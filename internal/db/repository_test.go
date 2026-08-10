@@ -3,7 +3,9 @@ package db
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -754,9 +756,15 @@ func TestPostgresSnapshotReadUsesRepeatableReadOnlyTransaction(t *testing.T) {
 }
 
 func TestPostgresRelayQueriesRequireActiveTargetAndRelayMemberships(t *testing.T) {
-	membershipQuery := strings.ToLower(relayMembershipExistsQuery)
-	if strings.Count(membershipQuery, "status = 'active'") != 1 {
-		t.Fatalf("relay membership existence query is not active-only: %s", relayMembershipExistsQuery)
+	membershipQuery := strings.ToLower(membershipStatusQuery)
+	for _, fragment := range []string{
+		"select status",
+		"from memberships",
+		"where network_id = $1 and node_id = $2",
+	} {
+		if !strings.Contains(membershipQuery, fragment) {
+			t.Errorf("membership status query missing %q: %s", fragment, membershipStatusQuery)
+		}
 	}
 	snapshotQuery := strings.ToLower(snapshotRelayAssignmentsQuery)
 	for _, fragment := range []string{
@@ -862,9 +870,9 @@ func TestPostgresSetRelayAssignmentLocksNodesInIDOrderBeforeNetwork(t *testing.T
 		WithArgs("network-1").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("network-1"))
 	for _, nodeID := range []string{"z-target", "a-relay"} {
-		mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT status FROM memberships WHERE network_id = $1 AND node_id = $2")).
 			WithArgs("network-1", nodeID).
-			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+			WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(control.MembershipActive))
 	}
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO relay_assignments")).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -1014,9 +1022,9 @@ func TestPostgresSetRelayAssignmentMapsCrossTargetIDConflict(t *testing.T) {
 		WithArgs("network-1").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("network-1"))
 	for _, nodeID := range []string{"z-target", "a-relay"} {
-		mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT status FROM memberships WHERE network_id = $1 AND node_id = $2")).
 			WithArgs("network-1", nodeID).
-			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+			WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(control.MembershipActive))
 	}
 	mock.ExpectExec(regexp.QuoteMeta("ON CONFLICT DO NOTHING")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -1030,6 +1038,70 @@ func TestPostgresSetRelayAssignmentMapsCrossTargetIDConflict(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresSetRelayAssignmentDistinguishesInactiveAndMissingMemberships(t *testing.T) {
+	tests := []struct {
+		name          string
+		relayRows     *sqlmock.Rows
+		expectedError error
+	}{
+		{
+			name:          "inactive relay",
+			relayRows:     sqlmock.NewRows([]string{"status"}).AddRow(control.MembershipPending),
+			expectedError: control.ErrValidation,
+		},
+		{
+			name:          "missing relay",
+			relayRows:     sqlmock.NewRows([]string{"status"}),
+			expectedError: ErrNotFound,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("create sql mock: %v", err)
+			}
+			defer database.Close()
+			repository := NewPostgresRepository(database)
+			assignment := control.RelayAssignment{
+				ID:          "relay-assignment-1",
+				NetworkID:   "network-1",
+				NodeID:      "z-target",
+				RelayNodeID: "a-relay",
+				Address:     net.ParseIP("2001:db8::20"),
+				Port:        51820,
+				Family:      control.FamilyIPv6,
+				Status:      control.RelayAssignmentActive,
+				AssignedAt:  repositoryTestNow,
+			}
+
+			mock.ExpectBegin()
+			for _, nodeID := range []string{"a-relay", "z-target"} {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
+					WithArgs(nodeID).
+					WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(nodeID))
+			}
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+				WithArgs("network-1").
+				WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("network-1"))
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT status FROM memberships WHERE network_id = $1 AND node_id = $2")).
+				WithArgs("network-1", "z-target").
+				WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(control.MembershipActive))
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT status FROM memberships WHERE network_id = $1 AND node_id = $2")).
+				WithArgs("network-1", "a-relay").
+				WillReturnRows(test.relayRows)
+			mock.ExpectRollback()
+
+			if err := repository.SetRelayAssignment(context.Background(), assignment); !errors.Is(err, test.expectedError) {
+				t.Fatalf("expected %v, got %v", test.expectedError, err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unexpected PostgreSQL calls: %v", err)
+			}
+		})
 	}
 }
 
@@ -1228,6 +1300,218 @@ func TestPostgresBuildSnapshotUsesReadTransactionBoundary(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unexpected PostgreSQL calls: %v", err)
 	}
+}
+
+func TestPostgresBuildSnapshotClosesMembershipRowsBeforeReadingPeerEndpoints(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	columns := []string{"network_id", "node_id", "virtual_ipv4", "role", "status", "id", "display_name", "public_key", "platform", "client_version", "last_seen"}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, name, ipv4_pool::text, owner_id, config_version, created_at")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "ipv4_pool", "owner_id", "config_version", "created_at"}).
+			AddRow("network-1", "network", "10.42.0.0/24", "owner-1", int64(3), repositoryTestNetwork().CreatedAt))
+	membershipRows := sqlmock.NewRows(columns).
+		AddRow("network-1", "local", "10.42.0.2", control.RoleMember, control.MembershipActive, "local", "local", "key-local", "windows", "0.1.0", repositoryTestNow).
+		AddRow("network-1", "peer", "10.42.0.3", control.RoleMember, control.MembershipActive, "peer", "peer", "key-peer", "windows", "0.1.0", repositoryTestNow)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT m.network_id")).
+		WithArgs("network-1").
+		WillReturnRows(membershipRows).
+		RowsWillBeClosed()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT node_id, address::text, port, address_family, interface_name, priority, observed_at")).
+		WithArgs("peer").
+		WillReturnRows(sqlmock.NewRows([]string{"node_id", "address", "port", "address_family", "interface_name", "priority", "observed_at"}).
+			AddRow("peer", "2001:db8::42", int64(51820), int64(6), "Ethernet", int64(1), repositoryTestNow)).
+		RowsWillBeClosed()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT relay.id, relay.network_id")).
+		WithArgs("network-1", "local").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "network_id", "node_id", "relay_node_id", "address", "port", "address_family", "status", "assigned_at", "expires_at"})).
+		RowsWillBeClosed()
+	mock.ExpectCommit()
+
+	snapshot, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow)
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	if len(snapshot.Peers) != 1 || snapshot.Peers[0].NodeID != "peer" {
+		t.Fatalf("unexpected peers: %+v", snapshot.Peers)
+	}
+	if len(snapshot.Peers[0].Endpoints) != 1 || !snapshot.Peers[0].Endpoints[0].Address.Equal(net.ParseIP("2001:db8::42")) {
+		t.Fatalf("peer endpoint was not loaded after membership rows: %+v", snapshot.Peers[0].Endpoints)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresBuildSnapshotReadsPeerEndpointsAfterMembershipRowsClose(t *testing.T) {
+	state := &snapshotDriverState{}
+	database := sql.OpenDB(snapshotDriverConnector{state: state})
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+
+	snapshot, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow)
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	if len(snapshot.Peers) != 1 || len(snapshot.Peers[0].Endpoints) != 1 {
+		t.Fatalf("expected one peer with one endpoint, got %+v", snapshot.Peers)
+	}
+	state.mu.Lock()
+	endpointQueryBeforeClose := state.endpointQueryBeforeMembershipClose
+	state.mu.Unlock()
+	if endpointQueryBeforeClose {
+		t.Fatal("endpoint query ran before membership rows were closed")
+	}
+}
+
+type snapshotDriverState struct {
+	mu                                 sync.Mutex
+	membershipRowsOpen                 bool
+	endpointQueryBeforeMembershipClose bool
+}
+
+type snapshotDriverConnector struct {
+	state *snapshotDriverState
+}
+
+func (connector snapshotDriverConnector) Connect(context.Context) (driver.Conn, error) {
+	return &snapshotDriverConn{state: connector.state}, nil
+}
+
+func (connector snapshotDriverConnector) Driver() driver.Driver {
+	return snapshotDriver{}
+}
+
+type snapshotDriver struct{}
+
+func (snapshotDriver) Open(string) (driver.Conn, error) {
+	return nil, errors.New("snapshot test driver requires a connector")
+}
+
+type snapshotDriverConn struct {
+	state *snapshotDriverState
+}
+
+func (connection *snapshotDriverConn) Prepare(query string) (driver.Stmt, error) {
+	return snapshotDriverStmt{connection: connection, query: query}, nil
+}
+
+func (*snapshotDriverConn) Close() error { return nil }
+
+func (*snapshotDriverConn) Begin() (driver.Tx, error) {
+	return snapshotDriverTx{}, nil
+}
+
+func (*snapshotDriverConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
+	return snapshotDriverTx{}, nil
+}
+
+func (connection *snapshotDriverConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	normalized := strings.ToLower(query)
+	connection.state.mu.Lock()
+	defer connection.state.mu.Unlock()
+
+	switch {
+	case strings.Contains(normalized, "from endpoint_candidates"):
+		if connection.state.membershipRowsOpen {
+			connection.state.endpointQueryBeforeMembershipClose = true
+			return nil, errors.New("endpoint query while membership rows are open")
+		}
+		return &snapshotDriverRows{
+			columns: []string{"node_id", "address", "port", "address_family", "interface_name", "priority", "observed_at"},
+			values:  [][]driver.Value{{"peer", "2001:db8::42", int64(51820), int64(6), "Ethernet", int64(1), repositoryTestNow}},
+			state:   connection.state,
+		}, nil
+	case strings.Contains(normalized, "from networks where id"):
+		return &snapshotDriverRows{
+			columns: []string{"id", "name", "ipv4_pool", "owner_id", "config_version", "created_at"},
+			values:  [][]driver.Value{{"network-1", "network", "10.42.0.0/24", "owner-1", int64(3), repositoryTestNetwork().CreatedAt}},
+			state:   connection.state,
+		}, nil
+	case strings.Contains(normalized, "from memberships as m"):
+		connection.state.membershipRowsOpen = true
+		return &snapshotDriverRows{
+			columns: []string{"network_id", "node_id", "virtual_ipv4", "role", "status", "id", "display_name", "public_key", "platform", "client_version", "last_seen"},
+			values: [][]driver.Value{
+				{"network-1", "local", "10.42.0.2", control.RoleMember, control.MembershipActive, "local", "local", "key-local", "windows", "0.1.0", repositoryTestNow},
+				{"network-1", "peer", "10.42.0.3", control.RoleMember, control.MembershipActive, "peer", "peer", "key-peer", "windows", "0.1.0", repositoryTestNow},
+			},
+			state:      connection.state,
+			membership: true,
+		}, nil
+	case strings.Contains(normalized, "from relay_assignments as relay"):
+		return &snapshotDriverRows{
+			columns: []string{"id", "network_id", "node_id", "relay_node_id", "address", "port", "address_family", "status", "assigned_at", "expires_at"},
+			state:   connection.state,
+		}, nil
+	default:
+		return nil, errors.New("unexpected snapshot query: " + query)
+	}
+}
+
+func (*snapshotDriverConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+	return driver.RowsAffected(0), nil
+}
+
+type snapshotDriverStmt struct {
+	connection *snapshotDriverConn
+	query      string
+}
+
+func (statement snapshotDriverStmt) Close() error { return nil }
+
+func (snapshotDriverStmt) NumInput() int { return -1 }
+
+func (statement snapshotDriverStmt) Exec([]driver.Value) (driver.Result, error) {
+	return driver.RowsAffected(0), nil
+}
+
+func (statement snapshotDriverStmt) Query([]driver.Value) (driver.Rows, error) {
+	return statement.connection.QueryContext(context.Background(), statement.query, nil)
+}
+
+type snapshotDriverTx struct{}
+
+func (snapshotDriverTx) Commit() error   { return nil }
+func (snapshotDriverTx) Rollback() error { return nil }
+
+type snapshotDriverRows struct {
+	columns    []string
+	values     [][]driver.Value
+	state      *snapshotDriverState
+	membership bool
+	position   int
+	closed     bool
+}
+
+func (rows *snapshotDriverRows) Columns() []string { return rows.columns }
+
+func (rows *snapshotDriverRows) Close() error {
+	if rows.closed {
+		return nil
+	}
+	rows.closed = true
+	if rows.membership {
+		rows.state.mu.Lock()
+		rows.state.membershipRowsOpen = false
+		rows.state.mu.Unlock()
+	}
+	return nil
+}
+
+func (rows *snapshotDriverRows) Next(destination []driver.Value) error {
+	if rows.position >= len(rows.values) {
+		return io.EOF
+	}
+	copy(destination, rows.values[rows.position])
+	rows.position++
+	return nil
 }
 
 func TestRepositoriesExposeTransactionBoundary(t *testing.T) {

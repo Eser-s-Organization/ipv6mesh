@@ -69,11 +69,8 @@ const (
 			assigned_at = $9,
 			expires_at = $10
 		WHERE network_id = $2 AND node_id = $3`
-	relayMembershipExistsQuery = `
-		SELECT EXISTS (
-			SELECT 1 FROM memberships
-			WHERE network_id = $1 AND node_id = $2 AND status = 'active'
-		)`
+	membershipStatusQuery = `
+		SELECT status FROM memberships WHERE network_id = $1 AND node_id = $2`
 	snapshotRelayAssignmentsQuery = `
 		SELECT relay.id, relay.network_id, relay.node_id, relay.relay_node_id,
 		       relay.address::text, relay.port, relay.address_family,
@@ -656,10 +653,10 @@ func (repository *PostgresRepository) SetRelayAssignment(ctx context.Context, as
 		if err := lockNetworkRows(ctx, executor, []string{assignment.NetworkID}); err != nil {
 			return err
 		}
-		if err := ensureMembershipExists(ctx, executor, assignment.NetworkID, assignment.NodeID); err != nil {
+		if err := ensureActiveMembership(ctx, executor, assignment.NetworkID, assignment.NodeID); err != nil {
 			return err
 		}
-		if err := ensureMembershipExists(ctx, executor, assignment.NetworkID, assignment.RelayNodeID); err != nil {
+		if err := ensureActiveMembership(ctx, executor, assignment.NetworkID, assignment.RelayNodeID); err != nil {
 			return err
 		}
 		if err := upsertRelayAssignment(ctx, executor, assignment); err != nil {
@@ -711,13 +708,17 @@ func upsertRelayAssignment(ctx context.Context, executor SQLExecutor, assignment
 	return rowsAffectedConflict(result)
 }
 
-func ensureMembershipExists(ctx context.Context, executor SQLExecutor, networkID, nodeID string) error {
-	var exists bool
-	if err := executor.QueryRowContext(ctx, relayMembershipExistsQuery, networkID, nodeID).Scan(&exists); err != nil {
+func ensureActiveMembership(ctx context.Context, executor SQLExecutor, networkID, nodeID string) error {
+	var status control.MembershipStatus
+	err := executor.QueryRowContext(ctx, membershipStatusQuery, networkID, nodeID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
 		return err
 	}
-	if !exists {
-		return ErrNotFound
+	if status != control.MembershipActive {
+		return control.ErrValidation
 	}
 	return nil
 }
@@ -803,12 +804,29 @@ func buildSnapshotWithExecutor(ctx context.Context, executor SQLExecutor, networ
 
 	var localMembership control.Membership
 	localFound := false
-	peers := make([]control.Peer, 0)
+	type snapshotMember struct {
+		membership control.Membership
+		node       control.Node
+	}
+	members := make([]snapshotMember, 0)
 	for rows.Next() {
 		membership, node, scanErr := scanMembershipNodeRow(rows)
 		if scanErr != nil {
 			return control.NetworkSnapshot{}, scanErr
 		}
+		members = append(members, snapshotMember{membership: membership, node: node})
+	}
+	if err := rows.Err(); err != nil {
+		return control.NetworkSnapshot{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return control.NetworkSnapshot{}, err
+	}
+
+	peers := make([]control.Peer, 0, len(members))
+	for _, member := range members {
+		membership := member.membership
+		node := member.node
 		if node.ID == localNodeID {
 			localMembership = membership
 			localFound = true
