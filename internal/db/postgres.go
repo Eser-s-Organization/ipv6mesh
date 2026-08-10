@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"net"
+	"sort"
 	"time"
 
 	"github.com/Eser-s-Organization/ipv6mesh/internal/control"
@@ -25,6 +26,53 @@ type SQLExecutor interface {
 type PostgresRepository struct {
 	db   *sql.DB
 	exec SQLExecutor
+}
+
+const (
+	removeNodeAffectedNetworksQuery = `
+		SELECT DISTINCT network_id
+		FROM (
+			SELECT network_id FROM memberships WHERE node_id = $1
+			UNION
+			SELECT network_id FROM relay_assignments
+			WHERE node_id = $1 OR relay_node_id = $1
+		) AS affected_networks`
+	removeNodeDeleteQuery        = `DELETE FROM nodes WHERE id = $1`
+	incrementNetworkVersionQuery = `
+		UPDATE networks SET config_version = config_version + 1 WHERE id = $1`
+	relayMembershipExistsQuery = `
+		SELECT EXISTS (
+			SELECT 1 FROM memberships
+			WHERE network_id = $1 AND node_id = $2 AND status = 'active'
+		)`
+	snapshotRelayAssignmentsQuery = `
+		SELECT relay.id, relay.network_id, relay.node_id, relay.relay_node_id,
+		       relay.address::text, relay.port, relay.address_family,
+		       relay.status, relay.assigned_at, relay.expires_at
+		FROM relay_assignments AS relay
+		JOIN memberships AS target_membership
+		  ON target_membership.network_id = relay.network_id
+		 AND target_membership.node_id = relay.node_id
+		JOIN memberships AS relay_membership
+		  ON relay_membership.network_id = relay.network_id
+		 AND relay_membership.node_id = relay.relay_node_id
+		WHERE relay.network_id = $1
+		  AND relay.node_id = $2
+		  AND relay.status = 'active'
+		  AND target_membership.status = 'active'
+		  AND relay_membership.status = 'active'`
+)
+
+func removeNodeMutationQueries() []string {
+	return []string{
+		removeNodeAffectedNetworksQuery,
+		removeNodeDeleteQuery,
+		incrementNetworkVersionQuery,
+	}
+}
+
+func snapshotReadTransactionOptions() sql.TxOptions {
+	return sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
 }
 
 // NewPostgresRepository creates a repository around an existing *sql.DB. A
@@ -65,6 +113,28 @@ func (repository *PostgresRepository) withTransaction(ctx context.Context, opera
 		return operation(repository.exec)
 	}
 	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := operation(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func (repository *PostgresRepository) readTransaction(ctx context.Context, operation func(SQLExecutor) error) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if repository == nil || repository.exec == nil {
+		return ErrDatabaseUnavailable
+	}
+	if repository.db == nil {
+		return operation(repository.exec)
+	}
+	options := snapshotReadTransactionOptions()
+	tx, err := repository.db.BeginTx(ctx, &options)
 	if err != nil {
 		return err
 	}
@@ -187,25 +257,53 @@ func (repository *PostgresRepository) GetNode(ctx context.Context, nodeID string
 		FROM nodes WHERE id = $1`, nodeID))
 }
 
-// RemoveNode deletes a node; dependent rows are handled by schema foreign-key
-// policies.
+// RemoveNode deletes a node and advances every network affected by its
+// membership or relay assignments in the same transaction.
 func (repository *PostgresRepository) RemoveNode(ctx context.Context, nodeID string) error {
-	executor, err := repository.executor(ctx)
+	return repository.withTransaction(ctx, func(executor SQLExecutor) error {
+		networkIDs, err := queryAffectedNetworkIDs(ctx, executor, nodeID)
+		if err != nil {
+			return err
+		}
+		result, err := executor.ExecContext(ctx, removeNodeDeleteQuery, nodeID)
+		if err != nil {
+			return err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if count == 0 {
+			return ErrNotFound
+		}
+		for _, networkID := range networkIDs {
+			if err := incrementNetworkVersion(ctx, executor, networkID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func queryAffectedNetworkIDs(ctx context.Context, executor SQLExecutor, nodeID string) ([]string, error) {
+	rows, err := executor.QueryContext(ctx, removeNodeAffectedNetworksQuery, nodeID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	result, err := executor.ExecContext(ctx, `DELETE FROM nodes WHERE id = $1`, nodeID)
-	if err != nil {
-		return err
+	defer rows.Close()
+	networkIDs := make([]string, 0)
+	for rows.Next() {
+		var networkID string
+		if err := rows.Scan(&networkID); err != nil {
+			return nil, err
+		}
+		networkIDs = append(networkIDs, networkID)
 	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return err
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
-	if count == 0 {
-		return ErrNotFound
-	}
-	return nil
+	sort.Strings(networkIDs)
+	return networkIDs, nil
 }
 
 func (repository *PostgresRepository) DeleteNode(ctx context.Context, nodeID string) error {
@@ -254,6 +352,11 @@ func (repository *PostgresRepository) RemoveMembership(ctx context.Context, netw
 		if count == 0 {
 			return ErrNotFound
 		}
+		if _, err := executor.ExecContext(ctx, `
+			DELETE FROM relay_assignments
+			WHERE network_id = $1 AND (node_id = $2 OR relay_node_id = $2)`, networkID, nodeID); err != nil {
+			return err
+		}
 		return incrementNetworkVersion(ctx, executor, networkID)
 	})
 }
@@ -263,8 +366,7 @@ func (repository *PostgresRepository) DeleteMembership(ctx context.Context, netw
 }
 
 func incrementNetworkVersion(ctx context.Context, executor SQLExecutor, networkID string) error {
-	result, err := executor.ExecContext(ctx, `
-		UPDATE networks SET config_version = config_version + 1 WHERE id = $1`, networkID)
+	result, err := executor.ExecContext(ctx, incrementNetworkVersionQuery, networkID)
 	if err != nil {
 		return err
 	}
@@ -425,8 +527,7 @@ func (repository *PostgresRepository) SetRelayAssignment(ctx context.Context, as
 
 func ensureMembershipExists(ctx context.Context, executor SQLExecutor, networkID, nodeID string) error {
 	var exists bool
-	if err := executor.QueryRowContext(ctx, `
-		SELECT EXISTS (SELECT 1 FROM memberships WHERE network_id = $1 AND node_id = $2)`, networkID, nodeID).Scan(&exists); err != nil {
+	if err := executor.QueryRowContext(ctx, relayMembershipExistsQuery, networkID, nodeID).Scan(&exists); err != nil {
 		return err
 	}
 	if !exists {
@@ -462,15 +563,15 @@ func (repository *PostgresRepository) BuildVersionedSnapshot(ctx context.Context
 	return repository.BuildSnapshot(ctx, networkID, localNodeID)
 }
 
-// BuildSnapshotAt uses a transaction for a stable multi-query read when a
-// *sql.DB is available. Endpoint staleness is evaluated in Go so the same
-// policy is shared by the memory implementation.
+// BuildSnapshotAt uses a repeatable-read, read-only transaction for a stable
+// multi-query read when a *sql.DB is available. Endpoint staleness is
+// evaluated in Go so the same policy is shared by the memory implementation.
 func (repository *PostgresRepository) BuildSnapshotAt(ctx context.Context, networkID, localNodeID string, now time.Time) (control.NetworkSnapshot, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
 	var snapshot control.NetworkSnapshot
-	err := repository.withTransaction(ctx, func(executor SQLExecutor) error {
+	err := repository.readTransaction(ctx, func(executor SQLExecutor) error {
 		var err error
 		snapshot, err = buildSnapshotWithExecutor(ctx, executor, networkID, localNodeID, now)
 		return err
@@ -539,11 +640,7 @@ func buildSnapshotWithExecutor(ctx context.Context, executor SQLExecutor, networ
 	}
 
 	var relay *control.RelayAssignment
-	relayRows, err := executor.QueryContext(ctx, `
-		SELECT id, network_id, node_id, relay_node_id, address::text, port,
-		       address_family, status, assigned_at, expires_at
-		FROM relay_assignments
-		WHERE network_id = $1 AND node_id = $2 AND status = 'active'`, networkID, localNodeID)
+	relayRows, err := executor.QueryContext(ctx, snapshotRelayAssignmentsQuery, networkID, localNodeID)
 	if err != nil {
 		return control.NetworkSnapshot{}, err
 	}
@@ -619,6 +716,9 @@ func scanNetworkRow(row rowScanner) (control.Network, error) {
 		poolText string
 	)
 	if err := row.Scan(&network.ID, &network.Name, &poolText, &network.OwnerID, &network.ConfigVersion, &network.CreatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return control.Network{}, ErrNotFound
+		}
 		return control.Network{}, err
 	}
 	poolIP, pool, err := net.ParseCIDR(poolText)

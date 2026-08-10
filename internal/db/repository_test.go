@@ -118,6 +118,144 @@ func TestMemoryRepositoryRejectsDuplicateNetworkVirtualIPv4(t *testing.T) {
 	}
 }
 
+func TestMemoryRepositoryRejectsRelayAssignmentForInactiveMember(t *testing.T) {
+	repository := NewMemoryRepository()
+	addRepositoryTestNetwork(t, repository)
+	for _, node := range []control.Node{
+		repositoryTestNode("local", "key-local"),
+		repositoryTestNode("relay", "key-relay"),
+	} {
+		if err := repository.AddNode(context.Background(), node); err != nil {
+			t.Fatalf("add node %s: %v", node.ID, err)
+		}
+	}
+	if err := repository.AddMembership(context.Background(), repositoryTestMembership("local", "10.42.0.2", control.MembershipActive)); err != nil {
+		t.Fatalf("add local membership: %v", err)
+	}
+	if err := repository.AddMembership(context.Background(), repositoryTestMembership("relay", "10.42.0.3", control.MembershipPending)); err != nil {
+		t.Fatalf("add pending relay membership: %v", err)
+	}
+
+	err := repository.SetRelayAssignment(context.Background(), control.RelayAssignment{
+		ID:          "relay-assignment-1",
+		NetworkID:   "network-1",
+		NodeID:      "local",
+		RelayNodeID: "relay",
+		Address:     net.ParseIP("2001:db8::20"),
+		Port:        51820,
+		Family:      control.FamilyIPv6,
+		Status:      control.RelayAssignmentActive,
+		AssignedAt:  repositoryTestNow,
+	})
+	if !errors.Is(err, control.ErrValidation) {
+		t.Fatalf("expected inactive relay membership to be rejected, got %v", err)
+	}
+}
+
+func TestMemoryRepositoryRemovesRelayAssignmentWhenMembershipIsRemoved(t *testing.T) {
+	repository := NewMemoryRepository()
+	addRepositoryTestNetwork(t, repository)
+	for _, node := range []control.Node{
+		repositoryTestNode("local", "key-local"),
+		repositoryTestNode("relay", "key-relay"),
+	} {
+		if err := repository.AddNode(context.Background(), node); err != nil {
+			t.Fatalf("add node %s: %v", node.ID, err)
+		}
+	}
+	for _, nodeID := range []string{"local", "relay"} {
+		if err := repository.AddMembership(context.Background(), repositoryTestMembership(nodeID, map[string]string{"local": "10.42.0.2", "relay": "10.42.0.3"}[nodeID], control.MembershipActive)); err != nil {
+			t.Fatalf("add membership %s: %v", nodeID, err)
+		}
+	}
+	if err := repository.SetRelayAssignment(context.Background(), control.RelayAssignment{
+		ID:          "relay-assignment-1",
+		NetworkID:   "network-1",
+		NodeID:      "local",
+		RelayNodeID: "relay",
+		Address:     net.ParseIP("2001:db8::20"),
+		Port:        51820,
+		Family:      control.FamilyIPv6,
+		Status:      control.RelayAssignmentActive,
+		AssignedAt:  repositoryTestNow,
+	}); err != nil {
+		t.Fatalf("set relay assignment: %v", err)
+	}
+	before, err := repository.GetNetwork(context.Background(), "network-1")
+	if err != nil {
+		t.Fatalf("get network before membership removal: %v", err)
+	}
+	if err := repository.RemoveMembership(context.Background(), "network-1", "relay"); err != nil {
+		t.Fatalf("remove relay membership: %v", err)
+	}
+	after, err := repository.GetNetwork(context.Background(), "network-1")
+	if err != nil {
+		t.Fatalf("get network after membership removal: %v", err)
+	}
+	if after.ConfigVersion != before.ConfigVersion+1 {
+		t.Fatalf("membership removal changed version by %d, want 1", after.ConfigVersion-before.ConfigVersion)
+	}
+	snapshot, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow)
+	if err != nil {
+		t.Fatalf("build snapshot after membership removal: %v", err)
+	}
+	if snapshot.RelayAssignment != nil {
+		t.Fatalf("snapshot returned relay assignment after relay membership removal: %+v", snapshot.RelayAssignment)
+	}
+}
+
+func TestMemoryRepositoryRemovingRelayNodeAdvancesVersionOnceAndRemovesAssignment(t *testing.T) {
+	repository := NewMemoryRepository()
+	addRepositoryTestNetwork(t, repository)
+	for _, node := range []control.Node{
+		repositoryTestNode("local", "key-local"),
+		repositoryTestNode("relay", "key-relay"),
+	} {
+		if err := repository.AddNode(context.Background(), node); err != nil {
+			t.Fatalf("add node %s: %v", node.ID, err)
+		}
+	}
+	for _, nodeID := range []string{"local", "relay"} {
+		if err := repository.AddMembership(context.Background(), repositoryTestMembership(nodeID, map[string]string{"local": "10.42.0.2", "relay": "10.42.0.3"}[nodeID], control.MembershipActive)); err != nil {
+			t.Fatalf("add membership %s: %v", nodeID, err)
+		}
+	}
+	if err := repository.SetRelayAssignment(context.Background(), control.RelayAssignment{
+		ID:          "relay-assignment-1",
+		NetworkID:   "network-1",
+		NodeID:      "local",
+		RelayNodeID: "relay",
+		Address:     net.ParseIP("2001:db8::20"),
+		Port:        51820,
+		Family:      control.FamilyIPv6,
+		Status:      control.RelayAssignmentActive,
+		AssignedAt:  repositoryTestNow,
+	}); err != nil {
+		t.Fatalf("set relay assignment: %v", err)
+	}
+	before, err := repository.GetNetwork(context.Background(), "network-1")
+	if err != nil {
+		t.Fatalf("get network before node removal: %v", err)
+	}
+	if err := repository.RemoveNode(context.Background(), "relay"); err != nil {
+		t.Fatalf("remove relay node: %v", err)
+	}
+	after, err := repository.GetNetwork(context.Background(), "network-1")
+	if err != nil {
+		t.Fatalf("get network after node removal: %v", err)
+	}
+	if after.ConfigVersion != before.ConfigVersion+1 {
+		t.Fatalf("node removal changed version by %d, want 1", after.ConfigVersion-before.ConfigVersion)
+	}
+	snapshot, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow)
+	if err != nil {
+		t.Fatalf("build snapshot after node removal: %v", err)
+	}
+	if snapshot.RelayAssignment != nil {
+		t.Fatalf("snapshot returned relay assignment after relay node removal: %+v", snapshot.RelayAssignment)
+	}
+}
+
 func TestMemoryRepositoryReturnsNotFoundForUnknownDeletion(t *testing.T) {
 	repository := NewMemoryRepository()
 
@@ -391,10 +529,14 @@ func TestSchemaFixtureMatchesCanonicalSchemaAndProtectsSecrets(t *testing.T) {
 }
 
 type fakeRowScanner struct {
-	values []any
+	values    []any
+	scanError error
 }
 
 func (row fakeRowScanner) Scan(dest ...any) error {
+	if row.scanError != nil {
+		return row.scanError
+	}
 	if len(dest) != len(row.values) {
 		return errors.New("scan destination count mismatch")
 	}
@@ -451,6 +593,53 @@ func TestScanNetworkRowParsesIPv4PoolAtSQLBoundary(t *testing.T) {
 	}
 	if network.IPv4Pool != "10.42.0.0/24" || network.ConfigVersion != 9 {
 		t.Fatalf("unexpected scanned network: %+v", network)
+	}
+}
+
+func TestScanNetworkRowMapsMissingNetworkToNotFound(t *testing.T) {
+	_, err := scanNetworkRow(fakeRowScanner{scanError: sql.ErrNoRows})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected missing network to map to ErrNotFound, got %v", err)
+	}
+}
+
+func TestPostgresRemoveNodeQueryPlanCoversMembershipAndRelayNetworks(t *testing.T) {
+	queryPlan := strings.ToLower(strings.Join(removeNodeMutationQueries(), "\n"))
+	for _, fragment := range []string{
+		"select distinct network_id",
+		"from memberships",
+		"relay_node_id",
+		"delete from nodes",
+		"update networks set config_version = config_version + 1",
+	} {
+		if !strings.Contains(queryPlan, fragment) {
+			t.Errorf("remove-node query plan missing %q", fragment)
+		}
+	}
+}
+
+func TestPostgresSnapshotReadUsesRepeatableReadOnlyTransaction(t *testing.T) {
+	options := snapshotReadTransactionOptions()
+	if options.Isolation != sql.LevelRepeatableRead || !options.ReadOnly {
+		t.Fatalf("unexpected snapshot transaction options: %+v", options)
+	}
+}
+
+func TestPostgresRelayQueriesRequireActiveTargetAndRelayMemberships(t *testing.T) {
+	membershipQuery := strings.ToLower(relayMembershipExistsQuery)
+	if strings.Count(membershipQuery, "status = 'active'") != 1 {
+		t.Fatalf("relay membership existence query is not active-only: %s", relayMembershipExistsQuery)
+	}
+	snapshotQuery := strings.ToLower(snapshotRelayAssignmentsQuery)
+	for _, fragment := range []string{
+		"join memberships as target_membership",
+		"join memberships as relay_membership",
+		"target_membership.status = 'active'",
+		"relay_membership.status = 'active'",
+	} {
+		if !strings.Contains(snapshotQuery, fragment) {
+			t.Errorf("snapshot relay query missing %q", fragment)
+		}
 	}
 }
 

@@ -354,23 +354,23 @@ func (repository *MemoryRepository) RemoveNode(ctx context.Context, nodeID strin
 	delete(repository.nodes, nodeID)
 	delete(repository.publicKeys, node.PublicKey)
 	delete(repository.endpoints, nodeID)
+	affectedNetworks := make(map[string]struct{})
 	for networkID, networkMemberships := range repository.memberships {
 		if _, member := networkMemberships[nodeID]; member {
 			delete(networkMemberships, nodeID)
-			repository.incrementNetworkVersionLocked(networkID)
+			affectedNetworks[networkID] = struct{}{}
 		}
 	}
 	for networkID, assignments := range repository.relayAssignments {
-		changed := false
 		for assignmentNodeID, assignment := range assignments {
 			if assignment.NodeID == nodeID || assignment.RelayNodeID == nodeID {
 				delete(assignments, assignmentNodeID)
-				changed = true
+				affectedNetworks[networkID] = struct{}{}
 			}
 		}
-		if changed {
-			repository.incrementNetworkVersionLocked(networkID)
-		}
+	}
+	for networkID := range affectedNetworks {
+		repository.incrementNetworkVersionLocked(networkID)
 	}
 	return nil
 }
@@ -430,6 +430,16 @@ func (repository *MemoryRepository) RemoveMembership(ctx context.Context, networ
 		return ErrNotFound
 	}
 	delete(networkMemberships, nodeID)
+	if assignments := repository.relayAssignments[networkID]; len(assignments) > 0 {
+		for assignmentNodeID, assignment := range assignments {
+			if assignment.NodeID == nodeID || assignment.RelayNodeID == nodeID {
+				delete(assignments, assignmentNodeID)
+			}
+		}
+		if len(assignments) == 0 {
+			delete(repository.relayAssignments, networkID)
+		}
+	}
 	repository.incrementNetworkVersionLocked(networkID)
 	return nil
 }
@@ -560,11 +570,19 @@ func (repository *MemoryRepository) SetRelayAssignment(ctx context.Context, assi
 	if networkMemberships == nil {
 		return ErrNotFound
 	}
-	if _, exists := networkMemberships[assignment.NodeID]; !exists {
+	targetMembership, targetExists := networkMemberships[assignment.NodeID]
+	if !targetExists {
 		return ErrNotFound
 	}
-	if _, exists := networkMemberships[assignment.RelayNodeID]; !exists {
+	if targetMembership.Status != control.MembershipActive {
+		return control.ErrValidation
+	}
+	relayMembership, relayExists := networkMemberships[assignment.RelayNodeID]
+	if !relayExists {
 		return ErrNotFound
+	}
+	if relayMembership.Status != control.MembershipActive {
+		return control.ErrValidation
 	}
 	assignments := repository.relayAssignments[assignment.NetworkID]
 	if assignments == nil {
@@ -664,7 +682,9 @@ func (repository *MemoryRepository) BuildSnapshotAt(ctx context.Context, network
 	var relay *control.RelayAssignment
 	if assignments := repository.relayAssignments[networkID]; len(assignments) > 0 {
 		selected, selectedExists := assignments[localNodeID]
-		if selectedExists && selected.Status == control.RelayAssignmentActive && relayAssignmentUsable(selected, now) {
+		if selectedExists && selected.Status == control.RelayAssignmentActive && relayAssignmentUsable(selected, now) &&
+			repository.membershipIsActiveLocked(networkID, selected.NodeID) &&
+			repository.membershipIsActiveLocked(networkID, selected.RelayNodeID) {
 			assignment := cloneRelayAssignment(selected)
 			relay = &assignment
 		}
@@ -685,6 +705,11 @@ func (repository *MemoryRepository) BuildSnapshotAt(ctx context.Context, network
 		snapshot.Relay = &relayCopy
 	}
 	return cloneSnapshot(snapshot), nil
+}
+
+func (repository *MemoryRepository) membershipIsActiveLocked(networkID, nodeID string) bool {
+	membership, exists := repository.memberships[networkID][nodeID]
+	return exists && membership.Status == control.MembershipActive
 }
 
 // GetSnapshotAt is an alias for callers that use retrieval terminology.
