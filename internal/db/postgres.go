@@ -406,7 +406,7 @@ func queryMembershipNetworkIDs(ctx context.Context, executor SQLExecutor, nodeID
 }
 
 func queryRelayAssignmentNodeIDs(ctx context.Context, executor SQLExecutor, networkID string) ([]string, error) {
-	rows, err := executor.QueryContext(ctx, relayAssignmentNodeIDsQuery, networkID, networkID)
+	rows, err := executor.QueryContext(ctx, relayAssignmentNodeIDsQuery, networkID)
 	if err != nil {
 		return nil, err
 	}

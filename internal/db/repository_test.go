@@ -1115,7 +1115,7 @@ func TestPostgresRemoveRelayAssignmentLocksNodesBeforeNetwork(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT node_id FROM relay_assignments WHERE network_id = $1")).
-		WithArgs("network-1", "network-1").
+		WithArgs("network-1").
 		WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow("z-target").AddRow("a-relay"))
 	for _, nodeID := range []string{"a-relay", "z-target"} {
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
