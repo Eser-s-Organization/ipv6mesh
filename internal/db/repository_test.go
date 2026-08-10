@@ -65,6 +65,27 @@ func repositoryTestInvite() control.Invite {
 	}
 }
 
+func repositoryTestInviteRows(invite control.Invite) *sqlmock.Rows {
+	var consumedAt any
+	if invite.ConsumedAt != nil {
+		consumedAt = *invite.ConsumedAt
+	}
+	var revokedAt any
+	if invite.RevokedAt != nil {
+		revokedAt = *invite.RevokedAt
+	}
+	var consumedByNodeID any
+	if invite.ConsumedByNodeID != "" {
+		consumedByNodeID = invite.ConsumedByNodeID
+	}
+	return sqlmock.NewRows([]string{
+		"id", "network_id", "token_hash", "expires_at", "consumed_at", "revoked_at", "consumed_by_node_id", "created_at",
+	}).AddRow(
+		invite.ID, invite.NetworkID, invite.TokenHash, invite.ExpiresAt,
+		consumedAt, revokedAt, consumedByNodeID, invite.CreatedAt,
+	)
+}
+
 func repositoryTestEndpoint(nodeID string, address net.IP, observedAt time.Time) control.EndpointCandidate {
 	family := control.FamilyIPv6
 	if address.To4() != nil {
@@ -539,6 +560,62 @@ func TestMemoryRepositoryFiltersStaleEndpointsAndInactiveMembers(t *testing.T) {
 	}
 	if snapshot.RelayAssignment == nil || snapshot.RelayAssignment.ID != "relay-local" {
 		t.Fatalf("snapshot did not include local relay assignment: %+v", snapshot.RelayAssignment)
+	}
+}
+
+func TestMemoryRepositoryOrdersSnapshotEndpointsDeterministically(t *testing.T) {
+	repository := NewMemoryRepository()
+	addRepositoryTestNetwork(t, repository)
+	for _, node := range []control.Node{
+		repositoryTestNode("local", "key-local"),
+		repositoryTestNode("peer", "key-peer"),
+	} {
+		if err := repository.AddNode(context.Background(), node); err != nil {
+			t.Fatalf("add node %s: %v", node.ID, err)
+		}
+	}
+	for _, membership := range []control.Membership{
+		repositoryTestMembership("local", "10.42.0.2", control.MembershipActive),
+		repositoryTestMembership("peer", "10.42.0.3", control.MembershipActive),
+	} {
+		if err := repository.AddMembership(context.Background(), membership); err != nil {
+			t.Fatalf("add membership %s: %v", membership.NodeID, err)
+		}
+	}
+	endpoints := []control.EndpointCandidate{
+		{NodeID: "peer", Address: net.ParseIP("2001:db8::20"), Port: 51820, Family: control.FamilyIPv6, Interface: "WiFi", Priority: 2, ObservedAt: repositoryTestNow},
+		{NodeID: "peer", Address: net.ParseIP("2001:db8::10"), Port: 51821, Family: control.FamilyIPv6, Interface: "Ethernet", Priority: 1, ObservedAt: repositoryTestNow},
+		{NodeID: "peer", Address: net.ParseIP("2001:db8::30"), Port: 51820, Family: control.FamilyIPv6, Interface: "Ethernet", Priority: 1, ObservedAt: repositoryTestNow},
+		{NodeID: "peer", Address: net.ParseIP("2001:db8::10"), Port: 51820, Family: control.FamilyIPv6, Interface: "WiFi", Priority: 1, ObservedAt: repositoryTestNow},
+		{NodeID: "peer", Address: net.ParseIP("2001:db8::10"), Port: 51820, Family: control.FamilyIPv6, Interface: "Ethernet", Priority: 1, ObservedAt: repositoryTestNow},
+	}
+	if err := repository.ReplaceEndpoints(context.Background(), "peer", endpoints); err != nil {
+		t.Fatalf("replace endpoints: %v", err)
+	}
+
+	snapshot, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow)
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	want := []struct {
+		address       string
+		port          uint16
+		interfaceName string
+	}{
+		{address: "2001:db8::10", port: 51820, interfaceName: "Ethernet"},
+		{address: "2001:db8::10", port: 51820, interfaceName: "WiFi"},
+		{address: "2001:db8::10", port: 51821, interfaceName: "Ethernet"},
+		{address: "2001:db8::30", port: 51820, interfaceName: "Ethernet"},
+		{address: "2001:db8::20", port: 51820, interfaceName: "WiFi"},
+	}
+	if len(snapshot.Peers) != 1 || len(snapshot.Peers[0].Endpoints) != len(want) {
+		t.Fatalf("unexpected snapshot endpoint count: %+v", snapshot.Peers)
+	}
+	for index, expected := range want {
+		got := snapshot.Peers[0].Endpoints[index]
+		if got.Address.String() != expected.address || got.Port != expected.port || got.Interface != expected.interfaceName {
+			t.Errorf("endpoint %d = %s:%d/%s, want %s:%d/%s", index, got.Address, got.Port, got.Interface, expected.address, expected.port, expected.interfaceName)
+		}
 	}
 }
 
@@ -1276,6 +1353,128 @@ func TestPostgresCreateInviteMapsMissingNetworkAndConsumedNodeToNotFound(t *test
 	}
 }
 
+func TestPostgresConsumeInviteConsumesWithBoundParameters(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	consumeAt := repositoryTestNow
+	expected := repositoryTestInvite()
+	expected.ConsumedAt = &consumeAt
+
+	mock.ExpectQuery(regexp.QuoteMeta("UPDATE invites")).
+		WithArgs(expected.ID, expected.TokenHash, consumeAt).
+		WillReturnRows(repositoryTestInviteRows(expected))
+
+	got, err := repository.ConsumeInvite(context.Background(), expected.ID, expected.TokenHash, consumeAt)
+	if err != nil {
+		t.Fatalf("consume invite: %v", err)
+	}
+	if got.ID != expected.ID || got.ConsumedAt == nil || !got.ConsumedAt.Equal(consumeAt) {
+		t.Fatalf("unexpected consumed invite: %+v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresConsumeInviteClassifiesLookupAndLifecycleStates(t *testing.T) {
+	consumedAt := repositoryTestNow.Add(-time.Minute)
+	revokedAt := repositoryTestNow.Add(-time.Minute)
+	tests := []struct {
+		name          string
+		lookup        string
+		tokenHash     string
+		state         control.Invite
+		stateReturned bool
+		expectedError error
+	}{
+		{
+			name:          "wrong token",
+			lookup:        "invite-1",
+			tokenHash:     "wrong-hash",
+			expectedError: ErrNotFound,
+		},
+		{
+			name:          "unknown invite",
+			lookup:        "unknown-invite",
+			tokenHash:     "hash-1",
+			expectedError: ErrNotFound,
+		},
+		{
+			name:      "expired",
+			lookup:    "invite-1",
+			tokenHash: "hash-1",
+			state: func() control.Invite {
+				invite := repositoryTestInvite()
+				invite.ExpiresAt = repositoryTestNow.Add(-time.Second)
+				return invite
+			}(),
+			stateReturned: true,
+			expectedError: ErrInviteExpired,
+		},
+		{
+			name:      "already consumed",
+			lookup:    "invite-1",
+			tokenHash: "hash-1",
+			state: func() control.Invite {
+				invite := repositoryTestInvite()
+				invite.ConsumedAt = &consumedAt
+				return invite
+			}(),
+			stateReturned: true,
+			expectedError: ErrInviteConsumed,
+		},
+		{
+			name:      "revoked",
+			lookup:    "invite-1",
+			tokenHash: "hash-1",
+			state: func() control.Invite {
+				invite := repositoryTestInvite()
+				invite.RevokedAt = &revokedAt
+				return invite
+			}(),
+			stateReturned: true,
+			expectedError: ErrInviteRevoked,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("create sql mock: %v", err)
+			}
+			defer database.Close()
+			repository := NewPostgresRepository(database)
+
+			mock.ExpectQuery(regexp.QuoteMeta("UPDATE invites")).
+				WithArgs(test.lookup, test.tokenHash, repositoryTestNow).
+				WillReturnRows(sqlmock.NewRows([]string{
+					"id", "network_id", "token_hash", "expires_at", "consumed_at", "revoked_at", "consumed_by_node_id", "created_at",
+				}))
+			stateQuery := mock.ExpectQuery(regexp.QuoteMeta("FROM invites WHERE (id = $1 OR network_id = $1) AND token_hash = $2")).
+				WithArgs(test.lookup, test.tokenHash)
+			if test.stateReturned {
+				stateQuery.WillReturnRows(repositoryTestInviteRows(test.state))
+			} else {
+				stateQuery.WillReturnRows(sqlmock.NewRows([]string{
+					"id", "network_id", "token_hash", "expires_at", "consumed_at", "revoked_at", "consumed_by_node_id", "created_at",
+				}))
+			}
+
+			_, err = repository.ConsumeInvite(context.Background(), test.lookup, test.tokenHash, repositoryTestNow)
+			if !errors.Is(err, test.expectedError) {
+				t.Fatalf("expected %v, got %v", test.expectedError, err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unexpected PostgreSQL calls: %v", err)
+			}
+		})
+	}
+}
+
 func TestPostgresBuildSnapshotUsesReadTransactionBoundary(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	if err != nil {
@@ -1386,6 +1585,71 @@ func TestPostgresBuildSnapshotUsesConfiguredEndpointMaxAge(t *testing.T) {
 	}
 	if len(snapshot.Peers) != 1 || len(snapshot.Peers[0].Endpoints) != 1 {
 		t.Fatalf("expected configured freshness to keep endpoint, got %+v", snapshot.Peers)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresBuildSnapshotOrdersFreshEndpointsDeterministically(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	columns := []string{"network_id", "node_id", "virtual_ipv4", "role", "status", "id", "display_name", "public_key", "platform", "client_version", "last_seen"}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, name, ipv4_pool::text, owner_id, config_version, created_at")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "ipv4_pool", "owner_id", "config_version", "created_at"}).
+			AddRow("network-1", "network", "10.42.0.0/24", "owner-1", int64(3), repositoryTestNetwork().CreatedAt))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT m.network_id")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows(columns).
+			AddRow("network-1", "local", "10.42.0.2", control.RoleMember, control.MembershipActive, "local", "local", "key-local", "windows", "0.1.0", repositoryTestNow).
+			AddRow("network-1", "peer", "10.42.0.3", control.RoleMember, control.MembershipActive, "peer", "peer", "key-peer", "windows", "0.1.0", repositoryTestNow)).
+		RowsWillBeClosed()
+	endpointQuery := regexp.QuoteMeta("SELECT node_id, address::text, port, address_family, interface_name, priority, observed_at") + ".*" + regexp.QuoteMeta("ORDER BY priority, address::text, port, interface_name")
+	mock.ExpectQuery(endpointQuery).
+		WithArgs("peer").
+		WillReturnRows(sqlmock.NewRows([]string{"node_id", "address", "port", "address_family", "interface_name", "priority", "observed_at"}).
+			AddRow("peer", "2001:db8::20", int64(51820), int64(6), "WiFi", int64(2), repositoryTestNow).
+			AddRow("peer", "2001:db8::10", int64(51821), int64(6), "Ethernet", int64(1), repositoryTestNow).
+			AddRow("peer", "2001:db8::30", int64(51820), int64(6), "Ethernet", int64(1), repositoryTestNow).
+			AddRow("peer", "2001:db8::10", int64(51820), int64(6), "WiFi", int64(1), repositoryTestNow).
+			AddRow("peer", "2001:db8::10", int64(51820), int64(6), "Ethernet", int64(1), repositoryTestNow)).
+		RowsWillBeClosed()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT relay.id, relay.network_id")).
+		WithArgs("network-1", "local").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "network_id", "node_id", "relay_node_id", "address", "port", "address_family", "status", "assigned_at", "expires_at"})).
+		RowsWillBeClosed()
+	mock.ExpectCommit()
+
+	snapshot, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow)
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	want := []struct {
+		address       string
+		port          uint16
+		interfaceName string
+	}{
+		{address: "2001:db8::10", port: 51820, interfaceName: "Ethernet"},
+		{address: "2001:db8::10", port: 51820, interfaceName: "WiFi"},
+		{address: "2001:db8::10", port: 51821, interfaceName: "Ethernet"},
+		{address: "2001:db8::30", port: 51820, interfaceName: "Ethernet"},
+		{address: "2001:db8::20", port: 51820, interfaceName: "WiFi"},
+	}
+	if len(snapshot.Peers) != 1 || len(snapshot.Peers[0].Endpoints) != len(want) {
+		t.Fatalf("unexpected snapshot endpoint count: %+v", snapshot.Peers)
+	}
+	for index, expected := range want {
+		got := snapshot.Peers[0].Endpoints[index]
+		if got.Address.String() != expected.address || got.Port != expected.port || got.Interface != expected.interfaceName {
+			t.Errorf("endpoint %d = %s:%d/%s, want %s:%d/%s", index, got.Address, got.Port, got.Interface, expected.address, expected.port, expected.interfaceName)
+		}
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unexpected PostgreSQL calls: %v", err)

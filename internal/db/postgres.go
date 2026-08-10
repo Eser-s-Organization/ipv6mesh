@@ -922,7 +922,7 @@ func readFreshEndpointsWithMaxAge(ctx context.Context, executor SQLExecutor, nod
 	rows, err := executor.QueryContext(ctx, `
 		SELECT node_id, address::text, port, address_family, interface_name, priority, observed_at
 		FROM endpoint_candidates WHERE node_id = $1
-		ORDER BY priority, address::text, port`, nodeID)
+		ORDER BY priority, address::text, port, interface_name`, nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -940,6 +940,7 @@ func readFreshEndpointsWithMaxAge(ctx context.Context, executor SQLExecutor, nod
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	sortEndpointCandidates(endpoints)
 	return endpoints, nil
 }
 

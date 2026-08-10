@@ -259,6 +259,21 @@ func endpointIdentityFor(endpoint control.EndpointCandidate) endpointIdentity {
 	return endpointIdentity{address: endpoint.Address.String(), port: endpoint.Port, interfaceName: endpoint.Interface}
 }
 
+func sortEndpointCandidates(endpoints []control.EndpointCandidate) {
+	sort.SliceStable(endpoints, func(left, right int) bool {
+		if endpoints[left].Priority != endpoints[right].Priority {
+			return endpoints[left].Priority < endpoints[right].Priority
+		}
+		if endpoints[left].Address.String() != endpoints[right].Address.String() {
+			return endpoints[left].Address.String() < endpoints[right].Address.String()
+		}
+		if endpoints[left].Port != endpoints[right].Port {
+			return endpoints[left].Port < endpoints[right].Port
+		}
+		return endpoints[left].Interface < endpoints[right].Interface
+	})
+}
+
 func clonePeer(peer control.Peer) control.Peer {
 	peer.Node = cloneNode(peer.Node)
 	peer.Membership = cloneMembership(peer.Membership)
@@ -592,6 +607,7 @@ func (repository *MemoryRepository) ReplaceEndpoints(ctx context.Context, nodeID
 		}
 		seen[identity] = struct{}{}
 	}
+	sortEndpointCandidates(validated)
 	repository.endpoints[nodeID] = validated
 	for networkID, networkMemberships := range repository.memberships {
 		if _, member := networkMemberships[nodeID]; member {
@@ -733,6 +749,7 @@ func (repository *MemoryRepository) BuildSnapshotAt(ctx context.Context, network
 				freshEndpoints = append(freshEndpoints, cloneEndpoint(endpoint))
 			}
 		}
+		sortEndpointCandidates(freshEndpoints)
 		peers = append(peers, control.Peer{
 			NodeID:      node.ID,
 			DisplayName: node.DisplayName,
