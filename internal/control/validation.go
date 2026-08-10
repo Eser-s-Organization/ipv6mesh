@@ -11,6 +11,8 @@ import (
 // ErrValidation is the stable sentinel for invalid control-plane models.
 var ErrValidation = errors.New("validation failed")
 
+const maxPostgresInteger = int64(1<<31 - 1)
+
 // ValidationError identifies the first invalid field while retaining the
 // stable ErrValidation identity for callers.
 type ValidationError struct {
@@ -166,8 +168,8 @@ func ValidateEndpointCandidate(endpoint EndpointCandidate) error {
 	if strings.TrimSpace(endpoint.Interface) == "" {
 		return invalid("endpoint_candidate", "interface", "is required")
 	}
-	if endpoint.Priority < 0 {
-		return invalid("endpoint_candidate", "priority", "must not be negative")
+	if endpoint.Priority < 0 || int64(endpoint.Priority) > maxPostgresInteger {
+		return invalid("endpoint_candidate", "priority", "must be between 0 and 2147483647")
 	}
 	if endpoint.ObservedAt.IsZero() {
 		return invalid("endpoint_candidate", "observed_at", "is required")

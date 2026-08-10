@@ -1121,11 +1121,43 @@ func TestPostgresCreateInviteBindsInsertParameters(t *testing.T) {
 	invite.ConsumedAt = &consumedAt
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS (SELECT 1 FROM networks WHERE id = $1)")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
 		WithArgs(invite.NetworkID).
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(invite.NetworkID))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO invites")).
 		WithArgs(invite.ID, invite.NetworkID, invite.TokenHash, invite.ExpiresAt, consumedAt, nil, "", invite.CreatedAt).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := repository.CreateInvite(context.Background(), invite); err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresCreateInviteWithConsumerLocksNodeBeforeNetwork(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	invite := repositoryTestInvite()
+	consumedAt := repositoryTestNow
+	invite.ConsumedAt = &consumedAt
+	invite.ConsumedByNodeID = "consumer-node"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
+		WithArgs(invite.ConsumedByNodeID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(invite.ConsumedByNodeID))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+		WithArgs(invite.NetworkID).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(invite.NetworkID))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO invites")).
+		WithArgs(invite.ID, invite.NetworkID, invite.TokenHash, invite.ExpiresAt, consumedAt, nil, invite.ConsumedByNodeID, invite.CreatedAt).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -1591,11 +1623,9 @@ func TestPostgresCreateInviteMapsMissingNetworkAndConsumedNodeToNotFound(t *test
 	tests := []struct {
 		name           string
 		consumedNodeID string
-		networkHit     bool
-		nodeHit        bool
 	}{
-		{name: "network", networkHit: false},
-		{name: "consumed node", consumedNodeID: "missing-node", networkHit: true, nodeHit: false},
+		{name: "network"},
+		{name: "consumed node", consumedNodeID: "missing-node"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1613,13 +1643,14 @@ func TestPostgresCreateInviteMapsMissingNetworkAndConsumedNodeToNotFound(t *test
 			}
 
 			mock.ExpectBegin()
-			mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).
-				WithArgs(invite.NetworkID).
-				WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(test.networkHit))
-			if test.networkHit && test.consumedNodeID != "" {
-				mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).
+			if test.consumedNodeID != "" {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
 					WithArgs(test.consumedNodeID).
-					WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(test.nodeHit))
+					WillReturnRows(sqlmock.NewRows([]string{"id"}))
+			} else {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+					WithArgs(invite.NetworkID).
+					WillReturnRows(sqlmock.NewRows([]string{"id"}))
 			}
 			mock.ExpectRollback()
 
@@ -1798,9 +1829,9 @@ func TestPostgresConsumeInviteForNodeRecordsConsumer(t *testing.T) {
 	invite.ConsumedByNodeID = "consumer-node"
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS (SELECT 1 FROM nodes WHERE id = $1)")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
 		WithArgs("consumer-node").
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("consumer-node"))
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE invites")).
 		WithArgs(invite.ID, invite.TokenHash, consumedAt, "consumer-node").
 		WillReturnRows(repositoryTestInviteRows(invite))
@@ -1827,9 +1858,9 @@ func TestPostgresConsumeInviteForNodeRejectsMissingConsumer(t *testing.T) {
 	repository := NewPostgresRepository(database)
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS (SELECT 1 FROM nodes WHERE id = $1)")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
 		WithArgs("missing-node").
-		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 	mock.ExpectRollback()
 
 	if _, err := repository.ConsumeInviteForNode(context.Background(), "invite-1", "hash-1", repositoryTestNow, "missing-node"); !errors.Is(err, ErrNotFound) {

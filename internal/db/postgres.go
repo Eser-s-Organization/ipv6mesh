@@ -536,13 +536,13 @@ func (repository *PostgresRepository) CreateInvite(ctx context.Context, invite c
 		return err
 	}
 	return repository.withTransaction(ctx, func(executor SQLExecutor) error {
-		if err := ensureNetworkExists(ctx, executor, invite.NetworkID); err != nil {
-			return err
-		}
 		if invite.ConsumedByNodeID != "" {
-			if err := ensureNodeExists(ctx, executor, invite.ConsumedByNodeID); err != nil {
+			if err := lockNodeRows(ctx, executor, []string{invite.ConsumedByNodeID}); err != nil {
 				return err
 			}
+		}
+		if err := lockNetworkRows(ctx, executor, []string{invite.NetworkID}); err != nil {
+			return err
 		}
 		result, err := executor.ExecContext(ctx, `
 			INSERT INTO invites (id, network_id, token_hash, expires_at, consumed_at, revoked_at, consumed_by_node_id, created_at)
@@ -570,8 +570,8 @@ func (repository *PostgresRepository) ConsumeInvite(ctx context.Context, inviteO
 }
 
 // ConsumeInviteForNode atomically consumes an invite and records the node
-// that consumed it. The node existence check and the conditional invite
-// update share one transaction when the repository has a *sql.DB.
+// that consumed it. The node row lock and conditional invite update share one
+// transaction when the repository has a *sql.DB.
 func (repository *PostgresRepository) ConsumeInviteForNode(ctx context.Context, inviteOrNetworkID, tokenHash string, consumedAt time.Time, consumedByNodeID string) (control.Invite, error) {
 	if consumedByNodeID == "" {
 		return repository.ConsumeInvite(ctx, inviteOrNetworkID, tokenHash, consumedAt)
@@ -581,7 +581,7 @@ func (repository *PostgresRepository) ConsumeInviteForNode(ctx context.Context, 
 	}
 	var invite control.Invite
 	err := repository.withTransaction(ctx, func(executor SQLExecutor) error {
-		if err := ensureNodeExists(ctx, executor, consumedByNodeID); err != nil {
+		if err := lockNodeRows(ctx, executor, []string{consumedByNodeID}); err != nil {
 			return err
 		}
 		var err error
@@ -683,28 +683,6 @@ func (repository *PostgresRepository) ReplaceEndpoints(ctx context.Context, node
 			WHERE id IN (SELECT network_id FROM memberships WHERE node_id = $1)`, nodeID)
 		return err
 	})
-}
-
-func ensureNodeExists(ctx context.Context, executor SQLExecutor, nodeID string) error {
-	var exists bool
-	if err := executor.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM nodes WHERE id = $1)`, nodeID).Scan(&exists); err != nil {
-		return err
-	}
-	if !exists {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func ensureNetworkExists(ctx context.Context, executor SQLExecutor, networkID string) error {
-	var exists bool
-	if err := executor.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM networks WHERE id = $1)`, networkID).Scan(&exists); err != nil {
-		return err
-	}
-	if !exists {
-		return ErrNotFound
-	}
-	return nil
 }
 
 // SetRelayAssignment upserts one assignment and advances the network version.

@@ -170,6 +170,22 @@ func TestValidateEndpointRejectsPortZeroAndFamilyMismatch(t *testing.T) {
 	}
 }
 
+func TestValidateEndpointPriorityMatchesPostgresIntegerRange(t *testing.T) {
+	endpoint := testEndpoint("node-1")
+	maxPriority := int(1<<31 - 1)
+	endpoint.Priority = maxPriority
+	if err := control.ValidateEndpointCandidate(endpoint); err != nil {
+		t.Fatalf("PostgreSQL INTEGER maximum priority was rejected: %v", err)
+	}
+
+	if int64(^uint(0)>>1) > int64(maxPriority) {
+		endpoint.Priority = maxPriority + 1
+		if err := control.ValidateEndpointCandidate(endpoint); !errors.Is(err, control.ErrValidation) {
+			t.Fatalf("expected priority above PostgreSQL INTEGER maximum to be rejected, got %v", err)
+		}
+	}
+}
+
 func TestValidateInviteRequiresHashedTokenAndFutureExpiry(t *testing.T) {
 	invite := testInvite()
 	invite.TokenHash = ""
