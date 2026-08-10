@@ -22,6 +22,10 @@ import (
 
 var repositoryTestNow = time.Date(2026, time.January, 10, 12, 0, 0, 0, time.UTC)
 
+func repositoryTestTimePointer(value time.Time) *time.Time {
+	return &value
+}
+
 func repositoryTestNetwork() control.Network {
 	return control.Network{
 		ID:       "network-1",
@@ -307,6 +311,63 @@ func TestMemoryRepositoryRemovesRelayAssignmentWhenMembershipIsRemoved(t *testin
 	}
 	if snapshot.RelayAssignment != nil {
 		t.Fatalf("snapshot returned relay assignment after relay membership removal: %+v", snapshot.RelayAssignment)
+	}
+}
+
+func TestMemoryRepositorySnapshotRejectsFutureAndExpiredRelayAssignments(t *testing.T) {
+	tests := []struct {
+		name       string
+		assignedAt time.Time
+		expiresAt  *time.Time
+		wantRelay  bool
+	}{
+		{name: "future", assignedAt: repositoryTestNow.Add(time.Minute), wantRelay: false},
+		{name: "current", assignedAt: repositoryTestNow, expiresAt: repositoryTestTimePointer(repositoryTestNow.Add(time.Minute)), wantRelay: true},
+		{name: "expired", assignedAt: repositoryTestNow.Add(-2 * time.Minute), expiresAt: repositoryTestTimePointer(repositoryTestNow.Add(-time.Second)), wantRelay: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repository := NewMemoryRepository()
+			addRepositoryTestNetwork(t, repository)
+			for _, node := range []control.Node{
+				repositoryTestNode("local", "key-local"),
+				repositoryTestNode("relay", "key-relay"),
+			} {
+				if err := repository.AddNode(context.Background(), node); err != nil {
+					t.Fatalf("add node %s: %v", node.ID, err)
+				}
+			}
+			for _, membership := range []control.Membership{
+				repositoryTestMembership("local", "10.42.0.2", control.MembershipActive),
+				repositoryTestMembership("relay", "10.42.0.3", control.MembershipActive),
+			} {
+				if err := repository.AddMembership(context.Background(), membership); err != nil {
+					t.Fatalf("add membership %s: %v", membership.NodeID, err)
+				}
+			}
+			if err := repository.SetRelayAssignment(context.Background(), control.RelayAssignment{
+				ID:          "relay-assignment-1",
+				NetworkID:   "network-1",
+				NodeID:      "local",
+				RelayNodeID: "relay",
+				Address:     net.ParseIP("2001:db8::20"),
+				Port:        51820,
+				Family:      control.FamilyIPv6,
+				Status:      control.RelayAssignmentActive,
+				AssignedAt:  test.assignedAt,
+				ExpiresAt:   test.expiresAt,
+			}); err != nil {
+				t.Fatalf("set relay assignment: %v", err)
+			}
+
+			snapshot, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow)
+			if err != nil {
+				t.Fatalf("build snapshot: %v", err)
+			}
+			if gotRelay := snapshot.RelayAssignment != nil; gotRelay != test.wantRelay {
+				t.Fatalf("relay presence = %t, want %t: %+v", gotRelay, test.wantRelay, snapshot.RelayAssignment)
+			}
+		})
 	}
 }
 
@@ -1857,6 +1918,64 @@ func TestPostgresBuildSnapshotOrdersPeersByNodeID(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresBuildSnapshotRejectsFutureAndExpiredRelayAssignments(t *testing.T) {
+	columns := []string{"network_id", "node_id", "virtual_ipv4", "role", "status", "id", "display_name", "public_key", "platform", "client_version", "last_seen"}
+	tests := []struct {
+		name       string
+		assignedAt time.Time
+		expiresAt  *time.Time
+		wantRelay  bool
+	}{
+		{name: "future", assignedAt: repositoryTestNow.Add(time.Minute), wantRelay: false},
+		{name: "current", assignedAt: repositoryTestNow, expiresAt: repositoryTestTimePointer(repositoryTestNow.Add(time.Minute)), wantRelay: true},
+		{name: "expired", assignedAt: repositoryTestNow.Add(-2 * time.Minute), expiresAt: repositoryTestTimePointer(repositoryTestNow.Add(-time.Second)), wantRelay: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("create sql mock: %v", err)
+			}
+			defer database.Close()
+			repository := NewPostgresRepository(database)
+
+			mock.ExpectBegin()
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT id, name, ipv4_pool::text, owner_id, config_version, created_at")).
+				WithArgs("network-1").
+				WillReturnRows(sqlmock.NewRows([]string{"id", "name", "ipv4_pool", "owner_id", "config_version", "created_at"}).
+					AddRow("network-1", "network", "10.42.0.0/24", "owner-1", int64(3), repositoryTestNetwork().CreatedAt))
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT m.network_id")).
+				WithArgs("network-1").
+				WillReturnRows(sqlmock.NewRows(columns).
+					AddRow("network-1", "local", "10.42.0.2", control.RoleMember, control.MembershipActive, "local", "local", "key-local", "windows", "0.1.0", repositoryTestNow).
+					AddRow("network-1", "relay", "10.42.0.3", control.RoleMember, control.MembershipActive, "relay", "relay", "key-relay", "windows", "0.1.0", repositoryTestNow)).
+				RowsWillBeClosed()
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT node_id, address::text, port, address_family, interface_name, priority, observed_at")).
+				WithArgs("relay").
+				WillReturnRows(sqlmock.NewRows([]string{"node_id", "address", "port", "address_family", "interface_name", "priority", "observed_at"})).
+				RowsWillBeClosed()
+			relayRows := sqlmock.NewRows([]string{"id", "network_id", "node_id", "relay_node_id", "address", "port", "address_family", "status", "assigned_at", "expires_at"})
+			relayRows.AddRow("relay-assignment-1", "network-1", "local", "relay", "2001:db8::20", int64(51820), int64(6), control.RelayAssignmentActive, test.assignedAt, test.expiresAt)
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT relay.id, relay.network_id")).
+				WithArgs("network-1", "local").
+				WillReturnRows(relayRows).
+				RowsWillBeClosed()
+			mock.ExpectCommit()
+
+			snapshot, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow)
+			if err != nil {
+				t.Fatalf("build snapshot: %v", err)
+			}
+			if gotRelay := snapshot.RelayAssignment != nil; gotRelay != test.wantRelay {
+				t.Fatalf("relay presence = %t, want %t: %+v", gotRelay, test.wantRelay, snapshot.RelayAssignment)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unexpected PostgreSQL calls: %v", err)
+			}
+		})
 	}
 }
 

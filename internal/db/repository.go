@@ -829,6 +829,9 @@ func (repository *MemoryRepository) GetSnapshotAt(ctx context.Context, networkID
 }
 
 func relayAssignmentUsable(assignment control.RelayAssignment, now time.Time) bool {
+	if assignment.AssignedAt.After(now) {
+		return false
+	}
 	return assignment.ExpiresAt == nil || now.Before(*assignment.ExpiresAt)
 }
 
