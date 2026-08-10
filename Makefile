@@ -7,7 +7,8 @@ vet:
 	go vet ./...
 
 fmt-check:
-	@test -z "$$(gofmt -l .)" || { echo "gofmt required"; gofmt -l .; exit 1; }
+	@files="$$(gofmt -l .)" || { echo "gofmt unavailable"; exit 1; }; \
+	test -z "$$files" || { echo "gofmt required:"; echo "$$files"; exit 1; }
 
 check:
 	gofmt -w .

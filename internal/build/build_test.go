@@ -20,8 +20,10 @@ func TestRepositoryBootstrap(t *testing.T) {
 		"go.mod",
 		"cmd/control-server/main.go",
 		"cmd/vpn-service/main_windows.go",
+		"cmd/vpn-service/main_nonwindows.go",
 		"cmd/vpnctl/main.go",
 		"cmd/relay-agent/main_linux.go",
+		"cmd/relay-agent/main_nonlinux.go",
 		".github/workflows/test.yml",
 		"Makefile",
 	}
