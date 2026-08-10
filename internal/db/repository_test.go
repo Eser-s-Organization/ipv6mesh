@@ -520,6 +520,46 @@ func TestMemoryRepositoryInviteIDTakesPrecedenceOverNetworkLookup(t *testing.T) 
 	}
 }
 
+func TestMemoryRepositoryConsumeInviteForNodeRecordsConsumer(t *testing.T) {
+	repository := NewMemoryRepository()
+	addRepositoryTestNetwork(t, repository)
+	if err := repository.AddNode(context.Background(), repositoryTestNode("consumer-node", "key-consumer")); err != nil {
+		t.Fatalf("add consumer node: %v", err)
+	}
+	invite := repositoryTestInvite()
+	if err := repository.CreateInvite(context.Background(), invite); err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+
+	consumed, err := repository.ConsumeInviteForNode(context.Background(), invite.ID, invite.TokenHash, repositoryTestNow, "consumer-node")
+	if err != nil {
+		t.Fatalf("consume invite for node: %v", err)
+	}
+	if consumed.ConsumedByNodeID != "consumer-node" || consumed.ConsumedAt == nil {
+		t.Fatalf("consumer was not recorded: %+v", consumed)
+	}
+}
+
+func TestMemoryRepositoryConsumeInviteForNodeRejectsMissingConsumer(t *testing.T) {
+	repository := NewMemoryRepository()
+	addRepositoryTestNetwork(t, repository)
+	invite := repositoryTestInvite()
+	if err := repository.CreateInvite(context.Background(), invite); err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+
+	if _, err := repository.ConsumeInviteForNode(context.Background(), invite.ID, invite.TokenHash, repositoryTestNow, "missing-node"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected missing consumer to return ErrNotFound, got %v", err)
+	}
+	consumed, err := repository.ConsumeInvite(context.Background(), invite.ID, invite.TokenHash, repositoryTestNow)
+	if err != nil {
+		t.Fatalf("compatibility consume after rejected consumer: %v", err)
+	}
+	if consumed.ConsumedByNodeID != "" {
+		t.Fatalf("rejected consumer was recorded: %+v", consumed)
+	}
+}
+
 func TestMemoryRepositoryFiltersStaleEndpointsAndInactiveMembers(t *testing.T) {
 	repository := NewMemoryRepository()
 	addRepositoryTestNetwork(t, repository)
@@ -729,6 +769,45 @@ func TestMemoryRepositoryIncrementsSnapshotVersionAndIsolatesCopies(t *testing.T
 	}
 }
 
+func TestMemoryRepositoryOrdersPeersByNodeID(t *testing.T) {
+	repository := NewMemoryRepository()
+	addRepositoryTestNetwork(t, repository)
+	for _, node := range []control.Node{
+		repositoryTestNode("local", "key-local"),
+		repositoryTestNode("z-peer", "key-z"),
+		repositoryTestNode("A-peer", "key-A"),
+		repositoryTestNode("a-peer", "key-a"),
+	} {
+		if err := repository.AddNode(context.Background(), node); err != nil {
+			t.Fatalf("add node %s: %v", node.ID, err)
+		}
+	}
+	for _, membership := range []control.Membership{
+		repositoryTestMembership("local", "10.42.0.2", control.MembershipActive),
+		repositoryTestMembership("z-peer", "10.42.0.3", control.MembershipActive),
+		repositoryTestMembership("A-peer", "10.42.0.4", control.MembershipActive),
+		repositoryTestMembership("a-peer", "10.42.0.5", control.MembershipActive),
+	} {
+		if err := repository.AddMembership(context.Background(), membership); err != nil {
+			t.Fatalf("add membership %s: %v", membership.NodeID, err)
+		}
+	}
+
+	snapshot, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow)
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	want := []string{"A-peer", "a-peer", "z-peer"}
+	if len(snapshot.Peers) != len(want) {
+		t.Fatalf("unexpected peer count: %+v", snapshot.Peers)
+	}
+	for index, nodeID := range want {
+		if snapshot.Peers[index].NodeID != nodeID {
+			t.Errorf("peer %d = %q, want %q", index, snapshot.Peers[index].NodeID, nodeID)
+		}
+	}
+}
+
 func TestSchemaFixtureMatchesCanonicalSchemaAndProtectsSecrets(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -926,6 +1005,77 @@ func TestPostgresRepositoryCanBeConstructedWithoutConnecting(t *testing.T) {
 	var _ SQLExecutor = (*sql.DB)(nil)
 }
 
+func TestPostgresCreateNetworkBindsInsertParameters(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	network := repositoryTestNetwork()
+	network.ConfigVersion = 7
+
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO networks")).
+		WithArgs(network.ID, network.Name, network.IPv4Pool, network.OwnerID, int64(7), network.CreatedAt).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repository.CreateNetwork(context.Background(), network); err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresAddNodeBindsInsertParameters(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	node := repositoryTestNode("node-1", "key-1")
+
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO nodes")).
+		WithArgs(node.ID, node.DisplayName, node.PublicKey, node.Platform, node.ClientVersion, node.LastSeen).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := repository.AddNode(context.Background(), node); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresCreateInviteBindsInsertParameters(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	invite := repositoryTestInvite()
+	consumedAt := repositoryTestNow
+	invite.ConsumedAt = &consumedAt
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS (SELECT 1 FROM networks WHERE id = $1)")).
+		WithArgs(invite.NetworkID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO invites")).
+		WithArgs(invite.ID, invite.NetworkID, invite.TokenHash, invite.ExpiresAt, consumedAt, nil, "", invite.CreatedAt).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := repository.CreateInvite(context.Background(), invite); err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
 func TestPostgresAddMembershipLocksNodeBeforeNetwork(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	if err != nil {
@@ -1002,6 +1152,8 @@ func TestPostgresSetRelayAssignmentLocksNodesInIDOrderBeforeNetwork(t *testing.T
 		Status:      control.RelayAssignmentActive,
 		AssignedAt:  repositoryTestNow,
 	}
+	expiresAt := repositoryTestNow.Add(time.Hour)
+	assignment.ExpiresAt = &expiresAt
 
 	mock.ExpectBegin()
 	for _, nodeID := range []string{"a-relay", "z-target"} {
@@ -1018,6 +1170,7 @@ func TestPostgresSetRelayAssignmentLocksNodesInIDOrderBeforeNetwork(t *testing.T
 			WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(control.MembershipActive))
 	}
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO relay_assignments")).
+		WithArgs(assignment.ID, assignment.NetworkID, assignment.NodeID, assignment.RelayNodeID, assignment.Address.String(), assignment.Port, int64(6), assignment.Status, assignment.AssignedAt, expiresAt).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(regexp.QuoteMeta("UPDATE networks SET config_version = config_version + 1 WHERE id = $1")).
 		WithArgs("network-1").
@@ -1431,7 +1584,7 @@ func TestPostgresConsumeInviteConsumesWithBoundParameters(t *testing.T) {
 	expected.ConsumedAt = &consumeAt
 
 	mock.ExpectQuery(regexp.QuoteMeta("UPDATE invites")).
-		WithArgs(expected.ID, expected.TokenHash, consumeAt).
+		WithArgs(expected.ID, expected.TokenHash, consumeAt, "").
 		WillReturnRows(repositoryTestInviteRows(expected))
 
 	got, err := repository.ConsumeInvite(context.Background(), expected.ID, expected.TokenHash, consumeAt)
@@ -1516,7 +1669,7 @@ func TestPostgresConsumeInviteClassifiesLookupAndLifecycleStates(t *testing.T) {
 			repository := NewPostgresRepository(database)
 
 			mock.ExpectQuery(regexp.QuoteMeta("UPDATE invites")).
-				WithArgs(test.lookup, test.tokenHash, repositoryTestNow).
+				WithArgs(test.lookup, test.tokenHash, repositoryTestNow, "").
 				WillReturnRows(sqlmock.NewRows([]string{
 					"id", "network_id", "token_hash", "expires_at", "consumed_at", "revoked_at", "consumed_by_node_id", "created_at",
 				}))
@@ -1553,7 +1706,7 @@ func TestPostgresConsumeInvitePrefersInviteIDOverNetworkScope(t *testing.T) {
 	tokenHash := "network-token"
 	updateQuery := regexp.QuoteMeta("UPDATE invites") + ".*" + regexp.QuoteMeta("NOT EXISTS (SELECT 1 FROM invites AS id_scope WHERE id_scope.id = $1)")
 	mock.ExpectQuery(updateQuery).
-		WithArgs(lookup, tokenHash, repositoryTestNow).
+		WithArgs(lookup, tokenHash, repositoryTestNow, "").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "network_id", "token_hash", "expires_at", "consumed_at", "revoked_at", "consumed_by_node_id", "created_at",
 		}))
@@ -1565,6 +1718,61 @@ func TestPostgresConsumeInvitePrefersInviteIDOverNetworkScope(t *testing.T) {
 
 	if _, err := repository.ConsumeInvite(context.Background(), lookup, tokenHash, repositoryTestNow); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected invite ID precedence to block network fallback, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresConsumeInviteForNodeRecordsConsumer(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	consumedAt := repositoryTestNow
+	invite := repositoryTestInvite()
+	invite.ConsumedAt = &consumedAt
+	invite.ConsumedByNodeID = "consumer-node"
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS (SELECT 1 FROM nodes WHERE id = $1)")).
+		WithArgs("consumer-node").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectQuery(regexp.QuoteMeta("UPDATE invites")).
+		WithArgs(invite.ID, invite.TokenHash, consumedAt, "consumer-node").
+		WillReturnRows(repositoryTestInviteRows(invite))
+	mock.ExpectCommit()
+
+	consumed, err := repository.ConsumeInviteForNode(context.Background(), invite.ID, invite.TokenHash, consumedAt, "consumer-node")
+	if err != nil {
+		t.Fatalf("consume invite for node: %v", err)
+	}
+	if consumed.ConsumedByNodeID != "consumer-node" || consumed.ConsumedAt == nil || !consumed.ConsumedAt.Equal(consumedAt) {
+		t.Fatalf("consumer was not recorded: %+v", consumed)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresConsumeInviteForNodeRejectsMissingConsumer(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS (SELECT 1 FROM nodes WHERE id = $1)")).
+		WithArgs("missing-node").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectRollback()
+
+	if _, err := repository.ConsumeInviteForNode(context.Background(), "invite-1", "hash-1", repositoryTestNow, "missing-node"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected missing consumer to return ErrNotFound, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unexpected PostgreSQL calls: %v", err)
@@ -1591,6 +1799,61 @@ func TestPostgresBuildSnapshotUsesReadTransactionBoundary(t *testing.T) {
 
 	if _, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected missing local membership, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresBuildSnapshotOrdersPeersByNodeID(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	columns := []string{"network_id", "node_id", "virtual_ipv4", "role", "status", "id", "display_name", "public_key", "platform", "client_version", "last_seen"}
+	emptyEndpointRows := func() *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"node_id", "address", "port", "address_family", "interface_name", "priority", "observed_at"})
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, name, ipv4_pool::text, owner_id, config_version, created_at")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "ipv4_pool", "owner_id", "config_version", "created_at"}).
+			AddRow("network-1", "network", "10.42.0.0/24", "owner-1", int64(3), repositoryTestNetwork().CreatedAt))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT m.network_id")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows(columns).
+			AddRow("network-1", "a-peer", "10.42.0.3", control.RoleMember, control.MembershipActive, "a-peer", "a-peer", "key-a", "windows", "0.1.0", repositoryTestNow).
+			AddRow("network-1", "A-peer", "10.42.0.4", control.RoleMember, control.MembershipActive, "A-peer", "A-peer", "key-A", "windows", "0.1.0", repositoryTestNow).
+			AddRow("network-1", "z-peer", "10.42.0.5", control.RoleMember, control.MembershipActive, "z-peer", "z-peer", "key-z", "windows", "0.1.0", repositoryTestNow).
+			AddRow("network-1", "local", "10.42.0.2", control.RoleMember, control.MembershipActive, "local", "local", "key-local", "windows", "0.1.0", repositoryTestNow)).
+		RowsWillBeClosed()
+	for _, nodeID := range []string{"a-peer", "A-peer", "z-peer"} {
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT node_id, address::text, port, address_family, interface_name, priority, observed_at")).
+			WithArgs(nodeID).
+			WillReturnRows(emptyEndpointRows()).
+			RowsWillBeClosed()
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT relay.id, relay.network_id")).
+		WithArgs("network-1", "local").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "network_id", "node_id", "relay_node_id", "address", "port", "address_family", "status", "assigned_at", "expires_at"})).
+		RowsWillBeClosed()
+	mock.ExpectCommit()
+
+	snapshot, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow)
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	want := []string{"A-peer", "a-peer", "z-peer"}
+	if len(snapshot.Peers) != len(want) {
+		t.Fatalf("unexpected peer count: %+v", snapshot.Peers)
+	}
+	for index, nodeID := range want {
+		if snapshot.Peers[index].NodeID != nodeID {
+			t.Errorf("peer %d = %q, want %q", index, snapshot.Peers[index].NodeID, nodeID)
+		}
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unexpected PostgreSQL calls: %v", err)

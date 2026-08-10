@@ -43,6 +43,7 @@ type Repository interface {
 	RemoveMembership(context.Context, string, string) error
 	CreateInvite(context.Context, control.Invite) error
 	ConsumeInvite(context.Context, string, string, time.Time) (control.Invite, error)
+	ConsumeInviteForNode(context.Context, string, string, time.Time, string) (control.Invite, error)
 	ReplaceEndpoints(context.Context, string, []control.EndpointCandidate) error
 	SetRelayAssignment(context.Context, control.RelayAssignment) error
 	RemoveRelayAssignment(context.Context, string) error
@@ -271,6 +272,18 @@ func sortEndpointCandidates(endpoints []control.EndpointCandidate) {
 			return endpoints[left].Port < endpoints[right].Port
 		}
 		return endpoints[left].Interface < endpoints[right].Interface
+	})
+}
+
+func sortPeersByNodeID(peers []control.Peer) {
+	sort.SliceStable(peers, func(left, right int) bool {
+		if peers[left].NodeID != peers[right].NodeID {
+			return peers[left].NodeID < peers[right].NodeID
+		}
+		if peers[left].PublicKey != peers[right].PublicKey {
+			return peers[left].PublicKey < peers[right].PublicKey
+		}
+		return peers[left].VirtualIPv4.String() < peers[right].VirtualIPv4.String()
 	})
 }
 
@@ -532,10 +545,15 @@ func (repository *MemoryRepository) CreateInvite(ctx context.Context, invite con
 	return nil
 }
 
-// ConsumeInvite atomically verifies and consumes one invite. The first string
-// may be either an invite ID or a network ID; accepting both keeps the
-// enrollment boundary independent of how the caller looked up the invite.
+// ConsumeInvite is the compatibility wrapper for consumers that do not yet
+// identify the enrolling node.
 func (repository *MemoryRepository) ConsumeInvite(ctx context.Context, inviteOrNetworkID, tokenHash string, consumedAt time.Time) (control.Invite, error) {
+	return repository.ConsumeInviteForNode(ctx, inviteOrNetworkID, tokenHash, consumedAt, "")
+}
+
+// ConsumeInviteForNode atomically verifies and consumes one invite while
+// recording the node that consumed it when supplied.
+func (repository *MemoryRepository) ConsumeInviteForNode(ctx context.Context, inviteOrNetworkID, tokenHash string, consumedAt time.Time, consumedByNodeID string) (control.Invite, error) {
 	if err := contextError(ctx); err != nil {
 		return control.Invite{}, err
 	}
@@ -544,6 +562,11 @@ func (repository *MemoryRepository) ConsumeInvite(ctx context.Context, inviteOrN
 	inviteID, direct := repository.inviteByLookupLocked(inviteOrNetworkID, tokenHash)
 	if !direct {
 		return control.Invite{}, ErrNotFound
+	}
+	if consumedByNodeID != "" {
+		if _, exists := repository.nodes[consumedByNodeID]; !exists {
+			return control.Invite{}, ErrNotFound
+		}
 	}
 	if consumedAt.IsZero() {
 		consumedAt = time.Now().UTC()
@@ -562,6 +585,7 @@ func (repository *MemoryRepository) ConsumeInvite(ctx context.Context, inviteOrN
 		return control.Invite{}, control.ErrValidation
 	}
 	invite.ConsumedAt = &consumedAt
+	invite.ConsumedByNodeID = consumedByNodeID
 	repository.invites[inviteID] = cloneInvite(invite)
 	return cloneInvite(invite), nil
 }
@@ -764,6 +788,7 @@ func (repository *MemoryRepository) BuildSnapshotAt(ctx context.Context, network
 			Endpoints:   freshEndpoints,
 		})
 	}
+	sortPeersByNodeID(peers)
 
 	var relay *control.RelayAssignment
 	if assignments := repository.relayAssignments[networkID]; len(assignments) > 0 {

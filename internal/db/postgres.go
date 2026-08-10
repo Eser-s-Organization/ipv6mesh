@@ -556,8 +556,8 @@ func (repository *PostgresRepository) CreateInvite(ctx context.Context, invite c
 	})
 }
 
-// ConsumeInvite uses one conditional UPDATE as the atomic single-use gate,
-// then classifies a failed attempt by reading the persisted lifecycle state.
+// ConsumeInvite is the compatibility wrapper for consumers that do not yet
+// identify the enrolling node.
 func (repository *PostgresRepository) ConsumeInvite(ctx context.Context, inviteOrNetworkID, tokenHash string, consumedAt time.Time) (control.Invite, error) {
 	if consumedAt.IsZero() {
 		consumedAt = time.Now().UTC()
@@ -566,16 +566,49 @@ func (repository *PostgresRepository) ConsumeInvite(ctx context.Context, inviteO
 	if err != nil {
 		return control.Invite{}, err
 	}
+	return consumeInviteWithExecutor(ctx, executor, inviteOrNetworkID, tokenHash, consumedAt, "")
+}
+
+// ConsumeInviteForNode atomically consumes an invite and records the node
+// that consumed it. The node existence check and the conditional invite
+// update share one transaction when the repository has a *sql.DB.
+func (repository *PostgresRepository) ConsumeInviteForNode(ctx context.Context, inviteOrNetworkID, tokenHash string, consumedAt time.Time, consumedByNodeID string) (control.Invite, error) {
+	if consumedByNodeID == "" {
+		return repository.ConsumeInvite(ctx, inviteOrNetworkID, tokenHash, consumedAt)
+	}
+	if consumedAt.IsZero() {
+		consumedAt = time.Now().UTC()
+	}
+	var invite control.Invite
+	err := repository.withTransaction(ctx, func(executor SQLExecutor) error {
+		if err := ensureNodeExists(ctx, executor, consumedByNodeID); err != nil {
+			return err
+		}
+		var err error
+		invite, err = consumeInviteWithExecutor(ctx, executor, inviteOrNetworkID, tokenHash, consumedAt, consumedByNodeID)
+		return err
+	})
+	if err != nil {
+		return control.Invite{}, err
+	}
+	return invite, nil
+}
+
+// consumeInviteWithExecutor uses one conditional UPDATE as the atomic
+// single-use gate, then classifies a failed attempt by reading the persisted
+// lifecycle state.
+func consumeInviteWithExecutor(ctx context.Context, executor SQLExecutor, inviteOrNetworkID, tokenHash string, consumedAt time.Time, consumedByNodeID string) (control.Invite, error) {
 	const consumeQuery = `
 		UPDATE invites
-		SET consumed_at = $3
+		SET consumed_at = $3,
+		    consumed_by_node_id = NULLIF($4, '')
 		WHERE ` + inviteLookupPredicate + `
 		  AND consumed_at IS NULL
 		  AND revoked_at IS NULL
 		  AND $3 >= created_at
 		  AND expires_at > $3
 		RETURNING id, network_id, token_hash, expires_at, consumed_at, revoked_at, consumed_by_node_id, created_at`
-	invite, err := scanInviteRow(executor.QueryRowContext(ctx, consumeQuery, inviteOrNetworkID, tokenHash, consumedAt))
+	invite, err := scanInviteRow(executor.QueryRowContext(ctx, consumeQuery, inviteOrNetworkID, tokenHash, consumedAt, consumedByNodeID))
 	if err == nil {
 		return invite, nil
 	}
@@ -883,6 +916,7 @@ func buildSnapshotWithEndpointMaxAge(ctx context.Context, executor SQLExecutor, 
 			Endpoints:   endpoints,
 		})
 	}
+	sortPeersByNodeID(peers)
 	if err := rows.Err(); err != nil {
 		return control.NetworkSnapshot{}, err
 	}
