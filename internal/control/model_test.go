@@ -109,6 +109,16 @@ func TestValidateNetworkRejectsIPv6Pool(t *testing.T) {
 	}
 }
 
+func TestValidateNetworkRejectsIPv4PoolWithHostBits(t *testing.T) {
+	network := testNetwork()
+	network.IPv4Pool = "10.42.0.1/24"
+
+	err := control.ValidateNetwork(network)
+	if !errors.Is(err, control.ErrValidation) {
+		t.Fatalf("expected validation error for non-canonical IPv4 pool, got %v", err)
+	}
+}
+
 func TestValidateNodeRejectsMissingPublicKey(t *testing.T) {
 	node := testNode("node-1")
 	node.PublicKey = ""

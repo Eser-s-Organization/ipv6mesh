@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS relay_assignments (
     CHECK ((address_family = 4 AND family(address) = 4) OR
            (address_family = 6 AND family(address) = 6)),
     CHECK (expires_at IS NULL OR expires_at > assigned_at),
+    FOREIGN KEY (network_id, node_id) REFERENCES memberships(network_id, node_id) ON DELETE CASCADE,
+    FOREIGN KEY (network_id, relay_node_id) REFERENCES memberships(network_id, node_id) ON DELETE CASCADE,
     UNIQUE (network_id, node_id)
 );
 

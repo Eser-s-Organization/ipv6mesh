@@ -387,6 +387,12 @@ func (repository *MemoryRepository) RemoveNode(ctx context.Context, nodeID strin
 	delete(repository.nodes, nodeID)
 	delete(repository.publicKeys, node.PublicKey)
 	delete(repository.endpoints, nodeID)
+	for inviteID, invite := range repository.invites {
+		if invite.ConsumedByNodeID == nodeID {
+			invite.ConsumedByNodeID = ""
+			repository.invites[inviteID] = cloneInvite(invite)
+		}
+	}
 	affectedNetworks := make(map[string]struct{})
 	for networkID, networkMemberships := range repository.memberships {
 		if _, member := networkMemberships[nodeID]; member {
@@ -490,6 +496,11 @@ func (repository *MemoryRepository) CreateInvite(ctx context.Context, invite con
 	defer repository.mu.Unlock()
 	if _, exists := repository.networks[invite.NetworkID]; !exists {
 		return ErrNotFound
+	}
+	if invite.ConsumedByNodeID != "" {
+		if _, exists := repository.nodes[invite.ConsumedByNodeID]; !exists {
+			return ErrNotFound
+		}
 	}
 	if _, exists := repository.invites[invite.ID]; exists {
 		return ErrConflict

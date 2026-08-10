@@ -380,6 +380,45 @@ func TestMemoryRepositoryRejectsInviteConsumptionBeforeCreation(t *testing.T) {
 	}
 }
 
+func TestMemoryRepositoryRejectsInviteForMissingConsumedNode(t *testing.T) {
+	repository := NewMemoryRepository()
+	addRepositoryTestNetwork(t, repository)
+	invite := repositoryTestInvite()
+	invite.ConsumedByNodeID = "missing-node"
+	consumedAt := repositoryTestNow
+	invite.ConsumedAt = &consumedAt
+
+	if err := repository.CreateInvite(context.Background(), invite); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected missing consumed node to return ErrNotFound, got %v", err)
+	}
+}
+
+func TestMemoryRepositoryClearsConsumedInviteNodeWhenNodeIsRemoved(t *testing.T) {
+	repository := NewMemoryRepository()
+	addRepositoryTestNetwork(t, repository)
+	if err := repository.AddNode(context.Background(), repositoryTestNode("node-1", "key-1")); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+	invite := repositoryTestInvite()
+	invite.ConsumedByNodeID = "node-1"
+	consumedAt := repositoryTestNow
+	invite.ConsumedAt = &consumedAt
+	if err := repository.CreateInvite(context.Background(), invite); err != nil {
+		t.Fatalf("create consumed invite: %v", err)
+	}
+
+	if err := repository.RemoveNode(context.Background(), "node-1"); err != nil {
+		t.Fatalf("remove node: %v", err)
+	}
+
+	repository.mu.RLock()
+	storedInvite := repository.invites[invite.ID]
+	repository.mu.RUnlock()
+	if storedInvite.ConsumedByNodeID != "" {
+		t.Fatalf("removed node remained on consumed invite: %q", storedInvite.ConsumedByNodeID)
+	}
+}
+
 func TestMemoryRepositoryConsumesInviteOnlyOnceConcurrently(t *testing.T) {
 	repository := NewMemoryRepository()
 	addRepositoryTestNetwork(t, repository)
@@ -604,6 +643,9 @@ func TestSchemaFixtureMatchesCanonicalSchemaAndProtectsSecrets(t *testing.T) {
 		"address inet",
 		"references",
 		"consumed_by_node_id is null or consumed_at is not null",
+		"foreign key (network_id, node_id)",
+		"foreign key (network_id, relay_node_id)",
+		"references memberships(network_id, node_id)",
 	} {
 		if !strings.Contains(schema, requiredFragment) {
 			t.Errorf("schema missing required fragment %q", requiredFragment)
@@ -759,6 +801,274 @@ func TestPostgresRepositoryCanBeConstructedWithoutConnecting(t *testing.T) {
 	var _ SQLExecutor = (*sql.DB)(nil)
 }
 
+func TestPostgresAddMembershipLocksNodeBeforeNetwork(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	membership := repositoryTestMembership("node-1", "10.42.0.2", control.MembershipActive)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
+		WithArgs("node-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-1"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("network-1"))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO memberships")).
+		WithArgs("network-1", "node-1", "10.42.0.2", control.RoleMember, control.MembershipActive).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE networks SET config_version = config_version + 1 WHERE id = $1")).
+		WithArgs("network-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := repository.AddMembership(context.Background(), membership); err != nil {
+		t.Fatalf("add membership: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresSetRelayAssignmentLocksNodesInIDOrderBeforeNetwork(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	assignment := control.RelayAssignment{
+		ID:          "relay-assignment-1",
+		NetworkID:   "network-1",
+		NodeID:      "z-target",
+		RelayNodeID: "a-relay",
+		Address:     net.ParseIP("2001:db8::20"),
+		Port:        51820,
+		Family:      control.FamilyIPv6,
+		Status:      control.RelayAssignmentActive,
+		AssignedAt:  repositoryTestNow,
+	}
+
+	mock.ExpectBegin()
+	for _, nodeID := range []string{"a-relay", "z-target"} {
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
+			WithArgs(nodeID).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(nodeID))
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("network-1"))
+	for _, nodeID := range []string{"z-target", "a-relay"} {
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).
+			WithArgs("network-1", nodeID).
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	}
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO relay_assignments")).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE networks SET config_version = config_version + 1 WHERE id = $1")).
+		WithArgs("network-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := repository.SetRelayAssignment(context.Background(), assignment); err != nil {
+		t.Fatalf("set relay assignment: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresRemoveMembershipLocksNodeBeforeNetwork(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
+		WithArgs("node-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-1"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("network-1"))
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM memberships")).
+		WithArgs("network-1", "node-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM relay_assignments")).
+		WithArgs("network-1", "node-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE networks SET config_version = config_version + 1 WHERE id = $1")).
+		WithArgs("network-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := repository.RemoveMembership(context.Background(), "network-1", "node-1"); err != nil {
+		t.Fatalf("remove membership: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresReplaceEndpointsLocksNodeBeforeNetworks(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
+		WithArgs("node-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-1"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT network_id FROM memberships WHERE node_id = $1 ORDER BY network_id")).
+		WithArgs("node-1").
+		WillReturnRows(sqlmock.NewRows([]string{"network_id"}).AddRow("network-1").AddRow("network-2"))
+	for _, networkID := range []string{"network-1", "network-2"} {
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+			WithArgs(networkID).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(networkID))
+	}
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM endpoint_candidates WHERE node_id = $1")).
+		WithArgs("node-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE networks SET config_version = config_version + 1")).
+		WithArgs("node-1").
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectCommit()
+
+	if err := repository.ReplaceEndpoints(context.Background(), "node-1", nil); err != nil {
+		t.Fatalf("replace endpoints: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresReplaceEndpointsMapsDuplicateTupleToConflict(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	endpoint := repositoryTestEndpoint("node-1", net.ParseIP("2001:db8::10"), repositoryTestNow)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
+		WithArgs("node-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-1"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT network_id FROM memberships WHERE node_id = $1 ORDER BY network_id")).
+		WithArgs("node-1").
+		WillReturnRows(sqlmock.NewRows([]string{"network_id"}))
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM endpoint_candidates WHERE node_id = $1")).
+		WithArgs("node-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	for _, rowsAffected := range []int64{1, 0} {
+		mock.ExpectExec(regexp.QuoteMeta("ON CONFLICT (node_id, address, port, interface_name) DO NOTHING")).
+			WithArgs(endpoint.NodeID, endpoint.Address.String(), endpoint.Port, 6, endpoint.Interface, endpoint.Priority, endpoint.ObservedAt).
+			WillReturnResult(sqlmock.NewResult(0, rowsAffected))
+	}
+	mock.ExpectRollback()
+
+	if err := repository.ReplaceEndpoints(context.Background(), "node-1", []control.EndpointCandidate{endpoint, endpoint}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected duplicate endpoint tuple conflict, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresSetRelayAssignmentMapsCrossTargetIDConflict(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	assignment := control.RelayAssignment{
+		ID:          "relay-assignment-1",
+		NetworkID:   "network-1",
+		NodeID:      "z-target",
+		RelayNodeID: "a-relay",
+		Address:     net.ParseIP("2001:db8::20"),
+		Port:        51820,
+		Family:      control.FamilyIPv6,
+		Status:      control.RelayAssignmentActive,
+		AssignedAt:  repositoryTestNow,
+	}
+
+	mock.ExpectBegin()
+	for _, nodeID := range []string{"a-relay", "z-target"} {
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
+			WithArgs(nodeID).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(nodeID))
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("network-1"))
+	for _, nodeID := range []string{"z-target", "a-relay"} {
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).
+			WithArgs("network-1", nodeID).
+			WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	}
+	mock.ExpectExec(regexp.QuoteMeta("ON CONFLICT DO NOTHING")).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT network_id, node_id FROM relay_assignments WHERE id = $1 FOR UPDATE")).
+		WithArgs(assignment.ID).
+		WillReturnRows(sqlmock.NewRows([]string{"network_id", "node_id"}).AddRow("network-2", "other-target"))
+	mock.ExpectRollback()
+
+	if err := repository.SetRelayAssignment(context.Background(), assignment); !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected cross-target relay ID conflict, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresRemoveRelayAssignmentLocksNodesBeforeNetwork(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT node_id FROM relay_assignments WHERE network_id = $1")).
+		WithArgs("network-1", "network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"node_id"}).AddRow("z-target").AddRow("a-relay"))
+	for _, nodeID := range []string{"a-relay", "z-target"} {
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
+			WithArgs(nodeID).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(nodeID))
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("network-1"))
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM relay_assignments WHERE network_id = $1")).
+		WithArgs("network-1").
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE networks SET config_version = config_version + 1 WHERE id = $1")).
+		WithArgs("network-1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := repository.RemoveRelayAssignment(context.Background(), "network-1"); err != nil {
+		t.Fatalf("remove relay assignments: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
 func TestPostgresRemoveNodeUsesOneTransactionAndUpdatesAffectedNetworks(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	if err != nil {
@@ -768,9 +1078,17 @@ func TestPostgresRemoveNodeUsesOneTransactionAndUpdatesAffectedNetworks(t *testi
 	repository := NewPostgresRepository(database)
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
+		WithArgs("relay-node").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("relay-node"))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT DISTINCT network_id")).
 		WithArgs("relay-node").
 		WillReturnRows(sqlmock.NewRows([]string{"network_id"}).AddRow("network-1").AddRow("network-2"))
+	for _, networkID := range []string{"network-1", "network-2"} {
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+			WithArgs(networkID).
+			WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(networkID))
+	}
 	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM nodes WHERE id = $1")).
 		WithArgs("relay-node").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -791,13 +1109,13 @@ func TestPostgresRemoveNodeUsesOneTransactionAndUpdatesAffectedNetworks(t *testi
 
 func TestPostgresAddMembershipMapsMissingNetworkAndNodeToNotFound(t *testing.T) {
 	tests := []struct {
-		name       string
-		nodeID     string
-		networkHit bool
-		nodeHit    bool
+		name          string
+		nodeID        string
+		nodeExists    bool
+		networkExists bool
 	}{
-		{name: "network", nodeID: "node-1", networkHit: false},
-		{name: "node", nodeID: "missing-node", networkHit: true, nodeHit: false},
+		{name: "network", nodeID: "node-1", nodeExists: true, networkExists: false},
+		{name: "node", nodeID: "missing-node", nodeExists: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -810,13 +1128,23 @@ func TestPostgresAddMembershipMapsMissingNetworkAndNodeToNotFound(t *testing.T) 
 			membership := repositoryTestMembership(test.nodeID, "10.42.0.2", control.MembershipActive)
 
 			mock.ExpectBegin()
-			mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).
-				WithArgs(membership.NetworkID).
-				WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(test.networkHit))
-			if test.networkHit {
-				mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).
+			if test.nodeExists {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
 					WithArgs(membership.NodeID).
-					WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(test.nodeHit))
+					WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(membership.NodeID))
+				if test.networkExists {
+					mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+						WithArgs(membership.NetworkID).
+						WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(membership.NetworkID))
+				} else {
+					mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+						WithArgs(membership.NetworkID).
+						WillReturnRows(sqlmock.NewRows([]string{"id"}))
+				}
+			} else {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
+					WithArgs(membership.NodeID).
+					WillReturnRows(sqlmock.NewRows([]string{"id"}))
 			}
 			mock.ExpectRollback()
 

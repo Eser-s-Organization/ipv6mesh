@@ -29,6 +29,10 @@ type PostgresRepository struct {
 }
 
 const (
+	lockNodeQuery = `
+		SELECT id FROM nodes WHERE id = $1 FOR UPDATE`
+	lockNetworkQuery = `
+		SELECT id FROM networks WHERE id = $1 FOR UPDATE`
 	removeNodeAffectedNetworksQuery = `
 		SELECT DISTINCT network_id
 		FROM (
@@ -40,6 +44,31 @@ const (
 	removeNodeDeleteQuery        = `DELETE FROM nodes WHERE id = $1`
 	incrementNetworkVersionQuery = `
 		UPDATE networks SET config_version = config_version + 1 WHERE id = $1`
+	membershipNetworkIDsQuery = `
+		SELECT network_id FROM memberships WHERE node_id = $1 ORDER BY network_id`
+	relayAssignmentNodeIDsQuery = `
+		SELECT node_id FROM relay_assignments WHERE network_id = $1
+		UNION
+		SELECT relay_node_id FROM relay_assignments WHERE network_id = $1
+		ORDER BY 1`
+	relayAssignmentByIDQuery = `
+		SELECT network_id, node_id FROM relay_assignments WHERE id = $1 FOR UPDATE`
+	relayAssignmentInsertQuery = `
+		INSERT INTO relay_assignments
+			(id, network_id, node_id, relay_node_id, address, port, address_family, status, assigned_at, expires_at)
+		VALUES ($1, $2, $3, $4, $5::inet, $6, $7, $8, $9, $10)
+		ON CONFLICT DO NOTHING`
+	relayAssignmentUpdateQuery = `
+		UPDATE relay_assignments
+		SET id = $1,
+			relay_node_id = $4,
+			address = $5::inet,
+			port = $6,
+			address_family = $7,
+			status = $8,
+			assigned_at = $9,
+			expires_at = $10
+		WHERE network_id = $2 AND node_id = $3`
 	relayMembershipExistsQuery = `
 		SELECT EXISTS (
 			SELECT 1 FROM memberships
@@ -65,7 +94,9 @@ const (
 
 func removeNodeMutationQueries() []string {
 	return []string{
+		lockNodeQuery,
 		removeNodeAffectedNetworksQuery,
+		lockNetworkQuery,
 		removeNodeDeleteQuery,
 		incrementNetworkVersionQuery,
 	}
@@ -261,8 +292,14 @@ func (repository *PostgresRepository) GetNode(ctx context.Context, nodeID string
 // membership or relay assignments in the same transaction.
 func (repository *PostgresRepository) RemoveNode(ctx context.Context, nodeID string) error {
 	return repository.withTransaction(ctx, func(executor SQLExecutor) error {
+		if err := lockNodeRows(ctx, executor, []string{nodeID}); err != nil {
+			return err
+		}
 		networkIDs, err := queryAffectedNetworkIDs(ctx, executor, nodeID)
 		if err != nil {
+			return err
+		}
+		if err := lockNetworkRows(ctx, executor, networkIDs); err != nil {
 			return err
 		}
 		result, err := executor.ExecContext(ctx, removeNodeDeleteQuery, nodeID)
@@ -285,8 +322,51 @@ func (repository *PostgresRepository) RemoveNode(ctx context.Context, nodeID str
 	})
 }
 
-func queryAffectedNetworkIDs(ctx context.Context, executor SQLExecutor, nodeID string) ([]string, error) {
-	rows, err := executor.QueryContext(ctx, removeNodeAffectedNetworksQuery, nodeID)
+func lockNodeRows(ctx context.Context, executor SQLExecutor, nodeIDs []string) error {
+	for _, nodeID := range sortedUniqueStrings(nodeIDs) {
+		var lockedID string
+		err := executor.QueryRowContext(ctx, lockNodeQuery, nodeID).Scan(&lockedID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func lockNetworkRows(ctx context.Context, executor SQLExecutor, networkIDs []string) error {
+	for _, networkID := range sortedUniqueStrings(networkIDs) {
+		var lockedID string
+		err := executor.QueryRowContext(ctx, lockNetworkQuery, networkID).Scan(&lockedID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sortedUniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	sorted := append([]string(nil), values...)
+	sort.Strings(sorted)
+	unique := sorted[:0]
+	for _, value := range sorted {
+		if len(unique) == 0 || unique[len(unique)-1] != value {
+			unique = append(unique, value)
+		}
+	}
+	return unique
+}
+
+func queryNetworkIDs(ctx context.Context, executor SQLExecutor, query string, args ...any) ([]string, error) {
+	rows, err := executor.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -302,8 +382,35 @@ func queryAffectedNetworkIDs(ctx context.Context, executor SQLExecutor, nodeID s
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	sort.Strings(networkIDs)
-	return networkIDs, nil
+	return sortedUniqueStrings(networkIDs), nil
+}
+
+func queryAffectedNetworkIDs(ctx context.Context, executor SQLExecutor, nodeID string) ([]string, error) {
+	return queryNetworkIDs(ctx, executor, removeNodeAffectedNetworksQuery, nodeID)
+}
+
+func queryMembershipNetworkIDs(ctx context.Context, executor SQLExecutor, nodeID string) ([]string, error) {
+	return queryNetworkIDs(ctx, executor, membershipNetworkIDsQuery, nodeID)
+}
+
+func queryRelayAssignmentNodeIDs(ctx context.Context, executor SQLExecutor, networkID string) ([]string, error) {
+	rows, err := executor.QueryContext(ctx, relayAssignmentNodeIDsQuery, networkID, networkID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	nodeIDs := make([]string, 0)
+	for rows.Next() {
+		var nodeID string
+		if err := rows.Scan(&nodeID); err != nil {
+			return nil, err
+		}
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return sortedUniqueStrings(nodeIDs), nil
 }
 
 func (repository *PostgresRepository) DeleteNode(ctx context.Context, nodeID string) error {
@@ -317,10 +424,10 @@ func (repository *PostgresRepository) AddMembership(ctx context.Context, members
 		return err
 	}
 	return repository.withTransaction(ctx, func(executor SQLExecutor) error {
-		if err := ensureNetworkExists(ctx, executor, membership.NetworkID); err != nil {
+		if err := lockNodeRows(ctx, executor, []string{membership.NodeID}); err != nil {
 			return err
 		}
-		if err := ensureNodeExists(ctx, executor, membership.NodeID); err != nil {
+		if err := lockNetworkRows(ctx, executor, []string{membership.NetworkID}); err != nil {
 			return err
 		}
 		result, err := executor.ExecContext(ctx, `
@@ -346,6 +453,12 @@ func (repository *PostgresRepository) AddMember(ctx context.Context, membership 
 // config version.
 func (repository *PostgresRepository) RemoveMembership(ctx context.Context, networkID, nodeID string) error {
 	return repository.withTransaction(ctx, func(executor SQLExecutor) error {
+		if err := lockNodeRows(ctx, executor, []string{nodeID}); err != nil {
+			return err
+		}
+		if err := lockNetworkRows(ctx, executor, []string{networkID}); err != nil {
+			return err
+		}
 		result, err := executor.ExecContext(ctx, `
 			DELETE FROM memberships WHERE network_id = $1 AND node_id = $2`, networkID, nodeID)
 		if err != nil {
@@ -475,22 +588,34 @@ func (repository *PostgresRepository) ReplaceEndpoints(ctx context.Context, node
 		}
 	}
 	return repository.withTransaction(ctx, func(executor SQLExecutor) error {
-		if err := ensureNodeExists(ctx, executor, nodeID); err != nil {
+		if err := lockNodeRows(ctx, executor, []string{nodeID}); err != nil {
+			return err
+		}
+		networkIDs, err := queryMembershipNetworkIDs(ctx, executor, nodeID)
+		if err != nil {
+			return err
+		}
+		if err := lockNetworkRows(ctx, executor, networkIDs); err != nil {
 			return err
 		}
 		if _, err := executor.ExecContext(ctx, `DELETE FROM endpoint_candidates WHERE node_id = $1`, nodeID); err != nil {
 			return err
 		}
 		for _, endpoint := range endpoints {
-			if _, err := executor.ExecContext(ctx, `
+			result, err := executor.ExecContext(ctx, `
 				INSERT INTO endpoint_candidates
 					(node_id, address, port, address_family, interface_name, priority, observed_at)
-				VALUES ($1, $2::inet, $3, $4, $5, $6, $7)`,
-				endpoint.NodeID, endpoint.Address.String(), endpoint.Port, endpointFamilyNumber(endpoint.Family), endpoint.Interface, endpoint.Priority, endpoint.ObservedAt); err != nil {
+				VALUES ($1, $2::inet, $3, $4, $5, $6, $7)
+				ON CONFLICT (node_id, address, port, interface_name) DO NOTHING`,
+				endpoint.NodeID, endpoint.Address.String(), endpoint.Port, endpointFamilyNumber(endpoint.Family), endpoint.Interface, endpoint.Priority, endpoint.ObservedAt)
+			if err != nil {
+				return err
+			}
+			if err := rowsAffectedConflict(result); err != nil {
 				return err
 			}
 		}
-		_, err := executor.ExecContext(ctx, `
+		_, err = executor.ExecContext(ctx, `
 			UPDATE networks SET config_version = config_version + 1
 			WHERE id IN (SELECT network_id FROM memberships WHERE node_id = $1)`, nodeID)
 		return err
@@ -525,31 +650,65 @@ func (repository *PostgresRepository) SetRelayAssignment(ctx context.Context, as
 		return err
 	}
 	return repository.withTransaction(ctx, func(executor SQLExecutor) error {
+		if err := lockNodeRows(ctx, executor, []string{assignment.NodeID, assignment.RelayNodeID}); err != nil {
+			return err
+		}
+		if err := lockNetworkRows(ctx, executor, []string{assignment.NetworkID}); err != nil {
+			return err
+		}
 		if err := ensureMembershipExists(ctx, executor, assignment.NetworkID, assignment.NodeID); err != nil {
 			return err
 		}
 		if err := ensureMembershipExists(ctx, executor, assignment.NetworkID, assignment.RelayNodeID); err != nil {
 			return err
 		}
-		_, err := executor.ExecContext(ctx, `
-			INSERT INTO relay_assignments
-				(id, network_id, node_id, relay_node_id, address, port, address_family, status, assigned_at, expires_at)
-			VALUES ($1, $2, $3, $4, $5::inet, $6, $7, $8, $9, $10)
-			ON CONFLICT (network_id, node_id) DO UPDATE SET
-				id = EXCLUDED.id,
-				relay_node_id = EXCLUDED.relay_node_id,
-				address = EXCLUDED.address,
-				port = EXCLUDED.port,
-				address_family = EXCLUDED.address_family,
-				status = EXCLUDED.status,
-				assigned_at = EXCLUDED.assigned_at,
-				expires_at = EXCLUDED.expires_at`,
-			assignment.ID, assignment.NetworkID, assignment.NodeID, assignment.RelayNodeID, assignment.Address.String(), assignment.Port, endpointFamilyNumber(assignment.Family), assignment.Status, assignment.AssignedAt, assignment.ExpiresAt)
-		if err != nil {
+		if err := upsertRelayAssignment(ctx, executor, assignment); err != nil {
 			return err
 		}
 		return incrementNetworkVersion(ctx, executor, assignment.NetworkID)
 	})
+}
+
+func upsertRelayAssignment(ctx context.Context, executor SQLExecutor, assignment control.RelayAssignment) error {
+	args := []any{
+		assignment.ID,
+		assignment.NetworkID,
+		assignment.NodeID,
+		assignment.RelayNodeID,
+		assignment.Address.String(),
+		assignment.Port,
+		endpointFamilyNumber(assignment.Family),
+		assignment.Status,
+		assignment.AssignedAt,
+		assignment.ExpiresAt,
+	}
+	result, err := executor.ExecContext(ctx, relayAssignmentInsertQuery, args...)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+
+	var existingNetworkID, existingNodeID string
+	err = executor.QueryRowContext(ctx, relayAssignmentByIDQuery, assignment.ID).Scan(&existingNetworkID, &existingNodeID)
+	if err == nil {
+		if existingNetworkID != assignment.NetworkID || existingNodeID != assignment.NodeID {
+			return ErrConflict
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	result, err = executor.ExecContext(ctx, relayAssignmentUpdateQuery, args...)
+	if err != nil {
+		return err
+	}
+	return rowsAffectedConflict(result)
 }
 
 func ensureMembershipExists(ctx context.Context, executor SQLExecutor, networkID, nodeID string) error {
@@ -566,6 +725,16 @@ func ensureMembershipExists(ctx context.Context, executor SQLExecutor, networkID
 // RemoveRelayAssignment removes all current assignments for a network.
 func (repository *PostgresRepository) RemoveRelayAssignment(ctx context.Context, networkID string) error {
 	return repository.withTransaction(ctx, func(executor SQLExecutor) error {
+		nodeIDs, err := queryRelayAssignmentNodeIDs(ctx, executor, networkID)
+		if err != nil {
+			return err
+		}
+		if err := lockNodeRows(ctx, executor, nodeIDs); err != nil {
+			return err
+		}
+		if err := lockNetworkRows(ctx, executor, []string{networkID}); err != nil {
+			return err
+		}
 		result, err := executor.ExecContext(ctx, `DELETE FROM relay_assignments WHERE network_id = $1`, networkID)
 		if err != nil {
 			return err

@@ -54,6 +54,9 @@ func ValidateNetwork(network Network) error {
 	if err != nil || poolIP.To4() == nil {
 		return invalid("network", "ipv4_pool", "must be an IPv4 network")
 	}
+	if !poolIP.Equal(pool.IP) {
+		return invalid("network", "ipv4_pool", "must not contain host bits")
+	}
 	if _, bits := pool.Mask.Size(); bits != 32 {
 		return invalid("network", "ipv4_pool", "must use a 32-bit mask")
 	}
