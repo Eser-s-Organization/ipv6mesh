@@ -24,8 +24,9 @@ type SQLExecutor interface {
 // connection itself; callers provide a configured *sql.DB and register their
 // preferred PostgreSQL driver before constructing it.
 type PostgresRepository struct {
-	db   *sql.DB
-	exec SQLExecutor
+	db             *sql.DB
+	exec           SQLExecutor
+	endpointMaxAge time.Duration
 }
 
 const (
@@ -107,17 +108,31 @@ func snapshotReadTransactionOptions() sql.TxOptions {
 // nil handle is accepted so configuration can construct the object before
 // dependency wiring; operations then return ErrDatabaseUnavailable.
 func NewPostgresRepository(database *sql.DB) *PostgresRepository {
+	return newPostgresRepository(database, DefaultEndpointMaxAge)
+}
+
+// NewPostgresRepositoryWithEndpointMaxAge creates a PostgreSQL repository with
+// an explicit endpoint freshness window. The default constructor remains the
+// production-safe default for callers that do not need custom policy.
+func NewPostgresRepositoryWithEndpointMaxAge(database *sql.DB, maxAge time.Duration) *PostgresRepository {
+	return newPostgresRepository(database, maxAge)
+}
+
+func newPostgresRepository(database *sql.DB, maxAge time.Duration) *PostgresRepository {
+	repository := &PostgresRepository{endpointMaxAge: maxAge}
 	if database == nil {
-		return &PostgresRepository{}
+		return repository
 	}
-	return &PostgresRepository{db: database, exec: database}
+	repository.db = database
+	repository.exec = database
+	return repository
 }
 
 // NewPostgresRepositoryWithExecutor is intended for SQL-boundary tests and
 // adapters that expose the database/sql executor surface. A *sql.DB should be
 // used in production when transactional mutations are required.
 func NewPostgresRepositoryWithExecutor(executor SQLExecutor) *PostgresRepository {
-	return &PostgresRepository{exec: executor}
+	return &PostgresRepository{exec: executor, endpointMaxAge: DefaultEndpointMaxAge}
 }
 
 func (repository *PostgresRepository) executor(ctx context.Context) (SQLExecutor, error) {
@@ -188,13 +203,13 @@ func (repository *PostgresRepository) WithTransaction(ctx context.Context, opera
 		return ErrDatabaseUnavailable
 	}
 	if repository.db == nil {
-		return operation(ctx, &PostgresRepository{exec: repository.exec})
+		return operation(ctx, &PostgresRepository{exec: repository.exec, endpointMaxAge: repository.endpointMaxAge})
 	}
 	tx, err := repository.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	transactionRepository := &PostgresRepository{exec: tx}
+	transactionRepository := &PostgresRepository{exec: tx, endpointMaxAge: repository.endpointMaxAge}
 	if err := operation(ctx, transactionRepository); err != nil {
 		_ = tx.Rollback()
 		return err
@@ -770,7 +785,7 @@ func (repository *PostgresRepository) BuildSnapshotAt(ctx context.Context, netwo
 	var snapshot control.NetworkSnapshot
 	err := repository.readTransaction(ctx, func(executor SQLExecutor) error {
 		var err error
-		snapshot, err = buildSnapshotWithExecutor(ctx, executor, networkID, localNodeID, now)
+		snapshot, err = buildSnapshotWithEndpointMaxAge(ctx, executor, networkID, localNodeID, now, repository.endpointMaxAge)
 		return err
 	})
 	if err != nil {
@@ -780,6 +795,10 @@ func (repository *PostgresRepository) BuildSnapshotAt(ctx context.Context, netwo
 }
 
 func buildSnapshotWithExecutor(ctx context.Context, executor SQLExecutor, networkID, localNodeID string, now time.Time) (control.NetworkSnapshot, error) {
+	return buildSnapshotWithEndpointMaxAge(ctx, executor, networkID, localNodeID, now, DefaultEndpointMaxAge)
+}
+
+func buildSnapshotWithEndpointMaxAge(ctx context.Context, executor SQLExecutor, networkID, localNodeID string, now time.Time, endpointMaxAge time.Duration) (control.NetworkSnapshot, error) {
 	network, err := scanNetworkRow(executor.QueryRowContext(ctx, `
 		SELECT id, name, ipv4_pool::text, owner_id, config_version, created_at
 		FROM networks WHERE id = $1`, networkID))
@@ -832,7 +851,7 @@ func buildSnapshotWithExecutor(ctx context.Context, executor SQLExecutor, networ
 			localFound = true
 			continue
 		}
-		endpoints, endpointErr := readFreshEndpoints(ctx, executor, node.ID, now)
+		endpoints, endpointErr := readFreshEndpointsWithMaxAge(ctx, executor, node.ID, now, endpointMaxAge)
 		if endpointErr != nil {
 			return control.NetworkSnapshot{}, endpointErr
 		}
@@ -896,6 +915,10 @@ func buildSnapshotWithExecutor(ctx context.Context, executor SQLExecutor, networ
 }
 
 func readFreshEndpoints(ctx context.Context, executor SQLExecutor, nodeID string, now time.Time) ([]control.EndpointCandidate, error) {
+	return readFreshEndpointsWithMaxAge(ctx, executor, nodeID, now, DefaultEndpointMaxAge)
+}
+
+func readFreshEndpointsWithMaxAge(ctx context.Context, executor SQLExecutor, nodeID string, now time.Time, endpointMaxAge time.Duration) ([]control.EndpointCandidate, error) {
 	rows, err := executor.QueryContext(ctx, `
 		SELECT node_id, address::text, port, address_family, interface_name, priority, observed_at
 		FROM endpoint_candidates WHERE node_id = $1
@@ -910,7 +933,7 @@ func readFreshEndpoints(ctx context.Context, executor SQLExecutor, nodeID string
 		if scanErr != nil {
 			return nil, scanErr
 		}
-		if control.IsFreshEndpoint(endpoint, now, DefaultEndpointMaxAge) {
+		if control.IsFreshEndpoint(endpoint, now, endpointMaxAge) {
 			endpoints = append(endpoints, endpoint)
 		}
 	}

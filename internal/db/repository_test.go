@@ -1349,6 +1349,49 @@ func TestPostgresBuildSnapshotClosesMembershipRowsBeforeReadingPeerEndpoints(t *
 	}
 }
 
+func TestPostgresBuildSnapshotUsesConfiguredEndpointMaxAge(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepositoryWithEndpointMaxAge(database, 20*time.Minute)
+	columns := []string{"network_id", "node_id", "virtual_ipv4", "role", "status", "id", "display_name", "public_key", "platform", "client_version", "last_seen"}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, name, ipv4_pool::text, owner_id, config_version, created_at")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "ipv4_pool", "owner_id", "config_version", "created_at"}).
+			AddRow("network-1", "network", "10.42.0.0/24", "owner-1", int64(3), repositoryTestNetwork().CreatedAt))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT m.network_id")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows(columns).
+			AddRow("network-1", "local", "10.42.0.2", control.RoleMember, control.MembershipActive, "local", "local", "key-local", "windows", "0.1.0", repositoryTestNow).
+			AddRow("network-1", "peer", "10.42.0.3", control.RoleMember, control.MembershipActive, "peer", "peer", "key-peer", "windows", "0.1.0", repositoryTestNow)).
+		RowsWillBeClosed()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT node_id, address::text, port, address_family, interface_name, priority, observed_at")).
+		WithArgs("peer").
+		WillReturnRows(sqlmock.NewRows([]string{"node_id", "address", "port", "address_family", "interface_name", "priority", "observed_at"}).
+			AddRow("peer", "2001:db8::42", int64(51820), int64(6), "Ethernet", int64(1), repositoryTestNow.Add(-15*time.Minute))).
+		RowsWillBeClosed()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT relay.id, relay.network_id")).
+		WithArgs("network-1", "local").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "network_id", "node_id", "relay_node_id", "address", "port", "address_family", "status", "assigned_at", "expires_at"})).
+		RowsWillBeClosed()
+	mock.ExpectCommit()
+
+	snapshot, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow)
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	if len(snapshot.Peers) != 1 || len(snapshot.Peers[0].Endpoints) != 1 {
+		t.Fatalf("expected configured freshness to keep endpoint, got %+v", snapshot.Peers)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
 func TestPostgresBuildSnapshotReadsPeerEndpointsAfterMembershipRowsClose(t *testing.T) {
 	state := &snapshotDriverState{}
 	database := sql.OpenDB(snapshotDriverConnector{state: state})
