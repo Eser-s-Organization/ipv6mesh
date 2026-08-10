@@ -34,6 +34,8 @@ const (
 		SELECT id FROM nodes WHERE id = $1 FOR UPDATE`
 	lockNetworkQuery = `
 		SELECT id FROM networks WHERE id = $1 FOR UPDATE`
+	lockNetworkPoolQuery = `
+		SELECT id, ipv4_pool::text FROM networks WHERE id = $1 FOR UPDATE`
 	removeNodeAffectedNetworksQuery = `
 		SELECT DISTINCT network_id
 		FROM (
@@ -88,6 +90,7 @@ const (
 		  AND relay.status = 'active'
 		  AND target_membership.status = 'active'
 		  AND relay_membership.status = 'active'`
+	inviteLookupPredicate = `(id = $1 OR (network_id = $1 AND NOT EXISTS (SELECT 1 FROM invites AS id_scope WHERE id_scope.id = $1))) AND token_hash = $2`
 )
 
 func removeNodeMutationQueries() []string {
@@ -362,6 +365,18 @@ func lockNetworkRows(ctx context.Context, executor SQLExecutor, networkIDs []str
 	return nil
 }
 
+func lockNetworkAndReadIPv4Pool(ctx context.Context, executor SQLExecutor, networkID string) (string, error) {
+	var lockedID, ipv4Pool string
+	err := executor.QueryRowContext(ctx, lockNetworkPoolQuery, networkID).Scan(&lockedID, &ipv4Pool)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	return ipv4Pool, nil
+}
+
 func sortedUniqueStrings(values []string) []string {
 	if len(values) == 0 {
 		return nil
@@ -439,7 +454,11 @@ func (repository *PostgresRepository) AddMembership(ctx context.Context, members
 		if err := lockNodeRows(ctx, executor, []string{membership.NodeID}); err != nil {
 			return err
 		}
-		if err := lockNetworkRows(ctx, executor, []string{membership.NetworkID}); err != nil {
+		ipv4Pool, err := lockNetworkAndReadIPv4Pool(ctx, executor, membership.NetworkID)
+		if err != nil {
+			return err
+		}
+		if err := control.ValidateIPv4InPool(membership.VirtualIPv4, ipv4Pool); err != nil {
 			return err
 		}
 		result, err := executor.ExecContext(ctx, `
@@ -550,8 +569,7 @@ func (repository *PostgresRepository) ConsumeInvite(ctx context.Context, inviteO
 	const consumeQuery = `
 		UPDATE invites
 		SET consumed_at = $3
-		WHERE (id = $1 OR network_id = $1)
-		  AND token_hash = $2
+		WHERE ` + inviteLookupPredicate + `
 		  AND consumed_at IS NULL
 		  AND revoked_at IS NULL
 		  AND $3 >= created_at
@@ -566,7 +584,7 @@ func (repository *PostgresRepository) ConsumeInvite(ctx context.Context, inviteO
 	}
 	state, stateErr := scanInviteRow(executor.QueryRowContext(ctx, `
 		SELECT id, network_id, token_hash, expires_at, consumed_at, revoked_at, consumed_by_node_id, created_at
-		FROM invites WHERE (id = $1 OR network_id = $1) AND token_hash = $2`, inviteOrNetworkID, tokenHash))
+		FROM invites WHERE `+inviteLookupPredicate, inviteOrNetworkID, tokenHash))
 	if errors.Is(stateErr, sql.ErrNoRows) {
 		return control.Invite{}, ErrNotFound
 	}

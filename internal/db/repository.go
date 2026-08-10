@@ -443,11 +443,15 @@ func (repository *MemoryRepository) AddMembership(ctx context.Context, membershi
 	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
-	if _, exists := repository.networks[membership.NetworkID]; !exists {
+	network, exists := repository.networks[membership.NetworkID]
+	if !exists {
 		return ErrNotFound
 	}
 	if _, exists := repository.nodes[membership.NodeID]; !exists {
 		return ErrNotFound
+	}
+	if err := control.ValidateIPv4InPool(membership.VirtualIPv4, network.IPv4Pool); err != nil {
+		return err
 	}
 	networkMemberships := repository.memberships[membership.NetworkID]
 	if networkMemberships == nil {

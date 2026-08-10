@@ -143,6 +143,19 @@ func TestMemoryRepositoryRejectsDuplicateNetworkVirtualIPv4(t *testing.T) {
 	}
 }
 
+func TestMemoryRepositoryRejectsMembershipOutsideNetworkIPv4Pool(t *testing.T) {
+	repository := NewMemoryRepository()
+	addRepositoryTestNetwork(t, repository)
+	if err := repository.AddNode(context.Background(), repositoryTestNode("node-1", "key-1")); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+
+	membership := repositoryTestMembership("node-1", "10.43.0.2", control.MembershipActive)
+	if err := repository.AddMembership(context.Background(), membership); !errors.Is(err, control.ErrValidation) {
+		t.Fatalf("expected out-of-pool membership to be rejected, got %v", err)
+	}
+}
+
 func TestMemoryRepositoryRejectsDuplicateEndpointsWithinReplacement(t *testing.T) {
 	repository := NewMemoryRepository()
 	if err := repository.AddNode(context.Background(), repositoryTestNode("node-1", "key-1")); err != nil {
@@ -160,6 +173,7 @@ func TestMemoryRepositoryEnforcesGlobalRelayAssignmentID(t *testing.T) {
 	repository := NewMemoryRepository()
 	networkTwo := repositoryTestNetwork()
 	networkTwo.ID = "network-2"
+	networkTwo.IPv4Pool = "10.43.0.0/24"
 	for _, network := range []control.Network{repositoryTestNetwork(), networkTwo} {
 		if err := repository.CreateNetwork(context.Background(), network); err != nil {
 			t.Fatalf("create network %s: %v", network.ID, err)
@@ -477,6 +491,32 @@ func TestMemoryRepositoryConsumesInviteOnlyOnceConcurrently(t *testing.T) {
 	}
 	if successes != 1 || consumedErrors != attempts-1 {
 		t.Fatalf("expected one successful consumption and %d consumed errors, got %d and %d", attempts-1, successes, consumedErrors)
+	}
+}
+
+func TestMemoryRepositoryInviteIDTakesPrecedenceOverNetworkLookup(t *testing.T) {
+	repository := NewMemoryRepository()
+	addRepositoryTestNetwork(t, repository)
+	network := repositoryTestNetwork()
+	network.ID = "shared-scope"
+	if err := repository.CreateNetwork(context.Background(), network); err != nil {
+		t.Fatalf("create overlapping-scope network: %v", err)
+	}
+	idInvite := repositoryTestInvite()
+	idInvite.ID = "shared-scope"
+	idInvite.TokenHash = "id-token"
+	networkInvite := repositoryTestInvite()
+	networkInvite.ID = "network-invite"
+	networkInvite.NetworkID = "shared-scope"
+	networkInvite.TokenHash = "network-token"
+	for _, invite := range []control.Invite{idInvite, networkInvite} {
+		if err := repository.CreateInvite(context.Background(), invite); err != nil {
+			t.Fatalf("create invite %s: %v", invite.ID, err)
+		}
+	}
+
+	if _, err := repository.ConsumeInvite(context.Background(), "shared-scope", "network-token", repositoryTestNow); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected conflicting invite ID to take precedence, got %v", err)
 	}
 }
 
@@ -899,9 +939,9 @@ func TestPostgresAddMembershipLocksNodeBeforeNetwork(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
 		WithArgs("node-1").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-1"))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, ipv4_pool::text FROM networks WHERE id = $1 FOR UPDATE")).
 		WithArgs("network-1").
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("network-1"))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "ipv4_pool"}).AddRow("network-1", "10.42.0.0/24"))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO memberships")).
 		WithArgs("network-1", "node-1", "10.42.0.2", control.RoleMember, control.MembershipActive).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -912,6 +952,32 @@ func TestPostgresAddMembershipLocksNodeBeforeNetwork(t *testing.T) {
 
 	if err := repository.AddMembership(context.Background(), membership); err != nil {
 		t.Fatalf("add membership: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresAddMembershipRejectsAddressOutsideLockedNetworkPool(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	membership := repositoryTestMembership("node-1", "10.43.0.2", control.MembershipActive)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
+		WithArgs("node-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-1"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, ipv4_pool::text FROM networks WHERE id = $1 FOR UPDATE")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "ipv4_pool"}).AddRow("network-1", "10.42.0.0/24"))
+	mock.ExpectRollback()
+
+	if err := repository.AddMembership(context.Background(), membership); !errors.Is(err, control.ErrValidation) {
+		t.Fatalf("expected out-of-pool membership to be rejected, got %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unexpected PostgreSQL calls: %v", err)
@@ -1282,13 +1348,13 @@ func TestPostgresAddMembershipMapsMissingNetworkAndNodeToNotFound(t *testing.T) 
 					WithArgs(membership.NodeID).
 					WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(membership.NodeID))
 				if test.networkExists {
-					mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+					mock.ExpectQuery(regexp.QuoteMeta("SELECT id, ipv4_pool::text FROM networks WHERE id = $1 FOR UPDATE")).
 						WithArgs(membership.NetworkID).
-						WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(membership.NetworkID))
+						WillReturnRows(sqlmock.NewRows([]string{"id", "ipv4_pool"}).AddRow(membership.NetworkID, "10.42.0.0/24"))
 				} else {
-					mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM networks WHERE id = $1 FOR UPDATE")).
+					mock.ExpectQuery(regexp.QuoteMeta("SELECT id, ipv4_pool::text FROM networks WHERE id = $1 FOR UPDATE")).
 						WithArgs(membership.NetworkID).
-						WillReturnRows(sqlmock.NewRows([]string{"id"}))
+						WillReturnRows(sqlmock.NewRows([]string{"id", "ipv4_pool"}))
 				}
 			} else {
 				mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")).
@@ -1454,7 +1520,7 @@ func TestPostgresConsumeInviteClassifiesLookupAndLifecycleStates(t *testing.T) {
 				WillReturnRows(sqlmock.NewRows([]string{
 					"id", "network_id", "token_hash", "expires_at", "consumed_at", "revoked_at", "consumed_by_node_id", "created_at",
 				}))
-			stateQuery := mock.ExpectQuery(regexp.QuoteMeta("FROM invites WHERE (id = $1 OR network_id = $1) AND token_hash = $2")).
+			stateQuery := mock.ExpectQuery(regexp.QuoteMeta("FROM invites WHERE "+inviteLookupPredicate)).
 				WithArgs(test.lookup, test.tokenHash)
 			if test.stateReturned {
 				stateQuery.WillReturnRows(repositoryTestInviteRows(test.state))
@@ -1472,6 +1538,36 @@ func TestPostgresConsumeInviteClassifiesLookupAndLifecycleStates(t *testing.T) {
 				t.Fatalf("unexpected PostgreSQL calls: %v", err)
 			}
 		})
+	}
+}
+
+func TestPostgresConsumeInvitePrefersInviteIDOverNetworkScope(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+
+	lookup := "shared-scope"
+	tokenHash := "network-token"
+	updateQuery := regexp.QuoteMeta("UPDATE invites") + ".*" + regexp.QuoteMeta("NOT EXISTS (SELECT 1 FROM invites AS id_scope WHERE id_scope.id = $1)")
+	mock.ExpectQuery(updateQuery).
+		WithArgs(lookup, tokenHash, repositoryTestNow).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "network_id", "token_hash", "expires_at", "consumed_at", "revoked_at", "consumed_by_node_id", "created_at",
+		}))
+	mock.ExpectQuery(regexp.QuoteMeta("NOT EXISTS (SELECT 1 FROM invites AS id_scope WHERE id_scope.id = $1)")).
+		WithArgs(lookup, tokenHash).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "network_id", "token_hash", "expires_at", "consumed_at", "revoked_at", "consumed_by_node_id", "created_at",
+		}))
+
+	if _, err := repository.ConsumeInvite(context.Background(), lookup, tokenHash, repositoryTestNow); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected invite ID precedence to block network fallback, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
 	}
 }
 

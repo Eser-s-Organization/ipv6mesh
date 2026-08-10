@@ -139,6 +139,15 @@ func TestValidateMembershipRejectsIPv6Address(t *testing.T) {
 	}
 }
 
+func TestValidateIPv4InPoolRejectsAddressOutsideNetwork(t *testing.T) {
+	if err := control.ValidateIPv4InPool(net.ParseIP("10.42.0.2"), "10.42.0.0/24"); err != nil {
+		t.Fatalf("address in pool was rejected: %v", err)
+	}
+	if err := control.ValidateIPv4InPool(net.ParseIP("10.43.0.2"), "10.42.0.0/24"); !errors.Is(err, control.ErrValidation) {
+		t.Fatalf("expected out-of-pool address to be rejected, got %v", err)
+	}
+}
+
 func TestValidateMembershipRejectsUnknownRoleAndStatus(t *testing.T) {
 	membership := testMembership("node-1", "10.42.0.2")
 	membership.Role = "operator"

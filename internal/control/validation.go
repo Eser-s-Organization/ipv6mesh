@@ -113,6 +113,25 @@ func ValidateMembership(membership Membership) error {
 	return nil
 }
 
+// ValidateIPv4InPool verifies that an IPv4 address belongs to a canonical
+// IPv4 CIDR pool. It does not allocate an address or mutate either value.
+func ValidateIPv4InPool(address net.IP, ipv4Pool string) error {
+	if address == nil || address.To4() == nil {
+		return invalid("membership", "virtual_ipv4", "must be an IPv4 address")
+	}
+	poolIP, pool, err := net.ParseCIDR(ipv4Pool)
+	if err != nil || poolIP.To4() == nil || !poolIP.Equal(pool.IP) {
+		return invalid("network", "ipv4_pool", "must be a canonical IPv4 network")
+	}
+	if _, bits := pool.Mask.Size(); bits != 32 {
+		return invalid("network", "ipv4_pool", "must use a 32-bit mask")
+	}
+	if !pool.Contains(address.To4()) {
+		return invalid("membership", "virtual_ipv4", "must belong to network ipv4_pool")
+	}
+	return nil
+}
+
 func validateEndpointAddress(model string, address net.IP, family EndpointFamily) error {
 	if address == nil {
 		return invalid(model, "address", "is required")
