@@ -317,6 +317,12 @@ func (repository *PostgresRepository) AddMembership(ctx context.Context, members
 		return err
 	}
 	return repository.withTransaction(ctx, func(executor SQLExecutor) error {
+		if err := ensureNetworkExists(ctx, executor, membership.NetworkID); err != nil {
+			return err
+		}
+		if err := ensureNodeExists(ctx, executor, membership.NodeID); err != nil {
+			return err
+		}
 		result, err := executor.ExecContext(ctx, `
 			INSERT INTO memberships (network_id, node_id, virtual_ipv4, role, status)
 			VALUES ($1, $2, $3::inet, $4, $5)
@@ -385,19 +391,25 @@ func (repository *PostgresRepository) CreateInvite(ctx context.Context, invite c
 	if err := control.ValidateInvite(invite); err != nil {
 		return err
 	}
-	executor, err := repository.executor(ctx)
-	if err != nil {
-		return err
-	}
-	result, err := executor.ExecContext(ctx, `
-		INSERT INTO invites (id, network_id, token_hash, expires_at, consumed_at, revoked_at, consumed_by_node_id, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8)
-		ON CONFLICT DO NOTHING`,
-		invite.ID, invite.NetworkID, invite.TokenHash, invite.ExpiresAt, invite.ConsumedAt, invite.RevokedAt, invite.ConsumedByNodeID, invite.CreatedAt)
-	if err != nil {
-		return err
-	}
-	return rowsAffectedConflict(result)
+	return repository.withTransaction(ctx, func(executor SQLExecutor) error {
+		if err := ensureNetworkExists(ctx, executor, invite.NetworkID); err != nil {
+			return err
+		}
+		if invite.ConsumedByNodeID != "" {
+			if err := ensureNodeExists(ctx, executor, invite.ConsumedByNodeID); err != nil {
+				return err
+			}
+		}
+		result, err := executor.ExecContext(ctx, `
+			INSERT INTO invites (id, network_id, token_hash, expires_at, consumed_at, revoked_at, consumed_by_node_id, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8)
+			ON CONFLICT DO NOTHING`,
+			invite.ID, invite.NetworkID, invite.TokenHash, invite.ExpiresAt, invite.ConsumedAt, invite.RevokedAt, invite.ConsumedByNodeID, invite.CreatedAt)
+		if err != nil {
+			return err
+		}
+		return rowsAffectedConflict(result)
+	})
 }
 
 // ConsumeInvite uses one conditional UPDATE as the atomic single-use gate,
@@ -417,6 +429,7 @@ func (repository *PostgresRepository) ConsumeInvite(ctx context.Context, inviteO
 		  AND token_hash = $2
 		  AND consumed_at IS NULL
 		  AND revoked_at IS NULL
+		  AND $3 >= created_at
 		  AND expires_at > $3
 		RETURNING id, network_id, token_hash, expires_at, consumed_at, revoked_at, consumed_by_node_id, created_at`
 	invite, err := scanInviteRow(executor.QueryRowContext(ctx, consumeQuery, inviteOrNetworkID, tokenHash, consumedAt))
@@ -440,6 +453,9 @@ func (repository *PostgresRepository) ConsumeInvite(ctx context.Context, inviteO
 	}
 	if state.RevokedAt != nil {
 		return control.Invite{}, ErrInviteRevoked
+	}
+	if consumedAt.Before(state.CreatedAt) {
+		return control.Invite{}, control.ErrValidation
 	}
 	if state.IsExpired(consumedAt) {
 		return control.Invite{}, ErrInviteExpired
@@ -484,6 +500,17 @@ func (repository *PostgresRepository) ReplaceEndpoints(ctx context.Context, node
 func ensureNodeExists(ctx context.Context, executor SQLExecutor, nodeID string) error {
 	var exists bool
 	if err := executor.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM nodes WHERE id = $1)`, nodeID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func ensureNetworkExists(ctx context.Context, executor SQLExecutor, networkID string) error {
+	var exists bool
+	if err := executor.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM networks WHERE id = $1)`, networkID).Scan(&exists); err != nil {
 		return err
 	}
 	if !exists {

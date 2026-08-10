@@ -61,16 +61,17 @@ type TransactionalRepository interface {
 // repository. It is deliberately concurrency-safe and contains no network or
 // database dependency.
 type MemoryRepository struct {
-	mu               sync.RWMutex
-	networks         map[string]control.Network
-	nodes            map[string]control.Node
-	publicKeys       map[string]string
-	memberships      map[string]map[string]control.Membership
-	invites          map[string]control.Invite
-	inviteByToken    map[string]string
-	endpoints        map[string][]control.EndpointCandidate
-	relayAssignments map[string]map[string]control.RelayAssignment
-	endpointMaxAge   time.Duration
+	mu                    sync.RWMutex
+	networks              map[string]control.Network
+	nodes                 map[string]control.Node
+	publicKeys            map[string]string
+	memberships           map[string]map[string]control.Membership
+	invites               map[string]control.Invite
+	inviteByToken         map[string]string
+	endpoints             map[string][]control.EndpointCandidate
+	relayAssignments      map[string]map[string]control.RelayAssignment
+	relayAssignmentOwners map[string]string
+	endpointMaxAge        time.Duration
 }
 
 // NewMemoryRepository creates an empty repository using the default endpoint
@@ -83,15 +84,16 @@ func NewMemoryRepository() *MemoryRepository {
 // deployments that choose a different endpoint observation policy.
 func NewMemoryRepositoryWithEndpointMaxAge(maxAge time.Duration) *MemoryRepository {
 	return &MemoryRepository{
-		networks:         make(map[string]control.Network),
-		nodes:            make(map[string]control.Node),
-		publicKeys:       make(map[string]string),
-		memberships:      make(map[string]map[string]control.Membership),
-		invites:          make(map[string]control.Invite),
-		inviteByToken:    make(map[string]string),
-		endpoints:        make(map[string][]control.EndpointCandidate),
-		relayAssignments: make(map[string]map[string]control.RelayAssignment),
-		endpointMaxAge:   maxAge,
+		networks:              make(map[string]control.Network),
+		nodes:                 make(map[string]control.Node),
+		publicKeys:            make(map[string]string),
+		memberships:           make(map[string]map[string]control.Membership),
+		invites:               make(map[string]control.Invite),
+		inviteByToken:         make(map[string]string),
+		endpoints:             make(map[string][]control.EndpointCandidate),
+		relayAssignments:      make(map[string]map[string]control.RelayAssignment),
+		relayAssignmentOwners: make(map[string]string),
+		endpointMaxAge:        maxAge,
 	}
 }
 
@@ -120,6 +122,7 @@ func (repository *MemoryRepository) WithTransaction(ctx context.Context, operati
 	repository.inviteByToken = working.inviteByToken
 	repository.endpoints = working.endpoints
 	repository.relayAssignments = working.relayAssignments
+	repository.relayAssignmentOwners = working.relayAssignmentOwners
 	return nil
 }
 
@@ -156,6 +159,9 @@ func cloneMemoryRepositoryLocked(source *MemoryRepository) *MemoryRepository {
 			copiedAssignments[nodeID] = cloneRelayAssignment(assignment)
 		}
 		clone.relayAssignments[networkID] = copiedAssignments
+	}
+	for assignmentID, owner := range source.relayAssignmentOwners {
+		clone.relayAssignmentOwners[assignmentID] = owner
 	}
 	return clone
 }
@@ -224,6 +230,33 @@ func cloneRelayAssignment(assignment control.RelayAssignment) control.RelayAssig
 	assignment.Address = cloneIP(assignment.Address)
 	assignment.ExpiresAt = cloneTime(assignment.ExpiresAt)
 	return assignment
+}
+
+func relayAssignmentOwnerKey(networkID, nodeID string) string {
+	return networkID + "\x00" + nodeID
+}
+
+func (repository *MemoryRepository) deleteRelayAssignmentLocked(networkID, nodeID string) {
+	assignments := repository.relayAssignments[networkID]
+	assignment, exists := assignments[nodeID]
+	if !exists {
+		return
+	}
+	delete(assignments, nodeID)
+	delete(repository.relayAssignmentOwners, assignment.ID)
+	if len(assignments) == 0 {
+		delete(repository.relayAssignments, networkID)
+	}
+}
+
+type endpointIdentity struct {
+	address       string
+	port          uint16
+	interfaceName string
+}
+
+func endpointIdentityFor(endpoint control.EndpointCandidate) endpointIdentity {
+	return endpointIdentity{address: endpoint.Address.String(), port: endpoint.Port, interfaceName: endpoint.Interface}
 }
 
 func clonePeer(peer control.Peer) control.Peer {
@@ -365,8 +398,12 @@ func (repository *MemoryRepository) RemoveNode(ctx context.Context, nodeID strin
 		for assignmentNodeID, assignment := range assignments {
 			if assignment.NodeID == nodeID || assignment.RelayNodeID == nodeID {
 				delete(assignments, assignmentNodeID)
+				delete(repository.relayAssignmentOwners, assignment.ID)
 				affectedNetworks[networkID] = struct{}{}
 			}
+		}
+		if len(assignments) == 0 {
+			delete(repository.relayAssignments, networkID)
 		}
 	}
 	for networkID := range affectedNetworks {
@@ -430,14 +467,11 @@ func (repository *MemoryRepository) RemoveMembership(ctx context.Context, networ
 		return ErrNotFound
 	}
 	delete(networkMemberships, nodeID)
-	if assignments := repository.relayAssignments[networkID]; len(assignments) > 0 {
-		for assignmentNodeID, assignment := range assignments {
-			if assignment.NodeID == nodeID || assignment.RelayNodeID == nodeID {
-				delete(assignments, assignmentNodeID)
-			}
-		}
-		if len(assignments) == 0 {
-			delete(repository.relayAssignments, networkID)
+	repository.deleteRelayAssignmentLocked(networkID, nodeID)
+	assignments := repository.relayAssignments[networkID]
+	for assignmentNodeID, assignment := range assignments {
+		if assignment.NodeID == nodeID || assignment.RelayNodeID == nodeID {
+			repository.deleteRelayAssignmentLocked(networkID, assignmentNodeID)
 		}
 	}
 	repository.incrementNetworkVersionLocked(networkID)
@@ -494,6 +528,9 @@ func (repository *MemoryRepository) ConsumeInvite(ctx context.Context, inviteOrN
 	if invite.IsExpired(consumedAt) {
 		return control.Invite{}, ErrInviteExpired
 	}
+	if consumedAt.Before(invite.CreatedAt) {
+		return control.Invite{}, control.ErrValidation
+	}
 	invite.ConsumedAt = &consumedAt
 	repository.invites[inviteID] = cloneInvite(invite)
 	return cloneInvite(invite), nil
@@ -526,6 +563,7 @@ func (repository *MemoryRepository) ReplaceEndpoints(ctx context.Context, nodeID
 		return ErrNotFound
 	}
 	validated := make([]control.EndpointCandidate, len(endpoints))
+	seen := make(map[endpointIdentity]struct{}, len(endpoints))
 	for index, endpoint := range endpoints {
 		if endpoint.NodeID != nodeID {
 			return control.ErrValidation
@@ -537,6 +575,11 @@ func (repository *MemoryRepository) ReplaceEndpoints(ctx context.Context, nodeID
 		if validated[index].Family == control.FamilyIPv4 {
 			validated[index].Address = cloneIP(validated[index].Address.To4())
 		}
+		identity := endpointIdentityFor(validated[index])
+		if _, exists := seen[identity]; exists {
+			return ErrConflict
+		}
+		seen[identity] = struct{}{}
 	}
 	repository.endpoints[nodeID] = validated
 	for networkID, networkMemberships := range repository.memberships {
@@ -589,7 +632,15 @@ func (repository *MemoryRepository) SetRelayAssignment(ctx context.Context, assi
 		assignments = make(map[string]control.RelayAssignment)
 		repository.relayAssignments[assignment.NetworkID] = assignments
 	}
+	ownerKey := relayAssignmentOwnerKey(assignment.NetworkID, assignment.NodeID)
+	if existingOwner, exists := repository.relayAssignmentOwners[assignment.ID]; exists && existingOwner != ownerKey {
+		return ErrConflict
+	}
+	if existing, exists := assignments[assignment.NodeID]; exists && existing.ID != assignment.ID {
+		delete(repository.relayAssignmentOwners, existing.ID)
+	}
 	assignments[assignment.NodeID] = cloneRelayAssignment(assignment)
+	repository.relayAssignmentOwners[assignment.ID] = ownerKey
 	repository.incrementNetworkVersionLocked(assignment.NetworkID)
 	return nil
 }
@@ -604,6 +655,9 @@ func (repository *MemoryRepository) RemoveRelayAssignment(ctx context.Context, n
 	assignments, exists := repository.relayAssignments[networkID]
 	if !exists || len(assignments) == 0 {
 		return ErrNotFound
+	}
+	for _, assignment := range assignments {
+		delete(repository.relayAssignmentOwners, assignment.ID)
 	}
 	delete(repository.relayAssignments, networkID)
 	repository.incrementNetworkVersionLocked(networkID)

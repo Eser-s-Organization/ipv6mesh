@@ -7,12 +7,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/Eser-s-Organization/ipv6mesh/internal/control"
 )
 
@@ -115,6 +117,73 @@ func TestMemoryRepositoryRejectsDuplicateNetworkVirtualIPv4(t *testing.T) {
 	}
 	if err := repository.AddMembership(context.Background(), repositoryTestMembership("node-2", address, control.MembershipActive)); !errors.Is(err, ErrConflict) {
 		t.Fatalf("expected duplicate virtual IPv4 conflict, got %v", err)
+	}
+}
+
+func TestMemoryRepositoryRejectsDuplicateEndpointsWithinReplacement(t *testing.T) {
+	repository := NewMemoryRepository()
+	if err := repository.AddNode(context.Background(), repositoryTestNode("node-1", "key-1")); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+	endpoint := repositoryTestEndpoint("node-1", net.ParseIP("2001:db8::10"), repositoryTestNow)
+	duplicate := endpoint
+
+	if err := repository.ReplaceEndpoints(context.Background(), "node-1", []control.EndpointCandidate{endpoint, duplicate}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected duplicate endpoint conflict, got %v", err)
+	}
+}
+
+func TestMemoryRepositoryEnforcesGlobalRelayAssignmentID(t *testing.T) {
+	repository := NewMemoryRepository()
+	networkTwo := repositoryTestNetwork()
+	networkTwo.ID = "network-2"
+	for _, network := range []control.Network{repositoryTestNetwork(), networkTwo} {
+		if err := repository.CreateNetwork(context.Background(), network); err != nil {
+			t.Fatalf("create network %s: %v", network.ID, err)
+		}
+	}
+	for _, node := range []control.Node{
+		repositoryTestNode("local-1", "key-local-1"),
+		repositoryTestNode("relay-1", "key-relay-1"),
+		repositoryTestNode("local-2", "key-local-2"),
+		repositoryTestNode("relay-2", "key-relay-2"),
+	} {
+		if err := repository.AddNode(context.Background(), node); err != nil {
+			t.Fatalf("add node %s: %v", node.ID, err)
+		}
+	}
+	for _, membership := range []control.Membership{
+		{NetworkID: "network-1", NodeID: "local-1", VirtualIPv4: net.ParseIP("10.42.0.2").To4(), Role: control.RoleMember, Status: control.MembershipActive},
+		{NetworkID: "network-1", NodeID: "relay-1", VirtualIPv4: net.ParseIP("10.42.0.3").To4(), Role: control.RoleMember, Status: control.MembershipActive},
+		{NetworkID: "network-2", NodeID: "local-2", VirtualIPv4: net.ParseIP("10.43.0.2").To4(), Role: control.RoleMember, Status: control.MembershipActive},
+		{NetworkID: "network-2", NodeID: "relay-2", VirtualIPv4: net.ParseIP("10.43.0.3").To4(), Role: control.RoleMember, Status: control.MembershipActive},
+	} {
+		if err := repository.AddMembership(context.Background(), membership); err != nil {
+			t.Fatalf("add membership %s/%s: %v", membership.NetworkID, membership.NodeID, err)
+		}
+	}
+	assignment := control.RelayAssignment{
+		ID:          "global-relay-id",
+		NetworkID:   "network-1",
+		NodeID:      "local-1",
+		RelayNodeID: "relay-1",
+		Address:     net.ParseIP("2001:db8::20"),
+		Port:        51820,
+		Family:      control.FamilyIPv6,
+		Status:      control.RelayAssignmentActive,
+		AssignedAt:  repositoryTestNow,
+	}
+	if err := repository.SetRelayAssignment(context.Background(), assignment); err != nil {
+		t.Fatalf("set first relay assignment: %v", err)
+	}
+	if err := repository.SetRelayAssignment(context.Background(), assignment); err != nil {
+		t.Fatalf("replacing same target with same relay ID should succeed: %v", err)
+	}
+	assignment.NetworkID = "network-2"
+	assignment.NodeID = "local-2"
+	assignment.RelayNodeID = "relay-2"
+	if err := repository.SetRelayAssignment(context.Background(), assignment); !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected global relay ID conflict, got %v", err)
 	}
 }
 
@@ -292,6 +361,22 @@ func TestMemoryRepositoryUsesCurrentTimeWhenConsumptionTimeIsZero(t *testing.T) 
 
 	if _, err := repository.ConsumeInvite(context.Background(), invite.ID, invite.TokenHash, time.Time{}); !errors.Is(err, ErrInviteExpired) {
 		t.Fatalf("expected expired invite error when time is omitted, got %v", err)
+	}
+}
+
+func TestMemoryRepositoryRejectsInviteConsumptionBeforeCreation(t *testing.T) {
+	repository := NewMemoryRepository()
+	addRepositoryTestNetwork(t, repository)
+	invite := repositoryTestInvite()
+	if err := repository.CreateInvite(context.Background(), invite); err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+
+	if _, err := repository.ConsumeInvite(context.Background(), invite.ID, invite.TokenHash, invite.CreatedAt.Add(-time.Nanosecond)); !errors.Is(err, control.ErrValidation) {
+		t.Fatalf("expected early consumption to be rejected, got %v", err)
+	}
+	if _, err := repository.ConsumeInvite(context.Background(), invite.ID, invite.TokenHash, repositoryTestNow); err != nil {
+		t.Fatalf("invite should remain available after rejected consumption: %v", err)
 	}
 }
 
@@ -518,6 +603,7 @@ func TestSchemaFixtureMatchesCanonicalSchemaAndProtectsSecrets(t *testing.T) {
 		"token_hash",
 		"address inet",
 		"references",
+		"consumed_by_node_id is null or consumed_at is not null",
 	} {
 		if !strings.Contains(schema, requiredFragment) {
 			t.Errorf("schema missing required fragment %q", requiredFragment)
@@ -671,6 +757,149 @@ func TestPostgresRepositoryCanBeConstructedWithoutConnecting(t *testing.T) {
 
 	var _ Repository = repository
 	var _ SQLExecutor = (*sql.DB)(nil)
+}
+
+func TestPostgresRemoveNodeUsesOneTransactionAndUpdatesAffectedNetworks(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT DISTINCT network_id")).
+		WithArgs("relay-node").
+		WillReturnRows(sqlmock.NewRows([]string{"network_id"}).AddRow("network-1").AddRow("network-2"))
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM nodes WHERE id = $1")).
+		WithArgs("relay-node").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	for _, networkID := range []string{"network-1", "network-2"} {
+		mock.ExpectExec(regexp.QuoteMeta("UPDATE networks SET config_version = config_version + 1 WHERE id = $1")).
+			WithArgs(networkID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+	mock.ExpectCommit()
+
+	if err := repository.RemoveNode(context.Background(), "relay-node"); err != nil {
+		t.Fatalf("remove node: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresAddMembershipMapsMissingNetworkAndNodeToNotFound(t *testing.T) {
+	tests := []struct {
+		name       string
+		nodeID     string
+		networkHit bool
+		nodeHit    bool
+	}{
+		{name: "network", nodeID: "node-1", networkHit: false},
+		{name: "node", nodeID: "missing-node", networkHit: true, nodeHit: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("create sql mock: %v", err)
+			}
+			defer database.Close()
+			repository := NewPostgresRepository(database)
+			membership := repositoryTestMembership(test.nodeID, "10.42.0.2", control.MembershipActive)
+
+			mock.ExpectBegin()
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).
+				WithArgs(membership.NetworkID).
+				WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(test.networkHit))
+			if test.networkHit {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).
+					WithArgs(membership.NodeID).
+					WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(test.nodeHit))
+			}
+			mock.ExpectRollback()
+
+			if err := repository.AddMembership(context.Background(), membership); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("expected ErrNotFound, got %v", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unexpected PostgreSQL calls: %v", err)
+			}
+		})
+	}
+}
+
+func TestPostgresCreateInviteMapsMissingNetworkAndConsumedNodeToNotFound(t *testing.T) {
+	tests := []struct {
+		name           string
+		consumedNodeID string
+		networkHit     bool
+		nodeHit        bool
+	}{
+		{name: "network", networkHit: false},
+		{name: "consumed node", consumedNodeID: "missing-node", networkHit: true, nodeHit: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("create sql mock: %v", err)
+			}
+			defer database.Close()
+			repository := NewPostgresRepository(database)
+			invite := repositoryTestInvite()
+			invite.ConsumedByNodeID = test.consumedNodeID
+			consumedAt := repositoryTestNow
+			if test.consumedNodeID != "" {
+				invite.ConsumedAt = &consumedAt
+			}
+
+			mock.ExpectBegin()
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).
+				WithArgs(invite.NetworkID).
+				WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(test.networkHit))
+			if test.networkHit && test.consumedNodeID != "" {
+				mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS")).
+					WithArgs(test.consumedNodeID).
+					WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(test.nodeHit))
+			}
+			mock.ExpectRollback()
+
+			if err := repository.CreateInvite(context.Background(), invite); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("expected ErrNotFound, got %v", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unexpected PostgreSQL calls: %v", err)
+			}
+		})
+	}
+}
+
+func TestPostgresBuildSnapshotUsesReadTransactionBoundary(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, name, ipv4_pool::text, owner_id, config_version, created_at")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "ipv4_pool", "owner_id", "config_version", "created_at"}).
+			AddRow("network-1", "network", "10.42.0.0/24", "owner-1", int64(1), repositoryTestNetwork().CreatedAt))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT m.network_id")).
+		WithArgs("network-1").
+		WillReturnRows(sqlmock.NewRows([]string{"network_id", "node_id", "virtual_ipv4", "role", "status", "id", "display_name", "public_key", "platform", "client_version", "last_seen"}))
+	mock.ExpectRollback()
+
+	if _, err := repository.BuildSnapshotAt(context.Background(), "network-1", "local", repositoryTestNow); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected missing local membership, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
 }
 
 func TestRepositoriesExposeTransactionBoundary(t *testing.T) {

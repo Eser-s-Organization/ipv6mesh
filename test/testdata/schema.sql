@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS invites (
     CHECK (expires_at > created_at),
     CHECK (consumed_at IS NULL OR consumed_at >= created_at),
     CHECK (revoked_at IS NULL OR revoked_at >= created_at),
+    CHECK (consumed_by_node_id IS NULL OR consumed_at IS NOT NULL),
     CHECK (NOT (consumed_at IS NOT NULL AND revoked_at IS NOT NULL))
 );
 
