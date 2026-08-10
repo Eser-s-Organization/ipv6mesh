@@ -11,12 +11,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version-file: go.mod
       - run: go test ./...
       - run: go vet ./...
       - name: Check formatting
         shell: bash
-        run: test -z "$(gofmt -l .)"
+        run: |
+          formatted_files="$(gofmt -l .)" || {
+            echo "gofmt failed" >&2
+            exit 1
+          }
+          if [[ -n "$formatted_files" ]]; then
+            echo "gofmt required for:" >&2
+            printf '%s\n' "$formatted_files" >&2
+            exit 1
+          fi
 
   windows:
     runs-on: windows-latest
@@ -24,5 +33,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version-file: go.mod
       - run: go test ./...
