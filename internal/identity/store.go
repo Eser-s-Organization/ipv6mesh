@@ -143,16 +143,28 @@ func publicKeyForPrivate(privateKey []byte) ([]byte, error) {
 func encodeKey(key []byte) string { return base64.StdEncoding.EncodeToString(key) }
 
 func (store *Store) write(data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(store.path), 0o700); err != nil {
+	secure := store.secure
+	if secure == nil {
+		secure = secureIdentityFile
+	}
+	directory := filepath.Dir(store.path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
-	temporary, err := os.CreateTemp(filepath.Dir(store.path), ".identity-*")
+	if err := secure(directory); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(directory, ".identity-*")
 	if err != nil {
 		return err
 	}
 	temporaryName := temporary.Name()
 	defer os.Remove(temporaryName)
 	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := secure(temporaryName); err != nil {
 		_ = temporary.Close()
 		return err
 	}
@@ -169,10 +181,6 @@ func (store *Store) write(data []byte) error {
 	}
 	if err := os.Rename(temporaryName, store.path); err != nil {
 		return err
-	}
-	secure := store.secure
-	if secure == nil {
-		secure = secureIdentityFile
 	}
 	return secure(store.path)
 }

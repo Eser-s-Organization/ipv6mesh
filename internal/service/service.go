@@ -112,6 +112,14 @@ func (service *Service) Handle(ctx context.Context, request ipc.Request) ipc.Res
 	if err := contextErr(ctx); err != nil {
 		return ipc.ErrorResponse(ipc.CodeInternal)
 	}
+	if request.Type == ipc.CommandStatus {
+		service.mu.RLock()
+		defer service.mu.RUnlock()
+		if !service.started {
+			return ipc.ErrorResponse(ipc.CodeNotStarted)
+		}
+		return ipc.SuccessResponse(service.status)
+	}
 	service.operationMu.Lock()
 	defer service.operationMu.Unlock()
 	service.mu.RLock()
@@ -121,8 +129,6 @@ func (service *Service) Handle(ctx context.Context, request ipc.Request) ipc.Res
 		return ipc.ErrorResponse(ipc.CodeNotStarted)
 	}
 	switch request.Type {
-	case ipc.CommandStatus:
-		return ipc.SuccessResponse(service.statusSnapshot())
 	case ipc.CommandJoin:
 		return service.join(ctx, request)
 	case ipc.CommandLeave:

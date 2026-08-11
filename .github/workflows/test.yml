@@ -35,3 +35,11 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go test ./...
+      - run: go vet ./...
+      - name: Check formatting
+        shell: pwsh
+        run: |
+          $formatted = gofmt -l .
+          if ($formatted) {
+            Write-Error "gofmt required for: $formatted"
+          }
