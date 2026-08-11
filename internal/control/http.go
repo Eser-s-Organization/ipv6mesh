@@ -167,6 +167,8 @@ func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		handler.snapshot(writer, request)
 	case request.Method == http.MethodPost && hasPathSuffix(request.URL.Path, "/heartbeat"):
 		handler.heartbeat(writer, request)
+	case request.Method == http.MethodPost && hasPathSuffix(request.URL.Path, "/leave"):
+		handler.leaveNode(writer, request)
 	case request.Method == http.MethodDelete && strings.HasPrefix(request.URL.Path, "/v1/nodes/"):
 		handler.deleteNode(writer, request)
 	case request.URL.Path == "/v1/events":
@@ -685,6 +687,47 @@ func (handler *Handler) deleteNode(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	if err := handler.authorizeAdminNodeScope(request.Context(), principal, nodeID); err != nil {
+		writeAPIError(writer, statusForError(err), err)
+		return
+	}
+	if err := handler.repository.RemoveNode(request.Context(), nodeID); err != nil {
+		writeAPIError(writer, statusForError(err), err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+func (handler *Handler) leaveNode(writer http.ResponseWriter, request *http.Request) {
+	principal, err := handler.authenticate(request)
+	if err != nil {
+		writeAPIError(writer, statusForError(err), err)
+		return
+	}
+	nodeID, ok := resourceID(request.URL.Path, "nodes", "leave")
+	if !ok {
+		writeAPIError(writer, http.StatusNotFound, ErrNotFound)
+		return
+	}
+	switch principal.session.Role {
+	case auth.RoleNode:
+		if nodeID != principal.session.Subject {
+			writeAPIError(writer, http.StatusForbidden, auth.ErrInsufficientPermission)
+			return
+		}
+		if err := handler.authorizeNetwork(principal, principal.session.NetworkID); err != nil {
+			writeAPIError(writer, statusForError(err), err)
+			return
+		}
+	case auth.RoleAdmin:
+		if err := handler.authorizeAdminNodeScope(request.Context(), principal, nodeID); err != nil {
+			writeAPIError(writer, statusForError(err), err)
+			return
+		}
+	default:
+		writeAPIError(writer, http.StatusForbidden, auth.ErrInsufficientPermission)
+		return
+	}
+	if _, err := handler.repository.GetNode(request.Context(), nodeID); err != nil {
 		writeAPIError(writer, statusForError(err), err)
 		return
 	}

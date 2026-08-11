@@ -216,6 +216,23 @@ func TestClientEventsOpensAuthenticatedWebSocket(t *testing.T) {
 	}
 }
 
+func TestClientLeaveUsesNodeSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/nodes/node-1/leave" || request.Header.Get("Authorization") != "Bearer session-token" {
+			t.Errorf("unexpected leave request: %s %s auth=%q", request.Method, request.URL.Path, request.Header.Get("Authorization"))
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Leave(context.Background(), "network-1", "node-1", "session-token"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientWatchReconnectsWithBoundedBackoff(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 	connections := 0

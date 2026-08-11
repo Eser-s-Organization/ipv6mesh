@@ -468,6 +468,19 @@ func TestHTTPHeartbeatValidatesEndpointsAndAllowsOnlySelfForNode(t *testing.T) {
 	}
 }
 
+func TestHTTPNodeCanLeaveItsOwnNetwork(t *testing.T) {
+	fixture := newHTTPFixture(t, "10.42.0.0/29")
+	invite := fixture.createInvite(t)
+	nodeID, session := fixture.enroll(t, invite, "leave-public-key")
+	response := fixture.doJSON(t, http.MethodPost, "/v1/nodes/"+nodeID+"/leave", "", "Bearer "+session, "node-leave")
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("node leave status = %d, body=%s", response.StatusCode, response.Body)
+	}
+	if response := fixture.doJSON(t, http.MethodPost, "/v1/nodes/"+nodeID+"/leave", "", "Bearer "+session, "node-leave-again"); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("second node leave status = %d, want 404", response.StatusCode)
+	}
+}
+
 func TestHTTPRejectsDuplicateAndPoolExhaustion(t *testing.T) {
 	fixture := newHTTPFixture(t, "10.42.0.0/30")
 	inviteA := fixture.createInvite(t)

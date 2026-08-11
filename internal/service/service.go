@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Eser-s-Organization/ipv6mesh/internal/control"
 	"github.com/Eser-s-Organization/ipv6mesh/internal/identity"
 	"github.com/Eser-s-Organization/ipv6mesh/internal/ipc"
 )
@@ -37,6 +38,23 @@ type ControlClient interface {
 	Leave(context.Context, string) error
 }
 
+type SnapshotClient interface {
+	Snapshot(context.Context, string) (control.NetworkSnapshot, error)
+}
+
+type SnapshotApplier interface {
+	Apply(context.Context, control.NetworkSnapshot) error
+	Clear(context.Context) error
+}
+
+type EndpointSource interface {
+	Discover(context.Context, uint16) ([]control.EndpointCandidate, error)
+}
+
+type EndpointReporter interface {
+	Heartbeat(context.Context, []control.EndpointCandidate) error
+}
+
 type Adapter interface {
 	Connect(context.Context, string) error
 	Disconnect(context.Context, string) error
@@ -47,9 +65,10 @@ type Authorizer interface {
 }
 
 type Options struct {
-	Identity IdentityStore
-	Control  ControlClient
-	Adapter  Adapter
+	Identity   IdentityStore
+	Control    ControlClient
+	Adapter    Adapter
+	Reconciler SnapshotApplier
 }
 
 type Service struct {
@@ -148,14 +167,26 @@ func (service *Service) join(ctx context.Context, request ipc.Request) ipc.Respo
 		return ipc.ErrorResponse(CodeAlreadyJoined)
 	}
 	publicKey := service.identity.PublicKeyValue()
-	control := service.options.Control
+	controlClient := service.options.Control
+	reconciler := service.options.Reconciler
 	service.mu.RUnlock()
-	if strings.TrimSpace(request.Invite) == "" || strings.TrimSpace(request.DisplayName) == "" || control == nil {
+	if strings.TrimSpace(request.Invite) == "" || strings.TrimSpace(request.DisplayName) == "" || controlClient == nil {
 		return ipc.ErrorResponse(ipc.CodeInvalidRequest)
 	}
-	result, err := control.Join(ctx, JoinRequest{Invite: request.Invite, DisplayName: request.DisplayName, PublicKey: publicKey})
+	result, err := controlClient.Join(ctx, JoinRequest{Invite: request.Invite, DisplayName: request.DisplayName, PublicKey: publicKey})
 	if err != nil || result.NetworkID == "" || result.VirtualIPv4 == "" {
 		return ipc.ErrorResponse(CodeControlFailed)
+	}
+	if reconciler != nil {
+		snapshotClient, ok := controlClient.(SnapshotClient)
+		if !ok {
+			return ipc.ErrorResponse(CodeControlFailed)
+		}
+		snapshot, snapshotErr := snapshotClient.Snapshot(ctx, result.NetworkID)
+		if snapshotErr != nil || reconciler.Apply(ctx, snapshot) != nil {
+			_ = controlClient.Leave(ctx, result.NetworkID)
+			return ipc.ErrorResponse(CodeAdapterFailed)
+		}
 	}
 	service.mu.Lock()
 	defer service.mu.Unlock()
@@ -176,7 +207,8 @@ func (service *Service) leave(ctx context.Context, networkID string) ipc.Respons
 	joined := *service.joined
 	pathState := service.status.PathState
 	adapter := service.options.Adapter
-	control := service.options.Control
+	reconciler := service.options.Reconciler
+	controlClient := service.options.Control
 	service.mu.RUnlock()
 	if networkID != joined.NetworkID {
 		return ipc.ErrorResponse(ipc.CodeWrongNetwork)
@@ -186,10 +218,15 @@ func (service *Service) leave(ctx context.Context, networkID string) ipc.Respons
 			return ipc.ErrorResponse(CodeAdapterFailed)
 		}
 	}
-	if control == nil {
+	if reconciler != nil {
+		if err := reconciler.Clear(ctx); err != nil {
+			return ipc.ErrorResponse(CodeAdapterFailed)
+		}
+	}
+	if controlClient == nil {
 		return ipc.ErrorResponse(CodeControlFailed)
 	}
-	if err := control.Leave(ctx, networkID); err != nil {
+	if err := controlClient.Leave(ctx, networkID); err != nil {
 		return ipc.ErrorResponse(CodeControlFailed)
 	}
 	service.mu.Lock()
@@ -207,14 +244,24 @@ func (service *Service) connect(ctx context.Context, networkID string) ipc.Respo
 	}
 	joinedNetworkID := service.joined.NetworkID
 	adapter := service.options.Adapter
+	reconciler := service.options.Reconciler
+	controlClient := service.options.Control
 	service.mu.RUnlock()
 	if networkID != joinedNetworkID {
 		return ipc.ErrorResponse(ipc.CodeWrongNetwork)
 	}
-	if adapter == nil {
+	if reconciler != nil {
+		snapshotClient, ok := controlClient.(SnapshotClient)
+		if !ok {
+			return ipc.ErrorResponse(CodeControlFailed)
+		}
+		snapshot, err := snapshotClient.Snapshot(ctx, networkID)
+		if err != nil || reconciler.Apply(ctx, snapshot) != nil {
+			return ipc.ErrorResponse(CodeAdapterFailed)
+		}
+	} else if adapter == nil {
 		return ipc.ErrorResponse(CodeAdapterFailed)
-	}
-	if err := adapter.Connect(ctx, networkID); err != nil {
+	} else if err := adapter.Connect(ctx, networkID); err != nil {
 		return ipc.ErrorResponse(CodeAdapterFailed)
 	}
 	service.mu.Lock()
@@ -231,14 +278,18 @@ func (service *Service) disconnect(ctx context.Context, networkID string) ipc.Re
 	}
 	joinedNetworkID := service.joined.NetworkID
 	adapter := service.options.Adapter
+	reconciler := service.options.Reconciler
 	service.mu.RUnlock()
 	if networkID != joinedNetworkID {
 		return ipc.ErrorResponse(ipc.CodeWrongNetwork)
 	}
-	if adapter == nil {
+	if reconciler != nil {
+		if err := reconciler.Clear(ctx); err != nil {
+			return ipc.ErrorResponse(CodeAdapterFailed)
+		}
+	} else if adapter == nil {
 		return ipc.ErrorResponse(CodeAdapterFailed)
-	}
-	if err := adapter.Disconnect(ctx, networkID); err != nil {
+	} else if err := adapter.Disconnect(ctx, networkID); err != nil {
 		return ipc.ErrorResponse(CodeAdapterFailed)
 	}
 	service.mu.Lock()

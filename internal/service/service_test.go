@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 
+	"github.com/Eser-s-Organization/ipv6mesh/internal/control"
 	"github.com/Eser-s-Organization/ipv6mesh/internal/identity"
 	"github.com/Eser-s-Organization/ipv6mesh/internal/ipc"
 )
@@ -20,11 +22,13 @@ func (store *fakeIdentityStore) LoadOrCreate() (identity.Identity, error) {
 }
 
 type fakeControlClient struct {
-	joinCalls  int
-	leaveCalls int
-	joinResult JoinResult
-	joinErr    error
-	leaveErr   error
+	joinCalls   int
+	leaveCalls  int
+	joinResult  JoinResult
+	joinErr     error
+	leaveErr    error
+	snapshot    control.NetworkSnapshot
+	snapshotErr error
 }
 
 func (client *fakeControlClient) Join(context.Context, JoinRequest) (JoinResult, error) {
@@ -35,6 +39,10 @@ func (client *fakeControlClient) Join(context.Context, JoinRequest) (JoinResult,
 func (client *fakeControlClient) Leave(context.Context, string) error {
 	client.leaveCalls++
 	return client.leaveErr
+}
+
+func (client *fakeControlClient) Snapshot(context.Context, string) (control.NetworkSnapshot, error) {
+	return client.snapshot, client.snapshotErr
 }
 
 type fakeAdapter struct {
@@ -57,6 +65,23 @@ func (adapter *fakeAdapter) Disconnect(context.Context, string) error {
 type denyAuthorizer struct{}
 
 func (denyAuthorizer) Authorize(context.Context) error { return errors.New("caller is not allowed") }
+
+type fakeSnapshotApplier struct {
+	applyCalls   int
+	clearCalls   int
+	lastSnapshot control.NetworkSnapshot
+}
+
+func (applier *fakeSnapshotApplier) Apply(_ context.Context, snapshot control.NetworkSnapshot) error {
+	applier.applyCalls++
+	applier.lastSnapshot = snapshot
+	return nil
+}
+
+func (applier *fakeSnapshotApplier) Clear(context.Context) error {
+	applier.clearCalls++
+	return nil
+}
 
 func newTestService() (*Service, *fakeControlClient, *fakeAdapter) {
 	controlClient := &fakeControlClient{joinResult: JoinResult{
@@ -137,6 +162,19 @@ func TestLeaveCleansLocalState(t *testing.T) {
 	status := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandStatus})
 	if status.NetworkID != "" || status.VirtualIPv4 != "" || status.ConfigGeneration != 0 {
 		t.Fatalf("local membership survived leave: %#v", status)
+	}
+}
+
+func TestServiceAppliesInitialSnapshotDuringJoin(t *testing.T) {
+	controlClient := &fakeControlClient{joinResult: JoinResult{NetworkID: "network-a", VirtualIPv4: "10.42.0.2", ConfigGeneration: 7}, snapshot: control.NetworkSnapshot{NetworkID: "network-a", Generation: 7, LocalNodeID: "node-1", LocalVirtualIPv4: net.ParseIP("10.42.0.2")}}
+	reconciler := &fakeSnapshotApplier{}
+	service := New(Options{Identity: &fakeIdentityStore{identity: identity.Identity{PublicKey: "public-key"}}, Control: controlClient, Reconciler: reconciler})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	response := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandJoin, Invite: "invite-value", DisplayName: "device-a"})
+	if !response.OK || reconciler.applyCalls != 1 || reconciler.lastSnapshot.Generation != 7 {
+		t.Fatalf("join snapshot reconciliation = response %#v, reconciler %#v", response, reconciler)
 	}
 }
 

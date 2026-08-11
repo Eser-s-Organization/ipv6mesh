@@ -163,6 +163,13 @@ func (client *Client) Heartbeat(ctx context.Context, networkID, nodeID, sessionT
 	return client.doJSON(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(nodeID)+"/heartbeat", sessionToken, request, nil)
 }
 
+func (client *Client) Leave(ctx context.Context, networkID, nodeID, sessionToken string) error {
+	if strings.TrimSpace(networkID) == "" || strings.TrimSpace(nodeID) == "" || strings.TrimSpace(sessionToken) == "" {
+		return ErrValidation
+	}
+	return client.doJSON(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(nodeID)+"/leave", sessionToken, nil, nil)
+}
+
 func (client *Client) Snapshot(ctx context.Context, networkID, sessionToken string) (NetworkSnapshot, error) {
 	if strings.TrimSpace(networkID) == "" || strings.TrimSpace(sessionToken) == "" {
 		return NetworkSnapshot{}, ErrValidation

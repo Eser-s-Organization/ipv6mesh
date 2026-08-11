@@ -37,6 +37,23 @@ type Identity struct {
 // PublicKeyValue returns the base64-encoded WireGuard public key.
 func (identity Identity) PublicKeyValue() string { return identity.PublicKey }
 
+// WithPrivateKey gives a trusted in-process data-plane constructor a temporary
+// copy of the private key. The callback is the only access boundary; the copy
+// is wiped immediately after it returns and the key is never part of IPC or
+// JSON models.
+func (identity Identity) WithPrivateKey(consumer func([]byte) error) error {
+	if consumer == nil || len(identity.privateKey) != 32 {
+		return ErrInvalidIdentity
+	}
+	value := append([]byte(nil), identity.privateKey...)
+	defer func() {
+		for index := range value {
+			value[index] = 0
+		}
+	}()
+	return consumer(value)
+}
+
 type record struct {
 	Version             int    `json:"version"`
 	PublicKey           string `json:"public_key"`

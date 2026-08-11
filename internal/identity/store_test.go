@@ -106,3 +106,34 @@ func TestIdentityDoesNotExposePrivateKey(t *testing.T) {
 		t.Fatal("identity exposes a private-key accessor")
 	}
 }
+
+func TestIdentityPassesPrivateKeyOnlyThroughScopedCallback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "identity.json")
+	identity, err := NewStoreWithProtector(path, testProtector{key: [32]byte{9, 8, 7}}).LoadOrCreate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var captured []byte
+	if err := identity.WithPrivateKey(func(value []byte) error {
+		captured = append([]byte(nil), value...)
+		for index := range value {
+			value[index] = 0
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(captured) != 32 {
+		t.Fatalf("callback received %d private-key bytes", len(captured))
+	}
+	if err := identity.WithPrivateKey(func(value []byte) error {
+		for _, byteValue := range value {
+			if byteValue != 0 {
+				return nil
+			}
+		}
+		return ErrInvalidIdentity
+	}); err != nil {
+		t.Fatalf("private key was not retained after scoped callback: %v", err)
+	}
+}
