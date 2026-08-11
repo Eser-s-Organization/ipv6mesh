@@ -126,3 +126,19 @@ func TestSessionNetworkAuthorizationRejectsExpiredSessionClaims(t *testing.T) {
 		t.Fatalf("expired authorization error = %v, want ErrSessionExpired", err)
 	}
 }
+
+func TestRevokeSessionInvalidatesOpaqueToken(t *testing.T) {
+	store := auth.NewSessionStoreWithOptions(auth.SessionStoreOptions{
+		TTL:    time.Hour,
+		Now:    time.Now,
+		Random: bytes.NewReader(bytes.Repeat([]byte{0x7d}, 64)),
+	})
+	token, _, err := store.IssueNodeSession("node-1", "network-1")
+	if err != nil {
+		t.Fatalf("issue node session: %v", err)
+	}
+	store.RevokeSession(token)
+	if _, err := store.Authenticate(token); !errors.Is(err, auth.ErrInvalidCredential) {
+		t.Fatalf("revoked session error = %v, want ErrInvalidCredential", err)
+	}
+}

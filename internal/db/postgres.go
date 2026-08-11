@@ -303,6 +303,23 @@ func (repository *PostgresRepository) GetNode(ctx context.Context, nodeID string
 		FROM nodes WHERE id = $1`, nodeID))
 }
 
+// GetNodeNetworkIDs verifies the node exists before returning its membership
+// scope. This lets authorization distinguish an unknown node from a node whose
+// network ownership cannot be established.
+func (repository *PostgresRepository) GetNodeNetworkIDs(ctx context.Context, nodeID string) ([]string, error) {
+	executor, err := repository.executor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var existingID string
+	if err := executor.QueryRowContext(ctx, `SELECT id FROM nodes WHERE id = $1`, nodeID).Scan(&existingID); errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	} else if err != nil {
+		return nil, err
+	}
+	return queryMembershipNetworkIDs(ctx, executor, nodeID)
+}
+
 // TouchNode updates only a node's observation timestamp. LastSeen is not part
 // of versioned network configuration.
 func (repository *PostgresRepository) TouchNode(ctx context.Context, nodeID string, lastSeen time.Time) error {

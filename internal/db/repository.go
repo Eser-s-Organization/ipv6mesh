@@ -371,6 +371,28 @@ func (repository *MemoryRepository) GetNode(ctx context.Context, nodeID string) 
 	return cloneNode(node), nil
 }
 
+// GetNodeNetworkIDs returns every network containing the node, in a stable
+// order. An empty result for an existing node is intentionally distinguishable
+// from ErrNotFound so callers can reject nodes whose scope cannot be proven.
+func (repository *MemoryRepository) GetNodeNetworkIDs(ctx context.Context, nodeID string) ([]string, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	repository.mu.RLock()
+	defer repository.mu.RUnlock()
+	if _, exists := repository.nodes[nodeID]; !exists {
+		return nil, ErrNotFound
+	}
+	networkIDs := make([]string, 0)
+	for networkID, memberships := range repository.memberships {
+		if _, exists := memberships[nodeID]; exists {
+			networkIDs = append(networkIDs, networkID)
+		}
+	}
+	sort.Strings(networkIDs)
+	return networkIDs, nil
+}
+
 // TouchNode updates only the last-seen observation and does not advance a
 // network configuration version.
 func (repository *MemoryRepository) TouchNode(ctx context.Context, nodeID string, lastSeen time.Time) error {

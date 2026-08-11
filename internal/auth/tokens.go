@@ -251,6 +251,18 @@ func (store *SessionStore) AuthorizeNetwork(session Session, networkID string) e
 	}
 }
 
+// RevokeSession removes one issued session. It is used to compensate for a
+// persistence commit failure after a transaction has reached its final
+// session-signing step.
+func (store *SessionStore) RevokeSession(token string) {
+	if store == nil || token == "" {
+		return
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	delete(store.sessions, token)
+}
+
 // RevokeNetwork records a network-level denial. Existing sessions are kept so
 // callers can distinguish a revoked network (403) from an unknown credential
 // (401).

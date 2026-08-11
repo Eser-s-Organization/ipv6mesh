@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -52,11 +53,15 @@ func (reader *incrementingReader) Read(target []byte) (int, error) {
 }
 
 func newHTTPFixture(t *testing.T, pool string) *httpFixture {
+	return newHTTPFixtureWithSessionTTL(t, pool, time.Hour)
+}
+
+func newHTTPFixtureWithSessionTTL(t *testing.T, pool string, sessionTTL time.Duration) *httpFixture {
 	t.Helper()
 	repository := db.NewMemoryRepository()
 	ids := &testIDSource{values: []string{"network-1", "invite-1", "invite-2", "invite-3", "node-a", "node-b", "node-c"}}
 	sessions := auth.NewSessionStoreWithOptions(auth.SessionStoreOptions{
-		TTL:    time.Hour,
+		TTL:    sessionTTL,
 		Now:    func() time.Time { return httpTestNow },
 		Random: &incrementingReader{},
 	})
@@ -224,6 +229,71 @@ func TestHTTPEnforcesNetworkAndRoleAuthorization(t *testing.T) {
 	fixture.sessions.RevokeNetwork("network-1")
 	if response := fixture.doJSON(t, http.MethodGet, "/v1/networks/network-1/snapshot", "", "Bearer "+nodeSession, "revoked-network"); response.StatusCode != http.StatusForbidden {
 		t.Fatalf("revoked-network snapshot status = %d, body=%s; want 403", response.StatusCode, response.Body)
+	}
+}
+
+func TestHTTPScopedAdminCannotCrossNetworkOrCreateUnscopedNetwork(t *testing.T) {
+	fixture := newHTTPFixture(t, "10.42.0.0/29")
+	inviteA := fixture.createInvite(t)
+	nodeA, _ := fixture.enroll(t, inviteA, "public-a")
+
+	secondNetwork := fixture.doJSON(t, http.MethodPost, "/v1/networks", `{"name":"other","pool":"10.43.0.0/29"}`, "Bearer bootstrap-token", "scoped-network-two")
+	if secondNetwork.StatusCode != http.StatusCreated {
+		t.Fatalf("create second network status = %d, body=%s", secondNetwork.StatusCode, secondNetwork.Body)
+	}
+	secondNetworkID := objectString(t, responseObject(t, secondNetwork), "id")
+	secondInvite := fixture.doJSON(t, http.MethodPost, "/v1/networks/"+secondNetworkID+"/invites", `{"expires_in":"1h"}`, "Bearer bootstrap-token", "scoped-invite-two")
+	if secondInvite.StatusCode != http.StatusCreated {
+		t.Fatalf("create second invite status = %d, body=%s", secondInvite.StatusCode, secondInvite.Body)
+	}
+	nodeB, _ := fixture.enroll(t, objectString(t, responseObject(t, secondInvite), "token"), "public-b")
+
+	scopedToken, _, err := fixture.sessions.IssueAdminNetworkSession("scoped-admin", "network-1")
+	if err != nil {
+		t.Fatalf("issue scoped admin session: %v", err)
+	}
+	authorization := "Bearer " + scopedToken
+	if response := fixture.doJSON(t, http.MethodPost, "/v1/networks", `{"name":"unscoped","pool":"10.44.0.0/29"}`, authorization, "scoped-create-network"); response.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped create network status = %d, body=%s; want 403", response.StatusCode, response.Body)
+	}
+	if response := fixture.doJSON(t, http.MethodPost, "/v1/networks/"+secondNetworkID+"/invites", `{"expires_in":"1h"}`, authorization, "scoped-create-invite"); response.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped create cross-network invite status = %d, body=%s; want 403", response.StatusCode, response.Body)
+	}
+	if response := fixture.doJSON(t, http.MethodPost, "/v1/nodes/"+nodeA+"/heartbeat", `{}`, authorization, "scoped-heartbeat-own"); response.StatusCode != http.StatusNoContent {
+		t.Fatalf("scoped heartbeat own node status = %d, body=%s; want 204", response.StatusCode, response.Body)
+	}
+	if response := fixture.doJSON(t, http.MethodPost, "/v1/nodes/"+nodeB+"/heartbeat", `{}`, authorization, "scoped-heartbeat-other"); response.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped heartbeat cross-network status = %d, body=%s; want 403", response.StatusCode, response.Body)
+	}
+	if response := fixture.doJSON(t, http.MethodDelete, "/v1/nodes/"+nodeB, "", authorization, "scoped-delete-other"); response.StatusCode != http.StatusForbidden {
+		t.Fatalf("scoped delete cross-network status = %d, body=%s; want 403", response.StatusCode, response.Body)
+	}
+}
+
+func TestHTTPEnrollmentSessionFailureRollsBackNodeMembershipAndInvite(t *testing.T) {
+	fixture := newHTTPFixtureWithSessionTTL(t, "10.42.0.0/29", 0)
+	invite := fixture.createInvite(t)
+	response := fixture.doJSON(t, http.MethodPost, "/v1/enrollments", `{"invite":"`+invite+`","node_id":"rollback-node","display_name":"rollback","public_key":"rollback-key","platform":"windows","client_version":"0.1.0"}`, "", "enrollment-session-failure")
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("session failure status = %d, body=%s; want 500", response.StatusCode, response.Body)
+	}
+	if _, err := fixture.repository.GetNode(context.Background(), "rollback-node"); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("node after session failure = %v; want ErrNotFound", err)
+	}
+	network, err := fixture.repository.GetNetwork(context.Background(), "network-1")
+	if err != nil {
+		t.Fatalf("get network after session failure: %v", err)
+	}
+	if network.ConfigVersion != 1 {
+		t.Fatalf("network config version after session failure = %d; want 1", network.ConfigVersion)
+	}
+	inviteID := strings.SplitN(invite, ".", 2)[0]
+	consumed, err := fixture.repository.ConsumeInvite(context.Background(), inviteID, auth.HashToken(invite), httpTestNow)
+	if err != nil {
+		t.Fatalf("consume invite after session failure: %v", err)
+	}
+	if consumed.ID != inviteID || consumed.ConsumedByNodeID != "" || consumed.ConsumedAt == nil {
+		t.Fatalf("invite after session failure = %+v", consumed)
 	}
 }
 

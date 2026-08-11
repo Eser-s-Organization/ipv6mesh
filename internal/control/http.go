@@ -197,10 +197,47 @@ func (handler *Handler) authorizeNetwork(principal principal, networkID string) 
 	return handler.sessions.AuthorizeNetwork(principal.session, networkID)
 }
 
+type nodeNetworkScopeResolver interface {
+	GetNodeNetworkIDs(context.Context, string) ([]string, error)
+}
+
+// authorizeAdminNodeScope proves that a scoped administrator's target node is
+// a member only of the administrator's network. If the repository cannot
+// provide that proof, the operation is denied rather than guessed.
+func (handler *Handler) authorizeAdminNodeScope(ctx context.Context, principal principal, nodeID string) error {
+	if principal.session.Role != auth.RoleAdmin {
+		return auth.ErrInsufficientPermission
+	}
+	if strings.TrimSpace(principal.session.NetworkID) == "" {
+		return nil
+	}
+	resolver, ok := handler.repository.(nodeNetworkScopeResolver)
+	if !ok {
+		return auth.ErrInsufficientPermission
+	}
+	networkIDs, err := resolver.GetNodeNetworkIDs(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	if len(networkIDs) == 0 {
+		return auth.ErrInsufficientPermission
+	}
+	for _, networkID := range networkIDs {
+		if networkID != principal.session.NetworkID {
+			return auth.ErrWrongNetwork
+		}
+	}
+	return handler.authorizeNetwork(principal, principal.session.NetworkID)
+}
+
 func (handler *Handler) createNetwork(writer http.ResponseWriter, request *http.Request) {
 	principal, err := handler.requireAdmin(request)
 	if err != nil {
 		writeAPIError(writer, statusForError(err), err)
+		return
+	}
+	if strings.TrimSpace(principal.session.NetworkID) != "" {
+		writeAPIError(writer, http.StatusForbidden, auth.ErrInsufficientPermission)
 		return
 	}
 	var body struct {
@@ -313,17 +350,12 @@ func (handler *Handler) enroll(writer http.ResponseWriter, request *http.Request
 		writeAPIError(writer, statusForError(err), err)
 		return
 	}
-	token, session, err := handler.sessions.IssueNodeSession(result.Subject, result.NetworkID)
-	if err != nil {
-		writeAPIError(writer, statusForError(err), err)
-		return
-	}
 	writeJSON(writer, http.StatusCreated, enrollmentResponse{
 		Node:         makeNodeResponse(result.Node),
 		Membership:   makeMembershipResponse(result.Membership),
 		Network:      makeNetworkResponse(result.Network),
-		Session:      sessionResponse{Token: token, Subject: session.Subject, NetworkID: session.NetworkID, ExpiresAt: session.ExpiresAt},
-		SessionToken: token,
+		Session:      sessionResponse{Token: result.SessionToken, Subject: result.Session.Subject, NetworkID: result.Session.NetworkID, ExpiresAt: result.Session.ExpiresAt},
+		SessionToken: result.SessionToken,
 	})
 }
 
@@ -337,11 +369,13 @@ type enrollmentRequest struct {
 }
 
 type enrollmentResult struct {
-	Node       Node
-	Membership Membership
-	Network    Network
-	Subject    string
-	NetworkID  string
+	Node         Node
+	Membership   Membership
+	Network      Network
+	Subject      string
+	NetworkID    string
+	Session      auth.Session
+	SessionToken string
 }
 
 func (handler *Handler) enrollControl(ctx context.Context, request enrollmentRequest) (enrollmentResult, error) {
@@ -369,6 +403,7 @@ func (handler *Handler) enrollControl(ctx context.Context, request enrollmentReq
 	}
 	now := handler.clock().UTC()
 	var result enrollmentResult
+	var issuedToken string
 	err := handler.repository.WithTransaction(ctx, func(transactionContext context.Context, transaction Repository) error {
 		node := Node{ID: nodeID, DisplayName: request.DisplayName, PublicKey: request.PublicKey, Platform: request.Platform, ClientVersion: request.ClientVersion, LastSeen: now}
 		if err := transaction.AddNode(transactionContext, node); err != nil {
@@ -413,9 +448,19 @@ func (handler *Handler) enrollControl(ctx context.Context, request enrollmentReq
 			return err
 		}
 		result = enrollmentResult{Node: node, Membership: membership, Network: currentNetwork, Subject: node.ID, NetworkID: network.ID}
+		token, session, err := handler.sessions.IssueNodeSession(result.Subject, result.NetworkID)
+		if err != nil {
+			return err
+		}
+		issuedToken = token
+		result.Session = session
+		result.SessionToken = token
 		return nil
 	})
 	if err != nil {
+		if issuedToken != "" {
+			handler.sessions.RevokeSession(issuedToken)
+		}
 		return enrollmentResult{}, err
 	}
 	return result, nil
@@ -487,6 +532,9 @@ func (handler *Handler) heartbeat(writer http.ResponseWriter, request *http.Requ
 	} else if principal.session.Role != auth.RoleAdmin {
 		writeAPIError(writer, http.StatusForbidden, auth.ErrInsufficientPermission)
 		return
+	} else if err := handler.authorizeAdminNodeScope(request.Context(), principal, nodeID); err != nil {
+		writeAPIError(writer, statusForError(err), err)
+		return
 	}
 	if _, err := handler.repository.GetNode(request.Context(), nodeID); err != nil {
 		writeAPIError(writer, statusForError(err), err)
@@ -552,7 +600,8 @@ func parseHeartbeatEndpoint(nodeID string, endpoint heartbeatEndpoint) (Endpoint
 }
 
 func (handler *Handler) deleteNode(writer http.ResponseWriter, request *http.Request) {
-	if _, err := handler.requireAdmin(request); err != nil {
+	principal, err := handler.requireAdmin(request)
+	if err != nil {
 		writeAPIError(writer, statusForError(err), err)
 		return
 	}
@@ -564,6 +613,10 @@ func (handler *Handler) deleteNode(writer http.ResponseWriter, request *http.Req
 	nodeID, err := url.PathUnescape(parts[2])
 	if err != nil || nodeID == "" {
 		writeAPIError(writer, http.StatusNotFound, ErrNotFound)
+		return
+	}
+	if err := handler.authorizeAdminNodeScope(request.Context(), principal, nodeID); err != nil {
+		writeAPIError(writer, statusForError(err), err)
 		return
 	}
 	if err := handler.repository.RemoveNode(request.Context(), nodeID); err != nil {
