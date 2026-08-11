@@ -92,6 +92,28 @@ func TestServiceLoadsIdentityAndRejectsDuplicateJoin(t *testing.T) {
 	}
 }
 
+func TestServiceStartIsIdempotentAndPreservesMembership(t *testing.T) {
+	store := &fakeIdentityStore{identity: identity.Identity{PublicKey: "public-key"}}
+	controlClient := &fakeControlClient{joinResult: JoinResult{NetworkID: "network-a", VirtualIPv4: "100.64.0.2", ConfigGeneration: 7}}
+	service := New(Options{Identity: store, Control: controlClient, Adapter: &fakeAdapter{}})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	if response := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandJoin, Invite: "invite-value", DisplayName: "device-a"}); !response.OK {
+		t.Fatalf("join failed: %#v", response)
+	}
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatalf("second Start: %v", err)
+	}
+	if store.loads != 1 {
+		t.Fatalf("identity loads = %d, want 1", store.loads)
+	}
+	status := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandStatus})
+	if !status.OK || status.NetworkID != "network-a" || status.VirtualIPv4 != "100.64.0.2" {
+		t.Fatalf("membership after idempotent Start = %#v", status)
+	}
+}
+
 func TestLeaveCleansLocalState(t *testing.T) {
 	service, controlClient, adapter := newTestService()
 	if err := service.Start(context.Background()); err != nil {

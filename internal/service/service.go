@@ -53,12 +53,13 @@ type Options struct {
 }
 
 type Service struct {
-	mu       sync.RWMutex
-	identity identity.Identity
-	options  Options
-	started  bool
-	joined   *JoinResult
-	status   ipc.Status
+	mu          sync.RWMutex
+	operationMu sync.Mutex
+	identity    identity.Identity
+	options     Options
+	started     bool
+	joined      *JoinResult
+	status      ipc.Status
 }
 
 func New(options Options) *Service {
@@ -68,6 +69,14 @@ func New(options Options) *Service {
 func (service *Service) Start(ctx context.Context) error {
 	if service == nil || service.options.Identity == nil {
 		return ErrInvalidOptions
+	}
+	service.operationMu.Lock()
+	defer service.operationMu.Unlock()
+	service.mu.RLock()
+	started := service.started
+	service.mu.RUnlock()
+	if started {
+		return nil
 	}
 	loaded, err := service.options.Identity.LoadOrCreate()
 	if err != nil {
@@ -81,6 +90,9 @@ func (service *Service) Start(ctx context.Context) error {
 	}
 	service.mu.Lock()
 	defer service.mu.Unlock()
+	if service.started {
+		return nil
+	}
 	service.identity = loaded
 	service.started = true
 	service.status = ipc.Status{PathState: ipc.PathStateDisconnected}
@@ -100,96 +112,137 @@ func (service *Service) Handle(ctx context.Context, request ipc.Request) ipc.Res
 	if err := contextErr(ctx); err != nil {
 		return ipc.ErrorResponse(ipc.CodeInternal)
 	}
-	service.mu.Lock()
-	defer service.mu.Unlock()
-	if !service.started {
+	service.operationMu.Lock()
+	defer service.operationMu.Unlock()
+	service.mu.RLock()
+	started := service.started
+	service.mu.RUnlock()
+	if !started {
 		return ipc.ErrorResponse(ipc.CodeNotStarted)
 	}
 	switch request.Type {
 	case ipc.CommandStatus:
-		return ipc.SuccessResponse(service.status)
+		return ipc.SuccessResponse(service.statusSnapshot())
 	case ipc.CommandJoin:
-		return service.joinLocked(ctx, request)
+		return service.join(ctx, request)
 	case ipc.CommandLeave:
-		return service.leaveLocked(ctx, request.NetworkID)
+		return service.leave(ctx, request.NetworkID)
 	case ipc.CommandConnect:
-		return service.connectLocked(ctx, request.NetworkID)
+		return service.connect(ctx, request.NetworkID)
 	case ipc.CommandDisconnect:
-		return service.disconnectLocked(ctx, request.NetworkID)
+		return service.disconnect(ctx, request.NetworkID)
 	default:
 		return ipc.ErrorResponse(ipc.CodeInvalidRequest)
 	}
 }
+func (service *Service) statusSnapshot() ipc.Status {
+	service.mu.RLock()
+	defer service.mu.RUnlock()
+	return service.status
+}
 
-func (service *Service) joinLocked(ctx context.Context, request ipc.Request) ipc.Response {
+func (service *Service) join(ctx context.Context, request ipc.Request) ipc.Response {
+	service.mu.RLock()
 	if service.joined != nil {
+		service.mu.RUnlock()
 		return ipc.ErrorResponse(CodeAlreadyJoined)
 	}
-	if strings.TrimSpace(request.Invite) == "" || strings.TrimSpace(request.DisplayName) == "" || service.options.Control == nil {
+	publicKey := service.identity.PublicKeyValue()
+	control := service.options.Control
+	service.mu.RUnlock()
+	if strings.TrimSpace(request.Invite) == "" || strings.TrimSpace(request.DisplayName) == "" || control == nil {
 		return ipc.ErrorResponse(ipc.CodeInvalidRequest)
 	}
-	result, err := service.options.Control.Join(ctx, JoinRequest{Invite: request.Invite, DisplayName: request.DisplayName, PublicKey: service.identity.PublicKeyValue()})
+	result, err := control.Join(ctx, JoinRequest{Invite: request.Invite, DisplayName: request.DisplayName, PublicKey: publicKey})
 	if err != nil || result.NetworkID == "" || result.VirtualIPv4 == "" {
 		return ipc.ErrorResponse(CodeControlFailed)
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if service.joined != nil {
+		return ipc.ErrorResponse(CodeAlreadyJoined)
 	}
 	service.joined = &result
 	service.status = ipc.Status{NetworkID: result.NetworkID, VirtualIPv4: result.VirtualIPv4, PathState: ipc.PathStateDisconnected, ConfigGeneration: result.ConfigGeneration}
 	return ipc.SuccessResponse(service.status)
 }
 
-func (service *Service) leaveLocked(ctx context.Context, networkID string) ipc.Response {
+func (service *Service) leave(ctx context.Context, networkID string) ipc.Response {
+	service.mu.RLock()
 	if service.joined == nil {
+		service.mu.RUnlock()
 		return ipc.ErrorResponse(CodeNotJoined)
 	}
-	if networkID != service.joined.NetworkID {
+	joined := *service.joined
+	pathState := service.status.PathState
+	adapter := service.options.Adapter
+	control := service.options.Control
+	service.mu.RUnlock()
+	if networkID != joined.NetworkID {
 		return ipc.ErrorResponse(ipc.CodeWrongNetwork)
 	}
-	if service.status.PathState != ipc.PathStateDisconnected && service.options.Adapter != nil {
-		if err := service.options.Adapter.Disconnect(ctx, networkID); err != nil {
+	if pathState != ipc.PathStateDisconnected && adapter != nil {
+		if err := adapter.Disconnect(ctx, networkID); err != nil {
 			return ipc.ErrorResponse(CodeAdapterFailed)
 		}
 	}
-	if service.options.Control == nil {
+	if control == nil {
 		return ipc.ErrorResponse(CodeControlFailed)
 	}
-	if err := service.options.Control.Leave(ctx, networkID); err != nil {
+	if err := control.Leave(ctx, networkID); err != nil {
 		return ipc.ErrorResponse(CodeControlFailed)
 	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
 	service.joined = nil
 	service.status = ipc.Status{PathState: ipc.PathStateDisconnected}
 	return ipc.SuccessResponse(service.status)
 }
 
-func (service *Service) connectLocked(ctx context.Context, networkID string) ipc.Response {
+func (service *Service) connect(ctx context.Context, networkID string) ipc.Response {
+	service.mu.RLock()
 	if service.joined == nil {
+		service.mu.RUnlock()
 		return ipc.ErrorResponse(CodeNotJoined)
 	}
-	if networkID != service.joined.NetworkID {
+	joinedNetworkID := service.joined.NetworkID
+	adapter := service.options.Adapter
+	service.mu.RUnlock()
+	if networkID != joinedNetworkID {
 		return ipc.ErrorResponse(ipc.CodeWrongNetwork)
 	}
-	if service.options.Adapter == nil {
+	if adapter == nil {
 		return ipc.ErrorResponse(CodeAdapterFailed)
 	}
-	if err := service.options.Adapter.Connect(ctx, networkID); err != nil {
+	if err := adapter.Connect(ctx, networkID); err != nil {
 		return ipc.ErrorResponse(CodeAdapterFailed)
 	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
 	service.status.PathState = ipc.PathStateDirect
 	return ipc.SuccessResponse(service.status)
 }
 
-func (service *Service) disconnectLocked(ctx context.Context, networkID string) ipc.Response {
+func (service *Service) disconnect(ctx context.Context, networkID string) ipc.Response {
+	service.mu.RLock()
 	if service.joined == nil {
+		service.mu.RUnlock()
 		return ipc.ErrorResponse(CodeNotJoined)
 	}
-	if networkID != service.joined.NetworkID {
+	joinedNetworkID := service.joined.NetworkID
+	adapter := service.options.Adapter
+	service.mu.RUnlock()
+	if networkID != joinedNetworkID {
 		return ipc.ErrorResponse(ipc.CodeWrongNetwork)
 	}
-	if service.options.Adapter == nil {
+	if adapter == nil {
 		return ipc.ErrorResponse(CodeAdapterFailed)
 	}
-	if err := service.options.Adapter.Disconnect(ctx, networkID); err != nil {
+	if err := adapter.Disconnect(ctx, networkID); err != nil {
 		return ipc.ErrorResponse(CodeAdapterFailed)
 	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
 	service.status.PathState = ipc.PathStateDisconnected
 	return ipc.SuccessResponse(service.status)
 }

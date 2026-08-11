@@ -48,14 +48,17 @@ type Store struct {
 	path      string
 	protector Protector
 	random    io.Reader
+	secure    func(string) error
 }
 
 func NewStore(path string) *Store {
-	return &Store{path: path, random: rand.Reader}
+	return &Store{path: path, random: rand.Reader, secure: secureIdentityFile}
 }
 
 func NewStoreWithProtector(path string, protector Protector) *Store {
-	return &Store{path: path, protector: protector, random: rand.Reader}
+	// This constructor is the test-injection boundary. Production callers use
+	// NewStore so platform ACL enforcement cannot be bypassed.
+	return &Store{path: path, protector: protector, random: rand.Reader, secure: func(string) error { return nil }}
 }
 
 // LoadOrCreate loads an existing identity or creates it atomically on first
@@ -167,5 +170,9 @@ func (store *Store) write(data []byte) error {
 	if err := os.Rename(temporaryName, store.path); err != nil {
 		return err
 	}
-	return secureIdentityFile(store.path)
+	secure := store.secure
+	if secure == nil {
+		secure = secureIdentityFile
+	}
+	return secure(store.path)
 }

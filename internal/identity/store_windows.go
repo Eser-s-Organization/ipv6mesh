@@ -18,7 +18,7 @@ func (dpapiProtector) Protect(plain []byte) ([]byte, error) {
 	}
 	in := windows.DataBlob{Size: uint32(len(plain)), Data: &plain[0]}
 	var out windows.DataBlob
-	if err := windows.CryptProtectData(&in, nil, nil, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN, &out); err != nil {
+	if err := windows.CryptProtectData(&in, nil, nil, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN|windows.CRYPTPROTECT_LOCAL_MACHINE, &out); err != nil {
 		return nil, err
 	}
 	defer windows.LocalFree(windows.Handle(unsafe.Pointer(out.Data)))
@@ -31,7 +31,7 @@ func (dpapiProtector) Unprotect(protected []byte) ([]byte, error) {
 	}
 	in := windows.DataBlob{Size: uint32(len(protected)), Data: &protected[0]}
 	var out windows.DataBlob
-	if err := windows.CryptUnprotectData(&in, nil, nil, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN, &out); err != nil {
+	if err := windows.CryptUnprotectData(&in, nil, nil, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN|windows.CRYPTPROTECT_LOCAL_MACHINE, &out); err != nil {
 		return nil, err
 	}
 	defer windows.LocalFree(windows.Handle(unsafe.Pointer(out.Data)))
@@ -41,7 +41,7 @@ func (dpapiProtector) Unprotect(protected []byte) ([]byte, error) {
 // secureIdentityFile applies a protected DACL: LocalSystem and built-in
 // Administrators can access the file; ordinary users cannot.
 func secureIdentityFile(path string) error {
-	sd, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)")
+	sd, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;SY)(A;;FA;;;BA)")
 	if err != nil {
 		return err
 	}
