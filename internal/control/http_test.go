@@ -3,6 +3,7 @@ package control_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -52,20 +53,73 @@ func (reader *incrementingReader) Read(target []byte) (int, error) {
 	return len(target), nil
 }
 
+var (
+	errCommitAfterCommit   = errors.New("commit status unknown after commit")
+	errTransactionRollback = errors.New("transaction rolled back")
+)
+
+type commitErrorAfterCommitRepository struct {
+	*db.MemoryRepository
+}
+
+func (repository *commitErrorAfterCommitRepository) WithTransaction(ctx context.Context, operation func(context.Context, control.Repository) error) error {
+	if err := repository.MemoryRepository.WithTransaction(ctx, operation); err != nil {
+		return err
+	}
+	return errCommitAfterCommit
+}
+
+type uncertainReadbackRepository struct {
+	*db.MemoryRepository
+	readbackErr error
+}
+
+func (repository *uncertainReadbackRepository) WithTransaction(ctx context.Context, operation func(context.Context, control.Repository) error) error {
+	if err := repository.MemoryRepository.WithTransaction(ctx, operation); err != nil {
+		return err
+	}
+	return errCommitAfterCommit
+}
+
+func (repository *uncertainReadbackRepository) GetNode(context.Context, string) (control.Node, error) {
+	return control.Node{}, repository.readbackErr
+}
+
+func (repository *uncertainReadbackRepository) GetNodeNetworkIDs(context.Context, string) ([]string, error) {
+	return nil, repository.readbackErr
+}
+
+type rollbackAfterCallbackRepository struct {
+	*db.MemoryRepository
+	transaction *db.MemoryRepository
+}
+
+func (repository *rollbackAfterCallbackRepository) WithTransaction(ctx context.Context, operation func(context.Context, control.Repository) error) error {
+	if err := operation(ctx, repository.transaction); err != nil {
+		return err
+	}
+	return errTransactionRollback
+}
+
 func newHTTPFixture(t *testing.T, pool string) *httpFixture {
-	return newHTTPFixtureWithSessionTTL(t, pool, time.Hour)
+	repository := db.NewMemoryRepository()
+	return newHTTPFixtureWithRepositories(t, pool, repository, repository, time.Hour)
 }
 
 func newHTTPFixtureWithSessionTTL(t *testing.T, pool string, sessionTTL time.Duration) *httpFixture {
-	t.Helper()
 	repository := db.NewMemoryRepository()
+	return newHTTPFixtureWithRepositories(t, pool, repository, repository, sessionTTL)
+}
+
+func newHTTPFixtureWithRepositories(t *testing.T, pool string, repository *db.MemoryRepository, handlerRepository control.TransactionalRepository, sessionTTL time.Duration) *httpFixture {
+	t.Helper()
 	ids := &testIDSource{values: []string{"network-1", "invite-1", "invite-2", "invite-3", "node-a", "node-b", "node-c"}}
 	sessions := auth.NewSessionStoreWithOptions(auth.SessionStoreOptions{
 		TTL:    sessionTTL,
 		Now:    func() time.Time { return httpTestNow },
 		Random: &incrementingReader{},
 	})
-	handler := control.NewHandler(repository, control.HandlerOptions{
+	handler := control.NewHandler(handlerRepository, control.HandlerOptions{
 		BootstrapToken: "bootstrap-token",
 		SessionStore:   sessions,
 		InviteTTL:      time.Hour,
@@ -267,6 +321,91 @@ func TestHTTPScopedAdminCannotCrossNetworkOrCreateUnscopedNetwork(t *testing.T) 
 	}
 	if response := fixture.doJSON(t, http.MethodDelete, "/v1/nodes/"+nodeB, "", authorization, "scoped-delete-other"); response.StatusCode != http.StatusForbidden {
 		t.Fatalf("scoped delete cross-network status = %d, body=%s; want 403", response.StatusCode, response.Body)
+	}
+}
+
+func TestHTTPEnrollmentCommitErrorAfterCommitReturnsRegisteredSession(t *testing.T) {
+	repository := db.NewMemoryRepository()
+	handlerRepository := &commitErrorAfterCommitRepository{MemoryRepository: repository}
+	fixture := newHTTPFixtureWithRepositories(t, "10.42.0.0/29", repository, handlerRepository, time.Hour)
+	invite := fixture.createInvite(t)
+	response := fixture.doJSON(t, http.MethodPost, "/v1/enrollments", `{"invite":"`+invite+`","node_id":"committed-node","display_name":"committed","public_key":"committed-key","platform":"windows","client_version":"0.1.0"}`, "", "commit-after-commit")
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("commit-after-commit status = %d, body=%s; want 201", response.StatusCode, response.Body)
+	}
+	object := responseObject(t, response)
+	token := objectString(t, object, "session_token")
+	if _, err := fixture.sessions.Authenticate(token); err != nil {
+		t.Fatalf("returned session is not usable: %v", err)
+	}
+	if _, err := repository.GetNode(context.Background(), "committed-node"); err != nil {
+		t.Fatalf("committed node missing after commit error: %v", err)
+	}
+	networkIDs, err := repository.GetNodeNetworkIDs(context.Background(), "committed-node")
+	if err != nil || len(networkIDs) != 1 || networkIDs[0] != "network-1" {
+		t.Fatalf("committed node network IDs = %#v, %v; want [network-1]", networkIDs, err)
+	}
+}
+
+func TestHTTPEnrollmentUncertainReadbackReturnsRecoveryCredential(t *testing.T) {
+	repository := db.NewMemoryRepository()
+	handlerRepository := &uncertainReadbackRepository{MemoryRepository: repository, readbackErr: errors.New("readback unavailable")}
+	fixture := newHTTPFixtureWithRepositories(t, "10.42.0.0/29", repository, handlerRepository, time.Hour)
+	invite := fixture.createInvite(t)
+	response := fixture.doJSON(t, http.MethodPost, "/v1/enrollments", `{"invite":"`+invite+`","node_id":"uncertain-node","display_name":"uncertain","public_key":"uncertain-key","platform":"windows","client_version":"0.1.0"}`, "", "uncertain-readback")
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("uncertain readback status = %d, body=%s; want 503", response.StatusCode, response.Body)
+	}
+	object := responseObject(t, response)
+	if objectString(t, object, "error") != "enrollment_recovery_pending" {
+		t.Fatalf("uncertain readback error = %#v", object["error"])
+	}
+	token := objectString(t, object, "session_token")
+	if _, err := fixture.sessions.Authenticate(token); err != nil {
+		t.Fatalf("recovery session is not retained: %v", err)
+	}
+	if _, err := repository.GetNode(context.Background(), "uncertain-node"); err != nil {
+		t.Fatalf("committed node missing from backing repository: %v", err)
+	}
+}
+
+func TestHTTPEnrollmentRollbackRevokesIssuedSession(t *testing.T) {
+	repository := db.NewMemoryRepository()
+	transaction := db.NewMemoryRepository()
+	handlerRepository := &rollbackAfterCallbackRepository{MemoryRepository: repository, transaction: transaction}
+	fixture := newHTTPFixtureWithRepositories(t, "10.42.0.0/29", repository, handlerRepository, time.Hour)
+	invite := fixture.createInvite(t)
+	network, err := repository.GetNetwork(context.Background(), "network-1")
+	if err != nil {
+		t.Fatalf("get root network: %v", err)
+	}
+	if err := transaction.CreateNetwork(context.Background(), network); err != nil {
+		t.Fatalf("seed transaction network: %v", err)
+	}
+	inviteID := strings.SplitN(invite, ".", 2)[0]
+	if err := transaction.CreateInvite(context.Background(), control.Invite{
+		ID:        inviteID,
+		NetworkID: network.ID,
+		TokenHash: auth.HashToken(invite),
+		ExpiresAt: httpTestNow.Add(time.Hour),
+		CreatedAt: httpTestNow,
+	}); err != nil {
+		t.Fatalf("seed transaction invite: %v", err)
+	}
+	response := fixture.doJSON(t, http.MethodPost, "/v1/enrollments", `{"invite":"`+invite+`","node_id":"rolled-back-node","display_name":"rolled-back","public_key":"rolled-back-key","platform":"windows","client_version":"0.1.0"}`, "", "transaction-rollback")
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("rollback status = %d, body=%s; want 500", response.StatusCode, response.Body)
+	}
+	rawSessionToken := make([]byte, 32)
+	for index := range rawSessionToken {
+		rawSessionToken[index] = byte(index + 1)
+	}
+	issuedToken := base64.RawURLEncoding.EncodeToString(rawSessionToken)
+	if _, err := fixture.sessions.Authenticate(issuedToken); !errors.Is(err, auth.ErrInvalidCredential) {
+		t.Fatalf("rolled-back session authentication error = %v, want ErrInvalidCredential", err)
+	}
+	if _, err := repository.GetNode(context.Background(), "rolled-back-node"); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("rolled-back node = %v, want ErrNotFound", err)
 	}
 }
 

@@ -145,6 +145,66 @@ func TestMemoryRepositoryTouchNodeUpdatesLastSeen(t *testing.T) {
 	}
 }
 
+func TestMemoryRepositoryGetNodeNetworkIDsReturnsNotFoundForUnknownNode(t *testing.T) {
+	repository := NewMemoryRepository()
+	networkIDs, err := repository.GetNodeNetworkIDs(context.Background(), "missing-node")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown node error = %v, want ErrNotFound", err)
+	}
+	if networkIDs != nil {
+		t.Fatalf("unknown node network IDs = %#v, want nil", networkIDs)
+	}
+}
+
+func TestMemoryRepositoryGetNodeNetworkIDsReturnsNonNilEmptyForNodeWithoutMembership(t *testing.T) {
+	repository := NewMemoryRepository()
+	if err := repository.AddNode(context.Background(), repositoryTestNode("node-1", "key-1")); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+	networkIDs, err := repository.GetNodeNetworkIDs(context.Background(), "node-1")
+	if err != nil {
+		t.Fatalf("get node network IDs: %v", err)
+	}
+	if networkIDs == nil || len(networkIDs) != 0 {
+		t.Fatalf("node without membership network IDs = %#v, want non-nil empty slice", networkIDs)
+	}
+}
+
+func TestMemoryRepositoryGetNodeNetworkIDsReturnsSortedMultipleNetworks(t *testing.T) {
+	repository := NewMemoryRepository()
+	firstNetwork := repositoryTestNetwork()
+	secondNetwork := firstNetwork
+	secondNetwork.ID = "network-2"
+	secondNetwork.IPv4Pool = "10.43.0.0/24"
+	if err := repository.CreateNetwork(context.Background(), firstNetwork); err != nil {
+		t.Fatalf("create first network: %v", err)
+	}
+	if err := repository.CreateNetwork(context.Background(), secondNetwork); err != nil {
+		t.Fatalf("create second network: %v", err)
+	}
+	node := repositoryTestNode("node-1", "key-1")
+	if err := repository.AddNode(context.Background(), node); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+	firstMembership := repositoryTestMembership(node.ID, "10.42.0.2", control.MembershipActive)
+	secondMembership := firstMembership
+	secondMembership.NetworkID = secondNetwork.ID
+	secondMembership.VirtualIPv4 = net.ParseIP("10.43.0.2").To4()
+	if err := repository.AddMembership(context.Background(), firstMembership); err != nil {
+		t.Fatalf("add first membership: %v", err)
+	}
+	if err := repository.AddMembership(context.Background(), secondMembership); err != nil {
+		t.Fatalf("add second membership: %v", err)
+	}
+	networkIDs, err := repository.GetNodeNetworkIDs(context.Background(), node.ID)
+	if err != nil {
+		t.Fatalf("get node network IDs: %v", err)
+	}
+	if len(networkIDs) != 2 || networkIDs[0] != "network-1" || networkIDs[1] != "network-2" {
+		t.Fatalf("node network IDs = %#v, want [network-1 network-2]", networkIDs)
+	}
+}
+
 func TestPostgresTouchNodeUpdatesLastSeen(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	if err != nil {
@@ -158,6 +218,78 @@ func TestPostgresTouchNodeUpdatesLastSeen(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	if err := repository.TouchNode(context.Background(), "node-1", updatedAt); err != nil {
 		t.Fatalf("touch node: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresRepositoryGetNodeNetworkIDsMapsUnknownNodeToNotFound(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1")).
+		WithArgs("missing-node").
+		WillReturnError(sql.ErrNoRows)
+	networkIDs, err := repository.GetNodeNetworkIDs(context.Background(), "missing-node")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown node error = %v, want ErrNotFound", err)
+	}
+	if networkIDs != nil {
+		t.Fatalf("unknown node network IDs = %#v, want nil", networkIDs)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresRepositoryGetNodeNetworkIDsReturnsNonNilEmptyForNodeWithoutMembership(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1")).
+		WithArgs("node-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-1"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT network_id FROM memberships WHERE node_id = $1 ORDER BY network_id")).
+		WithArgs("node-1").
+		WillReturnRows(sqlmock.NewRows([]string{"network_id"}))
+	networkIDs, err := repository.GetNodeNetworkIDs(context.Background(), "node-1")
+	if err != nil {
+		t.Fatalf("get node network IDs: %v", err)
+	}
+	if networkIDs == nil || len(networkIDs) != 0 {
+		t.Fatalf("node without membership network IDs = %#v, want non-nil empty slice", networkIDs)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresRepositoryGetNodeNetworkIDsReturnsMultipleNetworksInOrder(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1")).
+		WithArgs("node-1").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-1"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT network_id FROM memberships WHERE node_id = $1 ORDER BY network_id")).
+		WithArgs("node-1").
+		WillReturnRows(sqlmock.NewRows([]string{"network_id"}).AddRow("network-1").AddRow("network-2"))
+	networkIDs, err := repository.GetNodeNetworkIDs(context.Background(), "node-1")
+	if err != nil {
+		t.Fatalf("get node network IDs: %v", err)
+	}
+	if len(networkIDs) != 2 || networkIDs[0] != "network-1" || networkIDs[1] != "network-2" {
+		t.Fatalf("node network IDs = %#v, want [network-1 network-2]", networkIDs)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unexpected PostgreSQL calls: %v", err)
@@ -2410,6 +2542,10 @@ func TestRepositoriesExposeTransactionBoundary(t *testing.T) {
 		return transaction.CreateNetwork(context.Background(), repositoryTestNetwork())
 	}); err != nil {
 		t.Fatalf("memory transaction boundary failed: %v", err)
+	}
+	var repository Repository = NewMemoryRepository()
+	if _, err := repository.GetNodeNetworkIDs(context.Background(), "missing-node"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("repository network scope contract error = %v, want ErrNotFound", err)
 	}
 
 	postgres := NewPostgresRepository(nil)

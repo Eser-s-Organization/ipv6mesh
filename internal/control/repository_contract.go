@@ -25,6 +25,7 @@ type Repository interface {
 	GetNetwork(context.Context, string) (Network, error)
 	AddNode(context.Context, Node) error
 	GetNode(context.Context, string) (Node, error)
+	GetNodeNetworkIDs(context.Context, string) ([]string, error)
 	TouchNode(context.Context, string, time.Time) error
 	RemoveNode(context.Context, string) error
 	AddMembership(context.Context, Membership) error

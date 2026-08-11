@@ -19,47 +19,58 @@ import (
 )
 
 const (
-	defaultSessionTTL = time.Hour
-	defaultInviteTTL  = 24 * time.Hour
-	defaultBodyLimit  = 1 << 20
+	defaultSessionTTL                 = time.Hour
+	defaultInviteTTL                  = 24 * time.Hour
+	defaultBodyLimit                  = 1 << 20
+	defaultEnrollmentRecoveryAttempts = 3
+	defaultEnrollmentRecoveryTimeout  = 2 * time.Second
+	defaultEnrollmentRecoveryDelay    = 10 * time.Millisecond
 )
 
 var (
-	errInvalidJSON        = errors.New("invalid JSON request")
-	ErrInvalidInviteToken = errors.New("invalid invite token")
-	ErrInvalidRequest     = errors.New("invalid enrollment request")
+	errInvalidJSON               = errors.New("invalid JSON request")
+	ErrInvalidInviteToken        = errors.New("invalid invite token")
+	ErrInvalidRequest            = errors.New("invalid enrollment request")
+	ErrCommitUnknown             = errors.New("enrollment commit status is uncertain")
+	ErrEnrollmentRecoveryPending = ErrCommitUnknown
 )
 
 // HandlerOptions configures the standard-library HTTP control-plane handler.
 // A supplied SessionStore and dependency functions make HTTP tests fully
 // deterministic without weakening production defaults.
 type HandlerOptions struct {
-	BootstrapToken   string
-	BootstrapSubject string
-	SessionTTL       time.Duration
-	InviteTTL        time.Duration
-	SessionStore     *auth.SessionStore
-	Clock            func() time.Time
-	NewID            func() string
-	IDGenerator      func() string
-	TokenRandom      io.Reader
-	MaxBodyBytes     int64
-	CheckOrigin      func(*http.Request) bool
+	BootstrapToken             string
+	BootstrapSubject           string
+	SessionTTL                 time.Duration
+	InviteTTL                  time.Duration
+	SessionStore               *auth.SessionStore
+	Clock                      func() time.Time
+	NewID                      func() string
+	IDGenerator                func() string
+	TokenRandom                io.Reader
+	MaxBodyBytes               int64
+	CheckOrigin                func(*http.Request) bool
+	EnrollmentRecoveryAttempts int
+	EnrollmentRecoveryTimeout  time.Duration
+	EnrollmentRecoveryDelay    time.Duration
 }
 
 // Handler serves only control-plane resources. It does not carry VPN data or
 // private key material.
 type Handler struct {
-	repository       TransactionalRepository
-	sessions         *auth.SessionStore
-	bootstrapToken   string
-	bootstrapSubject string
-	inviteTTL        time.Duration
-	clock            func() time.Time
-	newID            func() string
-	tokenRandom      io.Reader
-	maxBodyBytes     int64
-	checkOrigin      func(*http.Request) bool
+	repository                 TransactionalRepository
+	sessions                   *auth.SessionStore
+	bootstrapToken             string
+	bootstrapSubject           string
+	inviteTTL                  time.Duration
+	clock                      func() time.Time
+	newID                      func() string
+	tokenRandom                io.Reader
+	maxBodyBytes               int64
+	checkOrigin                func(*http.Request) bool
+	enrollmentRecoveryAttempts int
+	enrollmentRecoveryTimeout  time.Duration
+	enrollmentRecoveryDelay    time.Duration
 }
 
 // NewHandler constructs a control-plane HTTP handler around an existing
@@ -100,21 +111,36 @@ func NewHandler(repository TransactionalRepository, options HandlerOptions) *Han
 	if checkOrigin == nil {
 		checkOrigin = sameOrigin
 	}
+	recoveryAttempts := options.EnrollmentRecoveryAttempts
+	if recoveryAttempts <= 0 {
+		recoveryAttempts = defaultEnrollmentRecoveryAttempts
+	}
+	recoveryTimeout := options.EnrollmentRecoveryTimeout
+	if recoveryTimeout <= 0 {
+		recoveryTimeout = defaultEnrollmentRecoveryTimeout
+	}
+	recoveryDelay := options.EnrollmentRecoveryDelay
+	if recoveryDelay <= 0 {
+		recoveryDelay = defaultEnrollmentRecoveryDelay
+	}
 	bootstrapSubject := options.BootstrapSubject
 	if bootstrapSubject == "" {
 		bootstrapSubject = "bootstrap-admin"
 	}
 	return &Handler{
-		repository:       repository,
-		sessions:         sessions,
-		bootstrapToken:   options.BootstrapToken,
-		bootstrapSubject: bootstrapSubject,
-		inviteTTL:        inviteTTL,
-		clock:            clock,
-		newID:            newID,
-		tokenRandom:      tokenRandom,
-		maxBodyBytes:     bodyLimit,
-		checkOrigin:      checkOrigin,
+		repository:                 repository,
+		sessions:                   sessions,
+		bootstrapToken:             options.BootstrapToken,
+		bootstrapSubject:           bootstrapSubject,
+		inviteTTL:                  inviteTTL,
+		clock:                      clock,
+		newID:                      newID,
+		tokenRandom:                tokenRandom,
+		maxBodyBytes:               bodyLimit,
+		checkOrigin:                checkOrigin,
+		enrollmentRecoveryAttempts: recoveryAttempts,
+		enrollmentRecoveryTimeout:  recoveryTimeout,
+		enrollmentRecoveryDelay:    recoveryDelay,
 	}
 }
 
@@ -197,10 +223,6 @@ func (handler *Handler) authorizeNetwork(principal principal, networkID string) 
 	return handler.sessions.AuthorizeNetwork(principal.session, networkID)
 }
 
-type nodeNetworkScopeResolver interface {
-	GetNodeNetworkIDs(context.Context, string) ([]string, error)
-}
-
 // authorizeAdminNodeScope proves that a scoped administrator's target node is
 // a member only of the administrator's network. If the repository cannot
 // provide that proof, the operation is denied rather than guessed.
@@ -211,11 +233,7 @@ func (handler *Handler) authorizeAdminNodeScope(ctx context.Context, principal p
 	if strings.TrimSpace(principal.session.NetworkID) == "" {
 		return nil
 	}
-	resolver, ok := handler.repository.(nodeNetworkScopeResolver)
-	if !ok {
-		return auth.ErrInsufficientPermission
-	}
-	networkIDs, err := resolver.GetNodeNetworkIDs(ctx, nodeID)
+	networkIDs, err := handler.repository.GetNodeNetworkIDs(ctx, nodeID)
 	if err != nil {
 		return err
 	}
@@ -347,6 +365,18 @@ func (handler *Handler) enroll(writer http.ResponseWriter, request *http.Request
 		ClientVersion: body.ClientVersion,
 	})
 	if err != nil {
+		if errors.Is(err, ErrEnrollmentRecoveryPending) && result.SessionToken != "" {
+			writeJSON(writer, http.StatusServiceUnavailable, enrollmentRecoveryResponse{
+				Error:        "enrollment_recovery_pending",
+				Retryable:    true,
+				Node:         makeNodeResponse(result.Node),
+				Membership:   makeMembershipResponse(result.Membership),
+				Network:      makeNetworkResponse(result.Network),
+				Session:      sessionResponse{Token: result.SessionToken, Subject: result.Session.Subject, NetworkID: result.Session.NetworkID, ExpiresAt: result.Session.ExpiresAt},
+				SessionToken: result.SessionToken,
+			})
+			return
+		}
 		writeAPIError(writer, statusForError(err), err)
 		return
 	}
@@ -448,6 +478,8 @@ func (handler *Handler) enrollControl(ctx context.Context, request enrollmentReq
 			return err
 		}
 		result = enrollmentResult{Node: node, Membership: membership, Network: currentNetwork, Subject: node.ID, NetworkID: network.ID}
+		// Session issuance is the final callback operation, after every
+		// persistence write has completed.
 		token, session, err := handler.sessions.IssueNodeSession(result.Subject, result.NetworkID)
 		if err != nil {
 			return err
@@ -458,12 +490,47 @@ func (handler *Handler) enrollControl(ctx context.Context, request enrollmentReq
 		return nil
 	})
 	if err != nil {
-		if issuedToken != "" {
-			handler.sessions.RevokeSession(issuedToken)
+		if issuedToken == "" {
+			return enrollmentResult{}, err
 		}
-		return enrollmentResult{}, err
+		result.SessionToken = issuedToken
+		return handler.recoverEnrollmentCommit(result, err)
 	}
 	return result, nil
+}
+
+// recoverEnrollmentCommit handles the ambiguous boundary where a repository
+// may have committed successfully and still returned an error. Fresh bounded
+// reads prevent cancellation of the original request from orphaning a live
+// enrollment session.
+func (handler *Handler) recoverEnrollmentCommit(result enrollmentResult, transactionErr error) (enrollmentResult, error) {
+	recoveryContext, cancel := context.WithTimeout(context.Background(), handler.enrollmentRecoveryTimeout)
+	defer cancel()
+	uncertain := false
+	for attempt := 0; attempt < handler.enrollmentRecoveryAttempts; attempt++ {
+		if attempt > 0 && handler.enrollmentRecoveryDelay > 0 {
+			timer := time.NewTimer(handler.enrollmentRecoveryDelay)
+			select {
+			case <-timer.C:
+			case <-recoveryContext.Done():
+				return result, errors.Join(ErrEnrollmentRecoveryPending, transactionErr)
+			}
+		}
+		node, nodeErr := handler.repository.GetNode(recoveryContext, result.Node.ID)
+		networkIDs, membershipErr := handler.repository.GetNodeNetworkIDs(recoveryContext, result.Node.ID)
+		if nodeErr == nil && membershipErr == nil && len(networkIDs) == 1 && networkIDs[0] == result.NetworkID {
+			result.Node = node
+			return result, nil
+		}
+		if !(errors.Is(nodeErr, ErrNotFound) && errors.Is(membershipErr, ErrNotFound)) {
+			uncertain = true
+		}
+	}
+	if uncertain {
+		return result, errors.Join(ErrEnrollmentRecoveryPending, transactionErr)
+	}
+	handler.sessions.RevokeSession(result.SessionToken)
+	return enrollmentResult{}, transactionErr
 }
 
 var stopHTTPAllocation = errors.New("allocation completed")
@@ -734,6 +801,19 @@ type enrollmentResponse struct {
 	SessionToken string                `json:"session_token"`
 }
 
+// enrollmentRecoveryResponse keeps the issued credential available to a
+// client while the server reports that commit status remains uncertain. The
+// client can retry its control-plane synchronization with this credential.
+type enrollmentRecoveryResponse struct {
+	Error        string                `json:"error"`
+	Retryable    bool                  `json:"retryable"`
+	Node         apiNodeResponse       `json:"node"`
+	Membership   apiMembershipResponse `json:"membership"`
+	Network      apiNetworkResponse    `json:"network"`
+	Session      sessionResponse       `json:"session"`
+	SessionToken string                `json:"session_token"`
+}
+
 type sessionResponse struct {
 	Token     string    `json:"token"`
 	Subject   string    `json:"subject"`
@@ -855,6 +935,8 @@ func writeAPIError(writer http.ResponseWriter, status int, err error) {
 		code = "conflict"
 	case http.StatusUnprocessableEntity:
 		code = "invalid_request"
+	case http.StatusServiceUnavailable:
+		code = "enrollment_recovery_pending"
 	}
 	writeJSON(writer, status, map[string]string{"error": code})
 }
@@ -867,6 +949,8 @@ func statusForError(err error) int {
 		return http.StatusUnauthorized
 	case errors.Is(err, auth.ErrInsufficientPermission), errors.Is(err, auth.ErrWrongNetwork), errors.Is(err, auth.ErrRevokedNetwork):
 		return http.StatusForbidden
+	case errors.Is(err, ErrEnrollmentRecoveryPending):
+		return http.StatusServiceUnavailable
 	case errors.Is(err, ErrNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, ErrConflict), errors.Is(err, ErrInviteConsumed), errors.Is(err, ErrInviteExpired), errors.Is(err, ErrInviteRevoked):

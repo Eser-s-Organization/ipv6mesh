@@ -449,7 +449,7 @@ func lockNetworkAndReadIPv4Pool(ctx context.Context, executor SQLExecutor, netwo
 
 func sortedUniqueStrings(values []string) []string {
 	if len(values) == 0 {
-		return nil
+		return []string{}
 	}
 	sorted := append([]string(nil), values...)
 	sort.Strings(sorted)
