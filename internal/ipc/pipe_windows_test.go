@@ -25,7 +25,9 @@ func (testPipeHandler) HandleJSON(_ context.Context, data []byte) ([]byte, error
 
 func TestNamedPipeRoundTrip(t *testing.T) {
 	path := fmt.Sprintf(`\\.\pipe\ipv6mesh-test-%d`, time.Now().UnixNano())
-	server, err := NewServerWithOptions(path, testPipeHandler{}, testPipeAuthorizer{}, ServerOptions{SecurityDescriptor: "D:P(A;;GA;;;WD)"})
+	// The permissive descriptor is test-only; production uses NewServer's
+	// SYSTEM/Administrators-only default.
+	server, err := newServerWithOptions(path, testPipeHandler{}, testPipeAuthorizer{}, serverOptions{SecurityDescriptor: "D:P(A;;GA;;;WD)"})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}

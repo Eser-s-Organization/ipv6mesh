@@ -29,19 +29,22 @@ type Server struct {
 	connectionTimeout time.Duration
 	activeMu          sync.Mutex
 	active            map[net.Conn]struct{}
+	closed            bool
 	closeOnce         sync.Once
 }
 
-type ServerOptions struct {
+// serverOptions is intentionally unexported so production callers cannot
+// weaken the default SYSTEM/Administrators-only pipe ACL.
+type serverOptions struct {
 	SecurityDescriptor string
 	ConnectionTimeout  time.Duration
 }
 
 func NewServer(path string, handler RequestHandler, authorizer CallerAuthorizer) (*Server, error) {
-	return NewServerWithOptions(path, handler, authorizer, ServerOptions{})
+	return newServerWithOptions(path, handler, authorizer, serverOptions{})
 }
 
-func NewServerWithOptions(path string, handler RequestHandler, authorizer CallerAuthorizer, options ServerOptions) (*Server, error) {
+func newServerWithOptions(path string, handler RequestHandler, authorizer CallerAuthorizer, options serverOptions) (*Server, error) {
 	if path == "" {
 		path = DefaultPipeName
 	}
@@ -86,7 +89,9 @@ func (server *Server) Serve(ctx context.Context) error {
 			}
 			return err
 		}
-		server.track(connection)
+		if !server.track(connection) {
+			continue
+		}
 		go server.handleConnection(ctx, connection)
 	}
 }
@@ -119,21 +124,27 @@ func (server *Server) Close() error {
 	}
 	var err error
 	server.closeOnce.Do(func() {
-		err = server.listener.Close()
 		server.activeMu.Lock()
+		server.closed = true
 		for connection := range server.active {
 			_ = connection.Close()
 		}
-		server.active = make(map[net.Conn]struct{})
 		server.activeMu.Unlock()
+		err = server.listener.Close()
 	})
 	return err
 }
 
-func (server *Server) track(connection net.Conn) {
+func (server *Server) track(connection net.Conn) bool {
 	server.activeMu.Lock()
+	if server.closed {
+		server.activeMu.Unlock()
+		_ = connection.Close()
+		return false
+	}
 	server.active[connection] = struct{}{}
 	server.activeMu.Unlock()
+	return true
 }
 
 func (server *Server) untrack(connection net.Conn) {

@@ -141,12 +141,6 @@ func (service *Service) Handle(ctx context.Context, request ipc.Request) ipc.Res
 		return ipc.ErrorResponse(ipc.CodeInvalidRequest)
 	}
 }
-func (service *Service) statusSnapshot() ipc.Status {
-	service.mu.RLock()
-	defer service.mu.RUnlock()
-	return service.status
-}
-
 func (service *Service) join(ctx context.Context, request ipc.Request) ipc.Response {
 	service.mu.RLock()
 	if service.joined != nil {
