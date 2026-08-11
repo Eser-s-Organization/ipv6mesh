@@ -387,19 +387,19 @@ git commit -m "feat: integrate WireGuardNT and Windows overlay routes"
 - Create: internal/reconcile/snapshot_test.go
 - Modify: internal/service/service_windows.go
 
-- [ ] **Step 1: Filter Windows IPv6 candidates**
+- [x] **Step 1: Filter Windows IPv6 candidates**
 
 Enumerate unicast addresses and retain preferred, usable, non-link-local, non-loopback, non-VPN addresses that are not marked SkipAsSource. Preserve interface LUID and address lifetimes. Do not select the first IPv6 address returned by the operating system.
 
-- [ ] **Step 2: Implement rendezvous reporting**
+- [x] **Step 2: Implement rendezvous reporting**
 
 The client reports node ID, public key, candidate IPv6, WireGuard listen port, interface LUID, and client version. The server records the observed source address and timestamp. Stale candidates are excluded from snapshots.
 
-- [ ] **Step 3: Implement the Control Server client**
+- [x] **Step 3: Implement the Control Server client**
 
 Use HTTPS for request/response and WebSocket for configuration events. Reconnect with bounded exponential backoff. Preserve the last valid snapshot during temporary control-plane loss.
 
-- [ ] **Step 4: Implement idempotent snapshot reconciliation**
+- [x] **Step 4: Implement idempotent snapshot reconciliation**
 
 Apply snapshots in this order:
 
@@ -416,7 +416,7 @@ validate generation
 
 If an apply step fails, keep the last known good configuration and return a typed error.
 
-- [ ] **Step 5: Add reconciliation tests**
+- [x] **Step 5: Add reconciliation tests**
 
 Test out-of-order snapshots, duplicate events, stale generations, endpoint replacement, IPv6 address changes, control reconnect, partial adapter failure, member deletion, and restart with a cached snapshot.
 
@@ -426,7 +426,7 @@ Run:
 go test ./internal/endpoint ./internal/control ./internal/reconcile -race -v
 ~~~
 
-- [ ] **Step 6: Commit endpoint and reconciliation**
+- [x] **Step 6: Commit endpoint and reconciliation**
 
 ~~~text
 git add internal/endpoint internal/control internal/reconcile internal/service

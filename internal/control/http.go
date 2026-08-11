@@ -876,6 +876,23 @@ func makeEndpointResponse(endpoint EndpointCandidate) apiEndpointResponse {
 	return apiEndpointResponse{NodeID: endpoint.NodeID, Address: endpoint.Address, Port: endpoint.Port, Family: endpoint.Family, Interface: endpoint.Interface, Priority: endpoint.Priority, ObservedAt: endpoint.ObservedAt}
 }
 
+type apiRelayAssignmentResponse struct {
+	ID          string     `json:"id"`
+	NetworkID   string     `json:"network_id"`
+	NodeID      string     `json:"node_id"`
+	RelayNodeID string     `json:"relay_node_id"`
+	Address     net.IP     `json:"address"`
+	Port        uint16     `json:"port"`
+	Family      string     `json:"family"`
+	Status      string     `json:"status"`
+	AssignedAt  time.Time  `json:"assigned_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+}
+
+func makeRelayAssignmentResponse(assignment RelayAssignment) apiRelayAssignmentResponse {
+	return apiRelayAssignmentResponse{ID: assignment.ID, NetworkID: assignment.NetworkID, NodeID: assignment.NodeID, RelayNodeID: assignment.RelayNodeID, Address: assignment.Address, Port: assignment.Port, Family: assignment.Family, Status: assignment.Status, AssignedAt: assignment.AssignedAt, ExpiresAt: assignment.ExpiresAt}
+}
+
 type peerResponse struct {
 	NodeID      string                `json:"node_id"`
 	DisplayName string                `json:"display_name"`
@@ -887,14 +904,14 @@ type peerResponse struct {
 }
 
 type snapshotResponseBody struct {
-	NetworkID        string         `json:"network_id"`
-	Generation       int64          `json:"generation"`
-	ConfigVersion    int64          `json:"config_version"`
-	LocalNodeID      string         `json:"local_node_id"`
-	LocalVirtualIPv4 net.IP         `json:"local_virtual_ipv4"`
-	Peers            []peerResponse `json:"peers"`
-	RelayAssignment  any            `json:"relay_assignment,omitempty"`
-	GeneratedAt      time.Time      `json:"generated_at"`
+	NetworkID        string                      `json:"network_id"`
+	Generation       int64                       `json:"generation"`
+	ConfigVersion    int64                       `json:"config_version"`
+	LocalNodeID      string                      `json:"local_node_id"`
+	LocalVirtualIPv4 net.IP                      `json:"local_virtual_ipv4"`
+	Peers            []peerResponse              `json:"peers"`
+	RelayAssignment  *apiRelayAssignmentResponse `json:"relay_assignment,omitempty"`
+	GeneratedAt      time.Time                   `json:"generated_at"`
 }
 
 func snapshotResponse(snapshot NetworkSnapshot) snapshotResponseBody {
@@ -906,11 +923,13 @@ func snapshotResponse(snapshot NetworkSnapshot) snapshotResponseBody {
 		}
 		peers[index] = peerResponse{NodeID: peer.NodeID, DisplayName: peer.DisplayName, PublicKey: peer.PublicKey, VirtualIPv4: peer.VirtualIPv4, Node: makeNodeResponse(peer.Node), Membership: makeMembershipResponse(peer.Membership), Endpoints: endpoints}
 	}
-	var relay any
+	var relay *apiRelayAssignmentResponse
 	if snapshot.RelayAssignment != nil {
-		relay = snapshot.RelayAssignment
+		converted := makeRelayAssignmentResponse(*snapshot.RelayAssignment)
+		relay = &converted
 	} else if snapshot.Relay != nil {
-		relay = snapshot.Relay
+		converted := makeRelayAssignmentResponse(*snapshot.Relay)
+		relay = &converted
 	}
 	return snapshotResponseBody{NetworkID: snapshot.NetworkID, Generation: snapshot.Generation, ConfigVersion: snapshot.ConfigVersion, LocalNodeID: snapshot.LocalNodeID, LocalVirtualIPv4: snapshot.LocalVirtualIPv4, Peers: peers, RelayAssignment: relay, GeneratedAt: snapshot.GeneratedAt}
 }

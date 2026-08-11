@@ -6,8 +6,52 @@ import (
 	"context"
 	"errors"
 
+	"github.com/Eser-s-Organization/ipv6mesh/internal/endpoint"
 	"github.com/Eser-s-Organization/ipv6mesh/internal/ipc"
+	"github.com/Eser-s-Organization/ipv6mesh/internal/netwin"
+	"github.com/Eser-s-Organization/ipv6mesh/internal/reconcile"
+	"github.com/Eser-s-Organization/ipv6mesh/internal/wgnt"
 )
+
+// WindowsDataPlane owns the privileged Windows networking components used by
+// snapshot reconciliation. Construction is lazy with respect to the vendor
+// DLL: it does not create an adapter or modify routes until Apply is called.
+type WindowsDataPlane struct {
+	WireGuard *wgnt.Client
+	Routes    *netwin.RouteReconciler
+	Applier   *reconcile.Applier
+	Endpoints *endpoint.Discoverer
+}
+
+func NewWindowsDataPlane(privateKey wgnt.Key, interfaceName string, listenPort uint16) (*WindowsDataPlane, error) {
+	wireGuard := wgnt.New()
+	routes, err := netwin.NewRouteReconciler(netwin.NewIPHelper())
+	if err != nil {
+		return nil, err
+	}
+	applier, err := reconcile.NewApplier(reconcile.Options{
+		Adapter:       wireGuard,
+		Routes:        routes,
+		PrivateKey:    privateKey,
+		InterfaceName: interfaceName,
+		ListenPort:    listenPort,
+	})
+	if err != nil {
+		return nil, err
+	}
+	discoverer, err := endpoint.NewDiscoverer(endpoint.NewWindowsEnumerator())
+	if err != nil {
+		return nil, err
+	}
+	return &WindowsDataPlane{WireGuard: wireGuard, Routes: routes, Applier: applier, Endpoints: discoverer}, nil
+}
+
+func (dataPlane *WindowsDataPlane) Clear(ctx context.Context) error {
+	if dataPlane == nil || dataPlane.Applier == nil {
+		return errors.New("Windows data plane is unavailable")
+	}
+	return dataPlane.Applier.Clear(ctx)
+}
 
 // ServeWindows starts the local Named Pipe boundary for an already-created
 // service. Data-plane adapters are intentionally injected by the caller and
