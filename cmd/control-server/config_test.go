@@ -37,3 +37,32 @@ func TestLoadConfigRejectsMissingBootstrapAndInvalidTTLs(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadConfigSelectsRepositoryMode(t *testing.T) {
+	environment := map[string]string{
+		"CONTROL_BOOTSTRAP_TOKEN": "bootstrap-secret",
+		"CONTROL_SESSION_TTL":     "15m",
+		"CONTROL_INVITE_TTL":      "2h",
+	}
+	config, err := LoadConfigFrom(func(name string) string { return environment[name] })
+	if err != nil {
+		t.Fatalf("load default repository mode: %v", err)
+	}
+	if config.RepositoryMode != "memory" {
+		t.Fatalf("default repository mode = %q, want memory", config.RepositoryMode)
+	}
+
+	environment["CONTROL_DB_DSN"] = "postgres://control"
+	config, err = LoadConfigFrom(func(name string) string { return environment[name] })
+	if err != nil {
+		t.Fatalf("load postgres repository mode: %v", err)
+	}
+	if config.RepositoryMode != "postgres" {
+		t.Fatalf("DSN repository mode = %q, want postgres", config.RepositoryMode)
+	}
+
+	environment["CONTROL_REPOSITORY_MODE"] = "invalid"
+	if _, err := LoadConfigFrom(func(name string) string { return environment[name] }); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("invalid repository mode error = %v, want ErrInvalidConfig", err)
+	}
+}

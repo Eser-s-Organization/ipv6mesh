@@ -82,10 +82,22 @@ func NewClient(baseURL string) (*Client, error) {
 		return nil, fmt.Errorf("%w: base URL must include scheme and host", ErrInvalidClient)
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		transport = &http.Transport{}
+	} else {
+		transport = transport.Clone()
+	}
+	// IPv6-first endpoints must not unexpectedly traverse an ambient HTTP
+	// proxy. A proxy can also turn a reachable global IPv6 control endpoint
+	// into a misleading 502 response.
+	transport.Proxy = nil
+	webSocketDialer := *websocket.DefaultDialer
+	webSocketDialer.Proxy = nil
 	return &Client{
 		BaseURL:          parsed,
-		HTTPClient:       &http.Client{Timeout: 15 * time.Second},
-		WebSocketDialer:  websocket.DefaultDialer,
+		HTTPClient:       &http.Client{Transport: transport, Timeout: 15 * time.Second},
+		WebSocketDialer:  &webSocketDialer,
 		UserAgent:        "ipv6mesh-client/0.1",
 		MaxResponseBytes: defaultControlResponseLimit,
 	}, nil

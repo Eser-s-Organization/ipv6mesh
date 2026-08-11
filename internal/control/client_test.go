@@ -216,6 +216,23 @@ func TestClientEventsOpensAuthenticatedWebSocket(t *testing.T) {
 	}
 }
 
+func TestNewClientDoesNotInheritAmbientHTTPProxy(t *testing.T) {
+	client, err := NewClient("http://[2001:db8::1]:8080")
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	transport, ok := client.HTTPClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("HTTP transport type = %T, want *http.Transport", client.HTTPClient.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("control HTTP client inherited an ambient proxy")
+	}
+	if client.WebSocketDialer.Proxy != nil {
+		t.Fatal("control WebSocket client inherited an ambient proxy")
+	}
+}
+
 func TestClientLeaveUsesNodeSession(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/v1/nodes/node-1/leave" || request.Header.Get("Authorization") != "Bearer session-token" {

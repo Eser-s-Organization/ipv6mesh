@@ -18,6 +18,7 @@ type Config struct {
 	BootstrapToken   string
 	SessionTTL       time.Duration
 	InviteTTL        time.Duration
+	RepositoryMode   string
 	DatabaseDSN      string
 	DatabaseEndpoint string
 	DBDSN            string
@@ -54,6 +55,7 @@ func LoadConfigFrom(getenv func(string) string) (Config, error) {
 	config := Config{
 		ListenAddress:    firstEnv(getenv, "CONTROL_LISTEN_ADDRESS", "CONTROL_SERVER_LISTEN_ADDRESS", "LISTEN_ADDRESS"),
 		BootstrapToken:   firstEnv(getenv, "CONTROL_BOOTSTRAP_TOKEN", "CONTROL_SERVER_BOOTSTRAP_TOKEN", "BOOTSTRAP_TOKEN"),
+		RepositoryMode:   firstEnv(getenv, "CONTROL_REPOSITORY_MODE", "CONTROL_DB_MODE", "REPOSITORY_MODE"),
 		DatabaseDSN:      firstEnv(getenv, "CONTROL_DB_DSN", "CONTROL_SERVER_DB_DSN", "DB_DSN", "DATABASE_URL"),
 		DatabaseEndpoint: firstEnv(getenv, "CONTROL_DB_ENDPOINT", "CONTROL_SERVER_DB_ENDPOINT", "DB_ENDPOINT"),
 		MaxBodyBytes:     defaultMaxBodyBytes,
@@ -62,6 +64,15 @@ func LoadConfigFrom(getenv func(string) string) (Config, error) {
 	config.DBEndpoint = config.DatabaseEndpoint
 	if config.ListenAddress == "" {
 		config.ListenAddress = defaultListenAddress
+	}
+	if config.RepositoryMode == "" {
+		config.RepositoryMode = "memory"
+		if strings.TrimSpace(config.DatabaseDSN) != "" {
+			config.RepositoryMode = "postgres"
+		}
+	}
+	if config.RepositoryMode != "memory" && config.RepositoryMode != "postgres" {
+		return Config{}, &configError{Field: "repository_mode", Reason: "must be memory or postgres"}
 	}
 	if strings.TrimSpace(config.BootstrapToken) == "" {
 		return Config{}, &configError{Field: "bootstrap_token", Reason: "is required"}
