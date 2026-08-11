@@ -45,11 +45,14 @@ if ($LASTEXITCODE -eq 0) {
 }
 
 $servicePath = Join-Path $InstallDirectory "vpn-service.exe"
-$binPath = 'binPath= "' + $servicePath + '"'
-& sc.exe create $ServiceName $binPath "start= auto" "obj= LocalSystem" "DisplayName= IPv6Mesh VPN service"
-if ($LASTEXITCODE -ne 0) {
-    throw "sc.exe create failed"
-}
+$binaryPathName = '"' + $servicePath + '"'
+New-Service `
+    -Name $ServiceName `
+    -BinaryPathName $binaryPathName `
+    -DisplayName "IPv6Mesh VPN service" `
+    -Description "IPv6-first virtual IPv4 mesh VPN service" `
+    -StartupType Automatic `
+    -ErrorAction Stop | Out-Null
 & sc.exe description $ServiceName "IPv6-first virtual IPv4 mesh VPN service"
 & sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/15000/none/0
 
