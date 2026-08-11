@@ -311,13 +311,35 @@ func (repository *PostgresRepository) GetNodeNetworkIDs(ctx context.Context, nod
 	if err != nil {
 		return nil, err
 	}
-	var existingID string
-	if err := executor.QueryRowContext(ctx, `SELECT id FROM nodes WHERE id = $1`, nodeID).Scan(&existingID); errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	} else if err != nil {
+	rows, err := executor.QueryContext(ctx, `
+		SELECT m.network_id
+		FROM nodes AS n
+		LEFT JOIN memberships AS m ON m.node_id = n.id
+		WHERE n.id = $1
+		ORDER BY m.network_id`, nodeID)
+	if err != nil {
 		return nil, err
 	}
-	return queryMembershipNetworkIDs(ctx, executor, nodeID)
+	defer rows.Close()
+	foundNode := false
+	networkIDs := make([]string, 0)
+	for rows.Next() {
+		foundNode = true
+		var networkID sql.NullString
+		if err := rows.Scan(&networkID); err != nil {
+			return nil, err
+		}
+		if networkID.Valid {
+			networkIDs = append(networkIDs, networkID.String)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if !foundNode {
+		return nil, ErrNotFound
+	}
+	return sortedUniqueStrings(networkIDs), nil
 }
 
 // TouchNode updates only a node's observation timestamp. LastSeen is not part

@@ -333,6 +333,9 @@ func TestHTTPEnrollmentCommitErrorAfterCommitReturnsRegisteredSession(t *testing
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("commit-after-commit status = %d, body=%s; want 201", response.StatusCode, response.Body)
 	}
+	if got := response.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("enrollment cache control = %q, want no-store", got)
+	}
 	object := responseObject(t, response)
 	token := objectString(t, object, "session_token")
 	if _, err := fixture.sessions.Authenticate(token); err != nil {
@@ -355,6 +358,12 @@ func TestHTTPEnrollmentUncertainReadbackReturnsRecoveryCredential(t *testing.T) 
 	response := fixture.doJSON(t, http.MethodPost, "/v1/enrollments", `{"invite":"`+invite+`","node_id":"uncertain-node","display_name":"uncertain","public_key":"uncertain-key","platform":"windows","client_version":"0.1.0"}`, "", "uncertain-readback")
 	if response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("uncertain readback status = %d, body=%s; want 503", response.StatusCode, response.Body)
+	}
+	if got := response.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("recovery cache control = %q, want no-store", got)
+	}
+	if got := response.Header.Get("Retry-After"); got != "1" {
+		t.Fatalf("recovery Retry-After = %q, want 1", got)
 	}
 	object := responseObject(t, response)
 	if objectString(t, object, "error") != "enrollment_recovery_pending" {

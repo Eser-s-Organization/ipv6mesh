@@ -344,6 +344,7 @@ func (handler *Handler) createInvite(writer http.ResponseWriter, request *http.R
 }
 
 func (handler *Handler) enroll(writer http.ResponseWriter, request *http.Request) {
+	writer.Header().Set("Cache-Control", "no-store")
 	var body struct {
 		Invite        string `json:"invite"`
 		NodeID        string `json:"node_id"`
@@ -366,6 +367,7 @@ func (handler *Handler) enroll(writer http.ResponseWriter, request *http.Request
 	})
 	if err != nil {
 		if errors.Is(err, ErrEnrollmentRecoveryPending) && result.SessionToken != "" {
+			writer.Header().Set("Retry-After", "1")
 			writeJSON(writer, http.StatusServiceUnavailable, enrollmentRecoveryResponse{
 				Error:        "enrollment_recovery_pending",
 				Retryable:    true,

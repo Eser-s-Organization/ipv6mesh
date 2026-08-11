@@ -231,9 +231,9 @@ func TestPostgresRepositoryGetNodeNetworkIDsMapsUnknownNodeToNotFound(t *testing
 	}
 	defer database.Close()
 	repository := NewPostgresRepository(database)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT m.network_id FROM nodes AS n LEFT JOIN memberships AS m ON m.node_id = n.id WHERE n.id = $1 ORDER BY m.network_id")).
 		WithArgs("missing-node").
-		WillReturnError(sql.ErrNoRows)
+		WillReturnRows(sqlmock.NewRows([]string{"network_id"}))
 	networkIDs, err := repository.GetNodeNetworkIDs(context.Background(), "missing-node")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown node error = %v, want ErrNotFound", err)
@@ -253,12 +253,9 @@ func TestPostgresRepositoryGetNodeNetworkIDsReturnsNonNilEmptyForNodeWithoutMemb
 	}
 	defer database.Close()
 	repository := NewPostgresRepository(database)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT m.network_id FROM nodes AS n LEFT JOIN memberships AS m ON m.node_id = n.id WHERE n.id = $1 ORDER BY m.network_id")).
 		WithArgs("node-1").
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-1"))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT network_id FROM memberships WHERE node_id = $1 ORDER BY network_id")).
-		WithArgs("node-1").
-		WillReturnRows(sqlmock.NewRows([]string{"network_id"}))
+		WillReturnRows(sqlmock.NewRows([]string{"network_id"}).AddRow(nil))
 	networkIDs, err := repository.GetNodeNetworkIDs(context.Background(), "node-1")
 	if err != nil {
 		t.Fatalf("get node network IDs: %v", err)
@@ -278,10 +275,7 @@ func TestPostgresRepositoryGetNodeNetworkIDsReturnsMultipleNetworksInOrder(t *te
 	}
 	defer database.Close()
 	repository := NewPostgresRepository(database)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id FROM nodes WHERE id = $1")).
-		WithArgs("node-1").
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-1"))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT network_id FROM memberships WHERE node_id = $1 ORDER BY network_id")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT m.network_id FROM nodes AS n LEFT JOIN memberships AS m ON m.node_id = n.id WHERE n.id = $1 ORDER BY m.network_id")).
 		WithArgs("node-1").
 		WillReturnRows(sqlmock.NewRows([]string{"network_id"}).AddRow("network-1").AddRow("network-2"))
 	networkIDs, err := repository.GetNodeNetworkIDs(context.Background(), "node-1")
@@ -2554,5 +2548,27 @@ func TestRepositoriesExposeTransactionBoundary(t *testing.T) {
 		return nil
 	}); !errors.Is(err, ErrDatabaseUnavailable) {
 		t.Fatalf("expected unavailable PostgreSQL transaction, got %v", err)
+	}
+}
+
+func TestPostgresWithTransactionPropagatesCommitError(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	commitErr := errors.New("commit status unknown")
+	mock.ExpectBegin()
+	// sqlmock can prove commit-error propagation, but cannot prove whether a
+	// real PostgreSQL server committed before returning that driver error.
+	mock.ExpectCommit().WillReturnError(commitErr)
+	if err := repository.WithTransaction(context.Background(), func(_ context.Context, _ Repository) error {
+		return nil
+	}); !errors.Is(err, commitErr) {
+		t.Fatalf("commit error = %v, want %v", err, commitErr)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
 	}
 }
