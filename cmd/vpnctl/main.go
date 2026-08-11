@@ -7,11 +7,30 @@ import (
 	"io"
 	"os"
 
+	"github.com/Eser-s-Organization/ipv6mesh/internal/control"
 	"github.com/Eser-s-Organization/ipv6mesh/internal/ipc"
 )
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout, ipc.NewClient(ipc.DefaultPipeName)); err != nil {
+	parsed, err := parseCommand(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if parsed.Kind == serviceCommand {
+		err = runServiceRequest(parsed.Service, os.Stdout, ipc.NewClient(ipc.DefaultPipeName))
+	} else {
+		baseURL := os.Getenv("IPV6MESH_CONTROL_URL")
+		token := os.Getenv("IPV6MESH_ADMIN_TOKEN")
+		client, clientErr := control.NewClient(baseURL)
+		if clientErr == nil {
+			client.Token = token
+			err = runControlCommand(context.Background(), parsed, os.Stdout, client)
+		} else {
+			err = clientErr
+		}
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -22,10 +41,17 @@ type caller interface {
 }
 
 func run(args []string, output io.Writer, client caller) error {
-	request, err := parseArgs(args)
+	parsed, err := parseCommand(args)
 	if err != nil {
 		return err
 	}
+	if parsed.Kind != serviceCommand {
+		return ErrControlCommand
+	}
+	return runServiceRequest(parsed.Service, output, client)
+}
+
+func runServiceRequest(request ipc.Request, output io.Writer, client caller) error {
 	response, err := client.Call(context.Background(), request)
 	if err != nil {
 		return err
@@ -43,44 +69,27 @@ func run(args []string, output io.Writer, client caller) error {
 	return nil
 }
 
-func parseArgs(args []string) (ipc.Request, error) {
-	if len(args) == 0 {
-		return ipc.Request{}, errors.New("usage: vpnctl status|join|leave|connect|disconnect")
-	}
-	request := ipc.Request{}
-	switch args[0] {
-	case "status":
-		request.Type = ipc.CommandStatus
-	case "join":
-		request.Type = ipc.CommandJoin
-		request.Invite = flagValue(args[1:], "--invite")
-		request.DisplayName = flagValue(args[1:], "--name")
-	case "leave":
-		request.Type = ipc.CommandLeave
-		request.NetworkID = flagValue(args[1:], "--network")
-	case "connect":
-		request.Type = ipc.CommandConnect
-		request.NetworkID = flagValue(args[1:], "--network")
-	case "disconnect":
-		request.Type = ipc.CommandDisconnect
-		request.NetworkID = flagValue(args[1:], "--network")
-	default:
-		return ipc.Request{}, fmt.Errorf("unknown command %q", args[0])
-	}
-	if len(args) > 1 && args[0] == "status" {
-		return ipc.Request{}, errors.New("status takes no arguments")
-	}
-	if _, err := ipc.MarshalRequest(request); err != nil {
-		return ipc.Request{}, err
-	}
-	return request, nil
+type controlAdminClient interface {
+	CreateNetwork(context.Context, string, string, string) (control.Network, error)
+	CreateInvite(context.Context, string, string, string) (control.InviteResult, error)
 }
 
-func flagValue(args []string, flag string) string {
-	for index := 0; index+1 < len(args); index++ {
-		if args[index] == flag {
-			return args[index+1]
-		}
+func runControlCommand(ctx context.Context, parsed command, output io.Writer, client controlAdminClient) error {
+	if parsed.Kind != controlCommand || client == nil {
+		return ErrControlCommand
 	}
-	return ""
+	switch {
+	case parsed.NetworkName != "":
+		network, err := client.CreateNetwork(ctx, parsed.NetworkName, parsed.Pool, "")
+		if err != nil {
+			return err
+		}
+		return writeNetworkOutput(output, network)
+	default:
+		invite, err := client.CreateInvite(ctx, parsed.NetworkID, parsed.Expires, "")
+		if err != nil {
+			return err
+		}
+		return writeInviteOutput(output, invite)
+	}
 }
