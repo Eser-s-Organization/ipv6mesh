@@ -448,19 +448,19 @@ git commit -m "feat: add endpoint discovery and snapshot reconciliation"
 - Create: deploy/relay/nftables.conf
 - Create: deploy/relay/sysctl.conf
 
-- [ ] **Step 1: Define Relay membership configuration**
+- [x] **Step 1: Define Relay membership configuration**
 
 The Relay receives only network ID, node public key, node virtual IPv4, and allowed endpoint. It rejects unknown networks and nodes. Its management channel is authenticated separately from the client data channel.
 
-- [ ] **Step 2: Configure the Linux WireGuard Hub**
+- [x] **Step 2: Configure the Linux WireGuard Hub**
 
 Create one WireGuard interface per Relay instance and one Peer per registered node with a single virtual IPv4 /32. Enable forwarding only for the overlay interface. Add nftables rules that allow the WireGuard UDP port, established traffic, and forwarding between registered overlay /32 addresses while rejecting overlay-to-public forwarding.
 
-- [ ] **Step 3: Implement path hysteresis**
+- [x] **Step 3: Implement path hysteresis**
 
 Define the states Direct, Suspect, Relay, and Disconnected. A missed handshake enters Suspect; consecutive failures move to Relay; consecutive successful probes move back to Direct. The thresholds must be configurable and covered by a fake-clock test.
 
-- [ ] **Step 4: Test the selector**
+- [x] **Step 4: Test the selector**
 
 Verify no flap after one missed probe, Relay after repeated failures, recovery only after the success threshold, Disconnected when all paths fail, and rejection of deleted members.
 
