@@ -303,6 +303,59 @@ func (repository *PostgresRepository) GetNode(ctx context.Context, nodeID string
 		FROM nodes WHERE id = $1`, nodeID))
 }
 
+// TouchNode updates only a node's observation timestamp. LastSeen is not part
+// of versioned network configuration.
+func (repository *PostgresRepository) TouchNode(ctx context.Context, nodeID string, lastSeen time.Time) error {
+	if lastSeen.IsZero() {
+		return control.ErrValidation
+	}
+	executor, err := repository.executor(ctx)
+	if err != nil {
+		return err
+	}
+	result, err := executor.ExecContext(ctx, `UPDATE nodes SET last_seen = $2 WHERE id = $1`, nodeID, lastSeen)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateNodeLastSeen is a descriptive compatibility alias.
+func (repository *PostgresRepository) UpdateNodeLastSeen(ctx context.Context, nodeID string, lastSeen time.Time) error {
+	return repository.TouchNode(ctx, nodeID, lastSeen)
+}
+
+// UpdateNodeClientVersion updates client metadata without changing network
+// configuration generation.
+func (repository *PostgresRepository) UpdateNodeClientVersion(ctx context.Context, nodeID, clientVersion string) error {
+	if clientVersion == "" {
+		return control.ErrValidation
+	}
+	executor, err := repository.executor(ctx)
+	if err != nil {
+		return err
+	}
+	result, err := executor.ExecContext(ctx, `UPDATE nodes SET client_version = $2 WHERE id = $1`, nodeID, clientVersion)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // RemoveNode deletes a node and advances every network affected by its
 // membership or relay assignments in the same transaction.
 func (repository *PostgresRepository) RemoveNode(ctx context.Context, nodeID string) error {

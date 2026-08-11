@@ -126,6 +126,80 @@ func TestMemoryRepositoryRejectsDuplicatePublicKeys(t *testing.T) {
 	}
 }
 
+func TestMemoryRepositoryTouchNodeUpdatesLastSeen(t *testing.T) {
+	repository := NewMemoryRepository()
+	original := repositoryTestNode("node-1", "key-1")
+	if err := repository.AddNode(context.Background(), original); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+	updatedAt := repositoryTestNow.Add(time.Hour)
+	if err := repository.TouchNode(context.Background(), original.ID, updatedAt); err != nil {
+		t.Fatalf("touch node: %v", err)
+	}
+	updated, err := repository.GetNode(context.Background(), original.ID)
+	if err != nil {
+		t.Fatalf("get touched node: %v", err)
+	}
+	if !updated.LastSeen.Equal(updatedAt) {
+		t.Fatalf("LastSeen = %v, want %v", updated.LastSeen, updatedAt)
+	}
+}
+
+func TestPostgresTouchNodeUpdatesLastSeen(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	updatedAt := repositoryTestNow.Add(time.Hour)
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE nodes SET last_seen = $2 WHERE id = $1")).
+		WithArgs("node-1", updatedAt).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := repository.TouchNode(context.Background(), "node-1", updatedAt); err != nil {
+		t.Fatalf("touch node: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestMemoryRepositoryUpdatesNodeClientVersion(t *testing.T) {
+	repository := NewMemoryRepository()
+	node := repositoryTestNode("node-1", "key-1")
+	if err := repository.AddNode(context.Background(), node); err != nil {
+		t.Fatalf("add node: %v", err)
+	}
+	if err := repository.UpdateNodeClientVersion(context.Background(), node.ID, "0.2.0"); err != nil {
+		t.Fatalf("update client version: %v", err)
+	}
+	updated, err := repository.GetNode(context.Background(), node.ID)
+	if err != nil {
+		t.Fatalf("get updated node: %v", err)
+	}
+	if updated.ClientVersion != "0.2.0" {
+		t.Fatalf("ClientVersion = %q, want 0.2.0", updated.ClientVersion)
+	}
+}
+
+func TestPostgresRepositoryUpdatesNodeClientVersion(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("create sql mock: %v", err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	mock.ExpectExec(regexp.QuoteMeta("UPDATE nodes SET client_version = $2 WHERE id = $1")).
+		WithArgs("node-1", "0.2.0").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := repository.UpdateNodeClientVersion(context.Background(), "node-1", "0.2.0"); err != nil {
+		t.Fatalf("update client version: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
 func TestMemoryRepositoryRejectsDuplicateNetworkVirtualIPv4(t *testing.T) {
 	repository := NewMemoryRepository()
 	addRepositoryTestNetwork(t, repository)

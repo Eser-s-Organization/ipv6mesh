@@ -2,9 +2,9 @@ package db
 
 import (
 	"context"
-	"errors"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,51 +12,22 @@ import (
 )
 
 var (
-	// ErrNotFound means that the requested control-plane resource does not exist.
-	ErrNotFound = errors.New("not found")
-	// ErrConflict is returned for stable uniqueness and duplicate-resource violations.
-	ErrConflict = errors.New("conflict")
-	// Invite lifecycle errors are separate so callers can distinguish retryable
-	// or user-visible invite states without matching strings.
-	ErrInviteExpired  = errors.New("invite expired")
-	ErrInviteConsumed = errors.New("invite already consumed")
-	ErrInviteRevoked  = errors.New("invite revoked")
-	// ErrDatabaseUnavailable is used when a PostgreSQL repository was created
-	// without an explicitly supplied database handle.
-	ErrDatabaseUnavailable = errors.New("database unavailable")
-	ErrInvalidContext      = errors.New("invalid context")
+	ErrNotFound            = control.ErrNotFound
+	ErrConflict            = control.ErrConflict
+	ErrInviteExpired       = control.ErrInviteExpired
+	ErrInviteConsumed      = control.ErrInviteConsumed
+	ErrInviteRevoked       = control.ErrInviteRevoked
+	ErrDatabaseUnavailable = control.ErrDatabaseUnavailable
+	ErrInvalidContext      = control.ErrInvalidContext
 )
 
 // DefaultEndpointMaxAge is the freshness window used while building snapshots.
 const DefaultEndpointMaxAge = 10 * time.Minute
 
-// Repository is the context-aware control-plane persistence contract. The
-// PostgreSQL implementation uses SQL transactions for multi-step mutations;
-// the memory implementation provides the same domain semantics for tests.
-type Repository interface {
-	CreateNetwork(context.Context, control.Network) error
-	GetNetwork(context.Context, string) (control.Network, error)
-	AddNode(context.Context, control.Node) error
-	GetNode(context.Context, string) (control.Node, error)
-	RemoveNode(context.Context, string) error
-	AddMembership(context.Context, control.Membership) error
-	RemoveMembership(context.Context, string, string) error
-	CreateInvite(context.Context, control.Invite) error
-	ConsumeInvite(context.Context, string, string, time.Time) (control.Invite, error)
-	ConsumeInviteForNode(context.Context, string, string, time.Time, string) (control.Invite, error)
-	ReplaceEndpoints(context.Context, string, []control.EndpointCandidate) error
-	SetRelayAssignment(context.Context, control.RelayAssignment) error
-	RemoveRelayAssignment(context.Context, string) error
-	BuildSnapshot(context.Context, string, string) (control.NetworkSnapshot, error)
-}
-
-// TransactionalRepository is the optional enrollment boundary. Task 3 can
-// execute invite consumption, membership insertion, address allocation, and
-// version updates through one Repository view and commit them together.
-type TransactionalRepository interface {
-	Repository
-	WithTransaction(context.Context, func(context.Context, Repository) error) error
-}
+// Repository and TransactionalRepository remain aliases so existing callers
+// importing internal/db keep the same public names and method shapes.
+type Repository = control.Repository
+type TransactionalRepository = control.TransactionalRepository
 
 // MemoryRepository is an in-memory implementation of the control-plane
 // repository. It is deliberately concurrency-safe and contains no network or
@@ -398,6 +369,51 @@ func (repository *MemoryRepository) GetNode(ctx context.Context, nodeID string) 
 		return control.Node{}, ErrNotFound
 	}
 	return cloneNode(node), nil
+}
+
+// TouchNode updates only the last-seen observation and does not advance a
+// network configuration version.
+func (repository *MemoryRepository) TouchNode(ctx context.Context, nodeID string, lastSeen time.Time) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if lastSeen.IsZero() {
+		return control.ErrValidation
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	node, exists := repository.nodes[nodeID]
+	if !exists {
+		return ErrNotFound
+	}
+	node.LastSeen = lastSeen
+	repository.nodes[nodeID] = cloneNode(node)
+	return nil
+}
+
+// UpdateNodeLastSeen is a descriptive compatibility alias.
+func (repository *MemoryRepository) UpdateNodeLastSeen(ctx context.Context, nodeID string, lastSeen time.Time) error {
+	return repository.TouchNode(ctx, nodeID, lastSeen)
+}
+
+// UpdateNodeClientVersion updates client metadata without changing network
+// configuration generation.
+func (repository *MemoryRepository) UpdateNodeClientVersion(ctx context.Context, nodeID, clientVersion string) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if strings.TrimSpace(clientVersion) == "" {
+		return control.ErrValidation
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	node, exists := repository.nodes[nodeID]
+	if !exists {
+		return ErrNotFound
+	}
+	node.ClientVersion = clientVersion
+	repository.nodes[nodeID] = cloneNode(node)
+	return nil
 }
 
 // RemoveNode removes a node and its dependent control-plane state. Network
