@@ -67,7 +67,7 @@ var embeddedPayload []byte
     & $go.Source build `
         -tags installerpayload `
         -trimpath `
-        -ldflags "-s -w -X main.version=$Version" `
+        -ldflags "-H=windowsgui -s -w -X main.version=$Version" `
         -o $output `
         (Join-Path $repositoryRoot "cmd\ipv6mesh-installer")
     if ($LASTEXITCODE -ne 0) {

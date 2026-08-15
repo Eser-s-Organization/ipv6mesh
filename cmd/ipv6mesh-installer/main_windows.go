@@ -59,8 +59,11 @@ func main() {
 		if errors.Is(err, errRelaunched) {
 			return
 		}
-		fmt.Fprintln(os.Stderr, "IPv6Mesh installer failed:", err)
-		waitForExit(options.nonInteractive)
+		if !options.nonInteractive {
+			showInstallerError(err)
+		} else {
+			fmt.Fprintln(os.Stderr, "IPv6Mesh installer failed:", err)
+		}
 		os.Exit(1)
 	}
 }
@@ -98,6 +101,9 @@ func run(options installerOptions) error {
 			return err
 		}
 		return errRelaunched
+	}
+	if !options.nonInteractive {
+		return runGraphical(options)
 	}
 	if options.nonInteractive && strings.TrimSpace(options.controlURL) == "" {
 		return errors.New("-control-url is required with -non-interactive")
@@ -151,6 +157,75 @@ func run(options installerOptions) error {
 		return err
 	}
 	return nil
+}
+
+func runGraphical(options installerOptions) error {
+	tempDirectory, err := os.MkdirTemp("", "ipv6mesh-installer-")
+	if err != nil {
+		return fmt.Errorf("create temporary directory: %w", err)
+	}
+	preserveTemp := options.keepTemp
+	defer func() {
+		if !preserveTemp {
+			_ = os.RemoveAll(tempDirectory)
+		}
+	}()
+
+	if err := extractPayload(embeddedPayload, tempDirectory); err != nil {
+		preserveTemp = true
+		return err
+	}
+	powershell := findPowerShell()
+	arguments := buildGraphicalArguments(options, tempDirectory, version)
+	command := exec.Command(powershell, arguments...)
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	if err := command.Run(); err != nil {
+		preserveTemp = true
+		return fmt.Errorf("run Chinese IPv6Mesh UI: %w; temporary payload kept at %s", err, tempDirectory)
+	}
+	return nil
+}
+
+func buildGraphicalArguments(options installerOptions, tempDirectory, installerVersion string) []string {
+	arguments := []string{
+		"-NoLogo",
+		"-NoProfile",
+		"-NonInteractive",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-STA",
+		"-WindowStyle",
+		"Hidden",
+		"-File",
+		filepath.Join(tempDirectory, "ui.ps1"),
+		"-PackageDirectory",
+		tempDirectory,
+		"-Version",
+		installerVersion,
+	}
+	if options.controlURL != "" {
+		arguments = append(arguments, "-ControlUrl", options.controlURL)
+	}
+	if options.invite != "" {
+		arguments = append(arguments, "-Invite", options.invite)
+	}
+	if options.deviceName != "" {
+		arguments = append(arguments, "-DeviceName", options.deviceName)
+	}
+	if options.networkID != "" {
+		arguments = append(arguments, "-Network", options.networkID)
+	}
+	if options.installDirectory != "" {
+		arguments = append(arguments, "-InstallDirectory", options.installDirectory)
+	}
+	if options.dataDirectory != "" {
+		arguments = append(arguments, "-DataDirectory", options.dataDirectory)
+	}
+	if options.serviceName != "" {
+		arguments = append(arguments, "-ServiceName", options.serviceName)
+	}
+	return arguments
 }
 
 func buildInstallArguments(options installerOptions, tempDirectory, controlURL string) []string {
@@ -449,13 +524,25 @@ func verifyPayload() error {
 	if err := extractPayload(embeddedPayload, tempDirectory); err != nil {
 		return err
 	}
-	for _, required := range []string{"install.ps1", "vpn-service.exe", "vpnctl.exe", "wireguard.dll", "wireguardnt-LICENSE.txt"} {
+	for _, required := range []string{"install.ps1", "ui.ps1", "vpn-service.exe", "vpnctl.exe", "wireguard.dll", "wireguardnt-LICENSE.txt"} {
 		if _, err := os.Stat(filepath.Join(tempDirectory, required)); err != nil {
 			return fmt.Errorf("embedded payload is missing %s: %w", required, err)
 		}
 	}
 	fmt.Printf("Embedded payload verified (%d bytes, %s)\n", len(embeddedPayload), version)
 	return nil
+}
+
+func showInstallerError(err error) {
+	if err == nil {
+		return
+	}
+	text, textErr := windows.UTF16PtrFromString("IPv6Mesh 操作失败：\n\n" + err.Error())
+	caption, captionErr := windows.UTF16PtrFromString("IPv6Mesh")
+	if textErr != nil || captionErr != nil {
+		return
+	}
+	_, _ = windows.MessageBox(0, text, caption, windows.MB_OK|windows.MB_ICONERROR)
 }
 
 func safeZipPath(name string) (string, error) {

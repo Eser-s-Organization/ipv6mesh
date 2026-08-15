@@ -58,7 +58,7 @@ if ([string]::IsNullOrWhiteSpace($WireGuardDll)) {
     }
 }
 
-foreach ($file in @("install.ps1", "uninstall.ps1", "diagnose.ps1", "acceptance.ps1", "start-control-server.ps1", "README.md", "wireguardnt-manifest.json")) {
+foreach ($file in @("install.ps1", "ui.ps1", "uninstall.ps1", "diagnose.ps1", "acceptance.ps1", "start-control-server.ps1", "README.md", "wireguardnt-manifest.json")) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination (Join-Path $output $file) -Force
 }
 

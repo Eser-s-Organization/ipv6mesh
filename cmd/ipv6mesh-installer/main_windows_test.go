@@ -85,6 +85,73 @@ func TestBuildInstallArgumentsPassesPackageDirectory(t *testing.T) {
 	t.Fatal("install arguments do not include -PackageDirectory")
 }
 
+func TestBuildGraphicalArgumentsPassesUIPayloadAndInitialValues(t *testing.T) {
+	args := buildGraphicalArguments(installerOptions{
+		controlURL:       "http://[2001:db8::1]:8080",
+		invite:           "invite-value",
+		deviceName:       "device-a",
+		networkID:        "network-a",
+		installDirectory: `C:\Program Files\IPv6Mesh`,
+	}, `C:\Temp\ipv6mesh-installer`, "0.1.0-debug.5")
+	want := []string{
+		"-STA",
+		"-WindowStyle", "Hidden",
+		filepath.Join(`C:\Temp\ipv6mesh-installer`, "ui.ps1"),
+		"-PackageDirectory", `C:\Temp\ipv6mesh-installer`,
+		"-Version", "0.1.0-debug.5",
+		"-ControlUrl", "http://[2001:db8::1]:8080",
+		"-Invite", "invite-value",
+		"-DeviceName", "device-a",
+		"-Network", "network-a",
+	}
+	for _, value := range want {
+		found := false
+		for _, arg := range args {
+			if arg == value {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("graphical arguments missing %q: %v", value, args)
+		}
+	}
+}
+
+func TestWindowsPackageIncludesChineseUI(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	packageRoot := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows")
+	buildScript, err := os.ReadFile(filepath.Join(packageRoot, "build.ps1"))
+	if err != nil {
+		t.Fatalf("read build script: %v", err)
+	}
+	if !strings.Contains(string(buildScript), `"ui.ps1"`) {
+		t.Fatal("build script does not include ui.ps1")
+	}
+	uiScript, err := os.ReadFile(filepath.Join(packageRoot, "ui.ps1"))
+	if err != nil {
+		t.Fatalf("read UI script: %v", err)
+	}
+	contents := string(uiScript)
+	for _, required := range []string{
+		"System.Windows.Forms",
+		"控制面管理员",
+		"游戏房主",
+		"游戏成员",
+		"network",
+		"invite",
+		"复制日志",
+		"导出日志",
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("UI script missing %q", required)
+		}
+	}
+}
+
 func TestInstallScriptStopsExistingServiceBeforeCopyingFiles(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
