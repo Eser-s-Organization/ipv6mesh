@@ -1,0 +1,13 @@
+# The relay-agent consumes deploy/relay/relay.json and configures the actual
+# interface with the system `wg` and `ip` tools. This file is a reference for
+# operators using wg-quick during diagnostics; do not place a real private key
+# in the repository.
+[Interface]
+Address = 10.42.0.1/32
+ListenPort = 51820
+PrivateKey = REPLACE_WITH_RELAY_PRIVATE_KEY
+
+# The relay-agent owns the Peer list. Do not add a default AllowedIPs route.
+# [Peer]
+# PublicKey = NODE_PUBLIC_KEY
+# AllowedIPs = 10.42.0.2/32

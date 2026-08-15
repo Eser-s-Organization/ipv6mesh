@@ -1,0 +1,23 @@
+{
+  "component": "wireguardnt",
+  "source": "https://download.wireguard.com/wireguard-nt/",
+  "target_release": "1.1",
+  "load_name": "wireguard.dll",
+  "placement": "side-by-side-with-vpn-service",
+  "artifacts": [
+    {
+      "architecture": "amd64",
+      "archive": "wireguard-nt-1.1.zip",
+      "sha256": "DCEB30A9BC4BE48CCE0F74160FC88A585A2C2627366E8F846FC6658F9038DACE",
+      "status": "official-sdk-archive-recorded"
+    },
+    {
+      "architecture": "arm64",
+      "archive": null,
+      "sha256": null,
+      "status": "fetch-and-record-during-release"
+    }
+  ],
+  "license_notice": "third_party/wireguardnt/README.md",
+  "binary_committed": false
+}

@@ -1,0 +1,3 @@
+/packaging/windows/dist/
+/cmd/ipv6mesh-installer/payload.zip
+/cmd/ipv6mesh-installer/payload_embed_windows.go

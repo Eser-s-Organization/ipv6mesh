@@ -281,7 +281,7 @@ git commit -m "feat: add enrollment and virtual IPv4 allocation"
 - Modify: cmd/vpn-service/main_windows.go
 - Modify: cmd/vpnctl/main.go
 
-- [ ] **Step 1: Define the IPC protocol**
+- [x] **Step 1: Define the IPC protocol**
 
 The first commands are status, join, leave, connect, and disconnect. Responses contain network ID, virtual IPv4, path state, last handshake, last error, and configuration generation.
 
@@ -293,15 +293,15 @@ The first commands are status, join, leave, connect, and disconnect. Responses c
 {"type":"disconnect","network_id":"network-id"}
 ~~~
 
-- [ ] **Step 2: Implement local identity storage**
+- [x] **Step 2: Implement local identity storage**
 
 Generate the WireGuard key pair on first service start. Protect the private key with Windows DPAPI and restrict its file ACL to the service account and local administrators. A service restart must return the same public key.
 
-- [ ] **Step 3: Implement the Named Pipe boundary**
+- [x] **Step 3: Implement the Named Pipe boundary**
 
 The service owns the pipe, validates the caller token, limits message size, parses one JSON request at a time, and never returns the private key.
 
-- [ ] **Step 4: Add service lifecycle tests**
+- [x] **Step 4: Add service lifecycle tests**
 
 Use fake adapter and fake Control Server clients to test identity creation, duplicate join rejection, leave cleanup, malformed JSON rejection, unauthorized pipe access, and restart recovery.
 
@@ -311,7 +311,7 @@ Run on Windows:
 go test ./internal/identity ./internal/ipc ./internal/service -race -v
 ~~~
 
-- [ ] **Step 5: Commit the service boundary**
+- [x] **Step 5: Commit the service boundary**
 
 ~~~text
 git add internal/identity internal/ipc internal/service cmd/vpn-service cmd/vpnctl
@@ -333,7 +333,7 @@ git commit -m "feat: add Windows service and IPC boundary"
 - Create: third_party/wireguardnt/README.md
 - Create: packaging/windows/wireguardnt-manifest.json
 
-- [ ] **Step 1: Define the adapter abstraction**
+- [x] **Step 1: Define the adapter abstraction**
 
 The service depends on an interface rather than the DLL directly:
 
@@ -348,15 +348,15 @@ type Adapter interface {
 }
 ~~~
 
-- [ ] **Step 2: Bind the official WireGuardNT DLL**
+- [x] **Step 2: Bind the official WireGuardNT DLL**
 
 Load wireguard.dll through the documented API, create a WireGuard adapter, configure interface and Peer keys, set endpoints and Allowed IPs, and query handshake and byte counters. Do not reimplement cryptography. Record the exact DLL source, license, architecture, and packaging hash in third_party/wireguardnt/README.md.
 
-- [ ] **Step 3: Implement IP Helper operations**
+- [x] **Step 3: Implement IP Helper operations**
 
 Use the adapter LUID to add/remove the virtual IPv4 address and overlay route. Keep an owned-route registry so cleanup cannot delete unrelated user routes. Never add a default route.
 
-- [ ] **Step 4: Test adapter and route reconciliation**
+- [x] **Step 4: Test adapter and route reconciliation**
 
 Cover idempotent adapter creation, Peer replacement by public key, /32 direct routes, Relay route replacement, deleted Peer cleanup, partial-apply rollback, and no-default-route behavior.
 
@@ -366,7 +366,7 @@ Run common tests on every platform and Windows integration tests on a Windows ho
 go test ./internal/wgnt ./internal/netwin -v
 ~~~
 
-- [ ] **Step 5: Commit the Windows data plane**
+- [x] **Step 5: Commit the Windows data plane**
 
 ~~~text
 git add internal/wgnt internal/netwin third_party/wireguardnt packaging/windows
@@ -387,19 +387,19 @@ git commit -m "feat: integrate WireGuardNT and Windows overlay routes"
 - Create: internal/reconcile/snapshot_test.go
 - Modify: internal/service/service_windows.go
 
-- [ ] **Step 1: Filter Windows IPv6 candidates**
+- [x] **Step 1: Filter Windows IPv6 candidates**
 
 Enumerate unicast addresses and retain preferred, usable, non-link-local, non-loopback, non-VPN addresses that are not marked SkipAsSource. Preserve interface LUID and address lifetimes. Do not select the first IPv6 address returned by the operating system.
 
-- [ ] **Step 2: Implement rendezvous reporting**
+- [x] **Step 2: Implement rendezvous reporting**
 
 The client reports node ID, public key, candidate IPv6, WireGuard listen port, interface LUID, and client version. The server records the observed source address and timestamp. Stale candidates are excluded from snapshots.
 
-- [ ] **Step 3: Implement the Control Server client**
+- [x] **Step 3: Implement the Control Server client**
 
 Use HTTPS for request/response and WebSocket for configuration events. Reconnect with bounded exponential backoff. Preserve the last valid snapshot during temporary control-plane loss.
 
-- [ ] **Step 4: Implement idempotent snapshot reconciliation**
+- [x] **Step 4: Implement idempotent snapshot reconciliation**
 
 Apply snapshots in this order:
 
@@ -416,7 +416,7 @@ validate generation
 
 If an apply step fails, keep the last known good configuration and return a typed error.
 
-- [ ] **Step 5: Add reconciliation tests**
+- [x] **Step 5: Add reconciliation tests**
 
 Test out-of-order snapshots, duplicate events, stale generations, endpoint replacement, IPv6 address changes, control reconnect, partial adapter failure, member deletion, and restart with a cached snapshot.
 
@@ -426,7 +426,7 @@ Run:
 go test ./internal/endpoint ./internal/control ./internal/reconcile -race -v
 ~~~
 
-- [ ] **Step 6: Commit endpoint and reconciliation**
+- [x] **Step 6: Commit endpoint and reconciliation**
 
 ~~~text
 git add internal/endpoint internal/control internal/reconcile internal/service
@@ -448,19 +448,19 @@ git commit -m "feat: add endpoint discovery and snapshot reconciliation"
 - Create: deploy/relay/nftables.conf
 - Create: deploy/relay/sysctl.conf
 
-- [ ] **Step 1: Define Relay membership configuration**
+- [x] **Step 1: Define Relay membership configuration**
 
 The Relay receives only network ID, node public key, node virtual IPv4, and allowed endpoint. It rejects unknown networks and nodes. Its management channel is authenticated separately from the client data channel.
 
-- [ ] **Step 2: Configure the Linux WireGuard Hub**
+- [x] **Step 2: Configure the Linux WireGuard Hub**
 
 Create one WireGuard interface per Relay instance and one Peer per registered node with a single virtual IPv4 /32. Enable forwarding only for the overlay interface. Add nftables rules that allow the WireGuard UDP port, established traffic, and forwarding between registered overlay /32 addresses while rejecting overlay-to-public forwarding.
 
-- [ ] **Step 3: Implement path hysteresis**
+- [x] **Step 3: Implement path hysteresis**
 
 Define the states Direct, Suspect, Relay, and Disconnected. A missed handshake enters Suspect; consecutive failures move to Relay; consecutive successful probes move back to Direct. The thresholds must be configurable and covered by a fake-clock test.
 
-- [ ] **Step 4: Test the selector**
+- [x] **Step 4: Test the selector**
 
 Verify no flap after one missed probe, Relay after repeated failures, recovery only after the success threshold, Disconnected when all paths fail, and rejection of deleted members.
 
