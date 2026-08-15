@@ -61,7 +61,7 @@ http://[2001:db8::1]:8080
 
 普通用户只需使用 GitHub 发布页中的单文件安装器，不需要手动运行 `vpnctl`：
 
-1. 在每台 Windows 电脑下载同一版本的 `ipv6mesh-installer-0.1.0-debug.3.exe`。
+1. 在每台 Windows 电脑下载同一版本的 `ipv6mesh-installer-0.1.0-debug.4.exe`。
 2. 双击运行，在 UAC 对话框中点击“是”。
 3. 按程序提示输入控制面 URL、该设备专属的一次性邀请令牌和设备名。
 4. 等待程序显示 `IPv6Mesh is connected`、`Virtual IPv4` 和 `Path`。

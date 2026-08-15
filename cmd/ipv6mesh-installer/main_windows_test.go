@@ -4,6 +4,9 @@ package main
 
 import (
 	"bufio"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -80,4 +83,28 @@ func TestBuildInstallArgumentsPassesPackageDirectory(t *testing.T) {
 		}
 	}
 	t.Fatal("install arguments do not include -PackageDirectory")
+}
+
+func TestInstallScriptStopsExistingServiceBeforeCopyingFiles(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	scriptPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "install.ps1")
+	script, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("read install script: %v", err)
+	}
+	contents := string(script)
+	stopIndex := strings.Index(contents, "Stop-Service")
+	copyIndex := strings.Index(contents, "Copy-Item -LiteralPath")
+	if stopIndex < 0 {
+		t.Fatal("install script does not stop an existing service")
+	}
+	if copyIndex < 0 {
+		t.Fatal("install script does not copy package files")
+	}
+	if stopIndex > copyIndex {
+		t.Fatalf("Stop-Service occurs after Copy-Item (stop=%d, copy=%d)", stopIndex, copyIndex)
+	}
 }
