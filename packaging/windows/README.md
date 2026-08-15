@@ -21,17 +21,17 @@
     -GoCommand 'C:\Users\Eser\.cache\codex-go\go\bin\go.exe' `
     -WireGuardDll 'C:\path\to\wireguard.dll' `
     -WireGuardLicense 'C:\path\to\LICENSE.txt' `
-    -Version '0.1.0-debug.1'
+    -Version '0.1.0-debug.5'
 ```
 
-生成的 `ipv6mesh-installer.exe` 面向普通用户的默认操作是双击运行。程序会自动请求 UAC 管理员权限，然后依次提示控制面 URL、一次性邀请令牌和设备名；安装服务后自动执行加入网络和连接虚拟适配器，并显示虚拟 IPv4。一次性令牌相当于一次性密码，不要公开或截图分享。下面的带参数命令仅用于开发者调试：
+生成的 `ipv6mesh-installer.exe` 面向普通用户的默认操作是双击运行。程序会自动请求 UAC 管理员权限，然后打开中文 WinForms 界面。界面顶部统一提供“控制面管理员”“游戏房主”“游戏成员”三种角色；管理员可以启动控制面、检查健康、创建网络、生成并复制两种邀请，房主/成员可以安装服务、加入、连接、断开和离开网络。下方日志窗口会收集控制面、安装脚本和 `vpnctl` 输出，并提供复制/导出功能；管理员令牌和一次性邀请令牌不会写入日志。下面的带参数命令仅用于开发者调试：
 
 ```powershell
 .\ipv6mesh-installer.exe `
     -control-url 'http://[2001:db8::1]:8080'
 ```
 
-双击时不需要传 `-control-url`，程序会自行提示输入。默认安装后自动启动 `IPv6Mesh` 服务、加入网络和连接；`-start-service=false`、`-connect=false` 和 `-keep-temp` 是开发者调试选项。该调试安装器目前未进行代码签名，Windows SmartScreen 可能显示未识别发布者提示；发布前应使用正式证书签名。
+双击时不需要传 `-control-url`，程序会在 UI 中填写。选择“游戏房主”或“游戏成员”后点击“安装并加入 VPN”，默认会停止旧服务、安装/更新 `IPv6Mesh` 服务、加入网络和连接；选择“控制面管理员”后可以启动控制面并生成邀请。`-non-interactive`、`-start-service=false`、`-connect=false` 和 `-keep-temp` 是开发者调试选项。该调试安装器目前未进行代码签名，Windows SmartScreen 可能显示未识别发布者提示；发布前应使用正式证书签名。
 
 发布前或人工调试时，可以不提权只验证 `.exe` 内嵌的载荷：
 
@@ -63,11 +63,15 @@ http://[2001:db8::1]:8080
 
 普通用户只需使用 GitHub 发布页中的单文件安装器，不需要手动运行 `vpnctl`：
 
-1. 在每台 Windows 电脑下载同一版本的 `ipv6mesh-installer-0.1.0-debug.4.exe`。
+1. 在每台 Windows 电脑下载同一版本的 `ipv6mesh-installer-0.1.0-debug.5.exe`。
 2. 双击运行，在 UAC 对话框中点击“是”。
-3. 按程序提示输入控制面 URL、该设备专属的一次性邀请令牌和设备名。
-4. 等待程序显示 `IPv6Mesh is connected`、`Virtual IPv4` 和 `Path`。
+3. 在顶部选择“游戏房主”或“游戏成员”，输入控制面 URL、该设备专属的一次性邀请令牌和设备名。
+4. 点击“安装并加入 VPN”，在状态和日志中查看 Network ID、虚拟 IPv4 和 Path。
 5. 第二台电脑重复上述流程，但使用不同的一次性邀请令牌和设备名。
+
+控制面管理员在同一个 UI 中选择“控制面管理员”，填入监听地址 `[::]:8080`、控制面 URL 和管理员令牌，点击“启动控制面”；然后依次点击“检查健康”“创建网络”“生成房主邀请”“生成成员邀请”。如果控制面运行在当前电脑，UI 会尝试自动放行对应 TCP 端口；仍需确认路由器/校园网允许 IPv6 入站访问。
+
+日志区支持“清空日志”“复制日志”“导出日志”。导出前请检查其中没有不希望公开的主机信息；邀请令牌只能通过专用令牌框复制，不要从命令行或日志中传播。
 
 完整的面向用户的 `.exe` 联机流程、房主/成员角色、双机互访验证和故障排查请参见仓库根目录的 [Windows 房主与成员联机说明](../../README.md#windows-用户使用说明房主与成员双击-exe-入网)。
 
