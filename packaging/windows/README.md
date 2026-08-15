@@ -24,14 +24,14 @@
     -Version '0.1.0-debug.1'
 ```
 
-生成的 `ipv6mesh-installer.exe` 会自动请求 UAC 管理员权限；运行时可直接传入控制面地址：
+生成的 `ipv6mesh-installer.exe` 面向普通用户的默认操作是双击运行。程序会自动请求 UAC 管理员权限，然后依次提示控制面 URL、一次性邀请令牌和设备名；安装服务后自动执行加入网络和连接虚拟适配器，并显示虚拟 IPv4。一次性令牌相当于一次性密码，不要公开或截图分享：
 
 ```powershell
 .\ipv6mesh-installer.exe `
     -control-url 'http://[2001:db8::1]:8080'
 ```
 
-不传 `-control-url` 时，安装器会在控制台中提示输入。默认安装后自动启动 `IPv6Mesh` 服务；使用 `-start-service=false` 可只安装不启动。`-keep-temp` 可保留解压目录，便于检查安装脚本和载荷。该调试安装器目前未进行代码签名，Windows SmartScreen 可能显示未识别发布者提示；发布前应使用正式证书签名。
+双击时不需要传 `-control-url`，程序会自行提示输入。默认安装后自动启动 `IPv6Mesh` 服务、加入网络和连接；`-start-service=false`、`-connect=false` 和 `-keep-temp` 是开发者调试选项。该调试安装器目前未进行代码签名，Windows SmartScreen 可能显示未识别发布者提示；发布前应使用正式证书签名。
 
 发布前或人工调试时，可以不提权只验证 `.exe` 内嵌的载荷：
 
@@ -59,15 +59,15 @@ http://[2001:db8::1]:8080
 
 ## 安装节点
 
-普通用户优先使用 GitHub 发布页中的单文件安装器，而不是手动运行脚本：
+普通用户只需使用 GitHub 发布页中的单文件安装器，不需要手动运行 `vpnctl`：
 
-1. 在每台 Windows 电脑下载同一版本的 `ipv6mesh-installer-debug-0.1.0.exe`。
-2. 运行 `.\ipv6mesh-installer-debug-0.1.0.exe -verify-payload` 检查载荷。
-3. 使用管理员提供的控制面地址运行 `.\ipv6mesh-installer-debug-0.1.0.exe -control-url 'http://[控制面IPv6]:8080'`。
-4. 在 UAC 对话框中允许提权；安装器默认安装并启动 `IPv6Mesh` 服务。
-5. 重新打开“管理员 PowerShell”，使用本设备专属的一次性邀请令牌执行 `vpnctl join`，再执行 `vpnctl status` 和 `vpnctl connect`。
+1. 在每台 Windows 电脑下载同一版本的 `ipv6mesh-installer-0.1.0-debug.2.exe`。
+2. 双击运行，在 UAC 对话框中点击“是”。
+3. 按程序提示输入控制面 URL、该设备专属的一次性邀请令牌和设备名。
+4. 等待程序显示 `IPv6Mesh is connected`、`Virtual IPv4` 和 `Path`。
+5. 第二台电脑重复上述流程，但使用不同的一次性邀请令牌和设备名。
 
-完整的面向用户的 `.exe` 联机流程、双机互访验证和故障排查请参见仓库根目录的 [Windows 用户使用说明](../../README.md#windows-用户使用说明使用-exe-加入虚拟局域网)。
+完整的面向用户的 `.exe` 联机流程、双机互访验证和故障排查请参见仓库根目录的 [Windows 用户使用说明](../../README.md#windows-用户使用说明双击-exe-加入虚拟局域网)。
 
 以管理员身份执行：
 
