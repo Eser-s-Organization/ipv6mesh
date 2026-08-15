@@ -6,6 +6,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,7 +16,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/Eser-s-Organization/ipv6mesh/internal/ipc"
 	"golang.org/x/sys/windows"
 )
 
@@ -25,11 +28,16 @@ var errRelaunched = errors.New("installer relaunched with administrator privileg
 
 type installerOptions struct {
 	controlURL       string
+	invite           string
+	deviceName       string
+	networkID        string
 	installDirectory string
 	dataDirectory    string
 	serviceName      string
 	startService     bool
+	connect          bool
 	keepTemp         bool
+	nonInteractive   bool
 	showVersion      bool
 	verifyPayload    bool
 }
@@ -52,6 +60,7 @@ func main() {
 			return
 		}
 		fmt.Fprintln(os.Stderr, "IPv6Mesh installer failed:", err)
+		waitForExit(options.nonInteractive)
 		os.Exit(1)
 	}
 }
@@ -59,11 +68,16 @@ func main() {
 func parseOptions() installerOptions {
 	options := installerOptions{}
 	flag.StringVar(&options.controlURL, "control-url", "", "control-plane URL, for example http://[2001:db8::1]:8080")
+	flag.StringVar(&options.invite, "invite", "", "one-time enrollment invite; prompted when omitted")
+	flag.StringVar(&options.deviceName, "device-name", "", "device display name; computer name is used when omitted")
+	flag.StringVar(&options.networkID, "network", "", "network ID; the invite network is used when omitted")
 	flag.StringVar(&options.installDirectory, "install-directory", "", "installation directory (default: C:\\Program Files\\IPv6Mesh)")
 	flag.StringVar(&options.dataDirectory, "data-directory", "", "data directory (default: C:\\ProgramData\\IPv6Mesh)")
 	flag.StringVar(&options.serviceName, "service-name", "", "Windows service name (default: IPv6Mesh)")
 	flag.BoolVar(&options.startService, "start-service", true, "start the service after installation")
+	flag.BoolVar(&options.connect, "connect", true, "join and connect the node after installation")
 	flag.BoolVar(&options.keepTemp, "keep-temp", false, "keep the extracted temporary payload for debugging")
+	flag.BoolVar(&options.nonInteractive, "non-interactive", false, "do not prompt or wait for input; required values must be flags")
 	flag.BoolVar(&options.showVersion, "version", false, "print installer version")
 	flag.BoolVar(&options.verifyPayload, "verify-payload", false, "verify the embedded payload without installing")
 	flag.Parse()
@@ -84,6 +98,9 @@ func run(options installerOptions) error {
 			return err
 		}
 		return errRelaunched
+	}
+	if options.nonInteractive && strings.TrimSpace(options.controlURL) == "" {
+		return errors.New("-control-url is required with -non-interactive")
 	}
 
 	controlURL, err := resolveControlURL(options.controlURL)
@@ -147,7 +164,164 @@ func run(options installerOptions) error {
 	}
 
 	fmt.Println("IPv6Mesh installation completed.")
+	if !options.startService {
+		fmt.Println("The service was not started because -start-service=false was supplied.")
+		waitForExit(options.nonInteractive)
+		return nil
+	}
+	if err := runConnectionWizard(options); err != nil {
+		return err
+	}
 	return nil
+}
+
+func runConnectionWizard(options installerOptions) error {
+	reader := bufio.NewReader(os.Stdin)
+	client := ipc.NewClient(ipc.DefaultPipeName)
+	status, err := callService(client, ipc.Request{Type: ipc.CommandStatus})
+	if err != nil {
+		return fmt.Errorf("wait for IPv6Mesh service: %w", err)
+	}
+	if !status.OK {
+		return serviceResponseError("status", status)
+	}
+
+	networkID := strings.TrimSpace(options.networkID)
+	if status.NetworkID != "" {
+		fmt.Println("This device is already joined to network:", status.NetworkID)
+		if networkID == "" {
+			networkID = status.NetworkID
+		}
+		if status.VirtualIPv4 != "" {
+			fmt.Println("Current virtual IPv4:", status.VirtualIPv4)
+		}
+	} else {
+		invite, err := promptValue(reader, "One-time invite token", options.invite, "", options.nonInteractive)
+		if err != nil {
+			return err
+		}
+		deviceName, err := promptValue(reader, "Device name", options.deviceName, defaultDeviceName(), options.nonInteractive)
+		if err != nil {
+			return err
+		}
+		fmt.Println("Joining the IPv6Mesh network...")
+		joined, err := callService(client, ipc.Request{Type: ipc.CommandJoin, Invite: invite, DisplayName: deviceName})
+		if err != nil {
+			return fmt.Errorf("join network: %w", err)
+		}
+		if !joined.OK {
+			return serviceResponseError("join", joined)
+		}
+		networkID = joined.NetworkID
+		fmt.Println("Joined network:", joined.NetworkID)
+		fmt.Println("Virtual IPv4:", joined.VirtualIPv4)
+	}
+
+	if !options.connect {
+		fmt.Println("Connection step skipped because -connect=false was supplied.")
+		waitForExit(options.nonInteractive)
+		return nil
+	}
+	if networkID == "" {
+		return errors.New("network ID is unavailable; provide -network")
+	}
+	fmt.Println("Connecting the virtual adapter...")
+	connected, err := callService(client, ipc.Request{Type: ipc.CommandConnect, NetworkID: networkID})
+	if err != nil {
+		return fmt.Errorf("connect network: %w", err)
+	}
+	if !connected.OK {
+		return serviceResponseError("connect", connected)
+	}
+	finalStatus, err := callService(client, ipc.Request{Type: ipc.CommandStatus})
+	if err != nil {
+		return fmt.Errorf("read final status: %w", err)
+	}
+	if !finalStatus.OK {
+		return serviceResponseError("final status", finalStatus)
+	}
+	fmt.Println("IPv6Mesh is connected.")
+	fmt.Println("Network:", finalStatus.NetworkID)
+	fmt.Println("Virtual IPv4:", finalStatus.VirtualIPv4)
+	fmt.Println("Path:", finalStatus.PathState)
+	waitForExit(options.nonInteractive)
+	return nil
+}
+
+func callService(client *ipc.Client, request ipc.Request) (ipc.Response, error) {
+	if client == nil {
+		return ipc.Response{}, errors.New("IPC client is not initialized")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var lastErr error
+	for {
+		response, err := client.Call(ctx, request)
+		if err == nil {
+			return response, nil
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return ipc.Response{}, fmt.Errorf("%w: %v", ctx.Err(), lastErr)
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func serviceResponseError(operation string, response ipc.Response) error {
+	if response.Error == nil {
+		return fmt.Errorf("%s failed", operation)
+	}
+	if response.Error.Message != "" {
+		return fmt.Errorf("%s failed: %s (%s)", operation, response.Error.Message, response.Error.Code)
+	}
+	return fmt.Errorf("%s failed: %s", operation, response.Error.Code)
+}
+
+func promptValue(reader *bufio.Reader, label, value, fallback string, nonInteractive bool) (string, error) {
+	value = strings.TrimSpace(value)
+	if value != "" {
+		return value, nil
+	}
+	if nonInteractive {
+		return "", fmt.Errorf("%s is required in non-interactive mode", label)
+	}
+	if fallback != "" {
+		fmt.Printf("%s [%s]: ", label, fallback)
+	} else {
+		fmt.Printf("%s: ", label)
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("read %s: %w", label, err)
+	}
+	value = strings.TrimSpace(line)
+	if value == "" {
+		value = strings.TrimSpace(fallback)
+	}
+	if value == "" {
+		return "", fmt.Errorf("%s cannot be empty", label)
+	}
+	return value, nil
+}
+
+func defaultDeviceName() string {
+	if name, err := os.Hostname(); err == nil && strings.TrimSpace(name) != "" {
+		return strings.TrimSpace(name)
+	}
+	if name := strings.TrimSpace(os.Getenv("COMPUTERNAME")); name != "" {
+		return name
+	}
+	return "ipv6mesh-device"
+}
+
+func waitForExit(nonInteractive bool) {
+	if nonInteractive {
+		return
+	}
+	fmt.Println("Press Enter to close this window.")
+	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
 }
 
 func resolveControlURL(value string) (string, error) {
