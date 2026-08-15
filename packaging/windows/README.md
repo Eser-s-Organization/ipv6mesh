@@ -59,6 +59,16 @@ http://[2001:db8::1]:8080
 
 ## 安装节点
 
+普通用户优先使用 GitHub 发布页中的单文件安装器，而不是手动运行脚本：
+
+1. 在每台 Windows 电脑下载同一版本的 `ipv6mesh-installer-debug-0.1.0.exe`。
+2. 运行 `.\ipv6mesh-installer-debug-0.1.0.exe -verify-payload` 检查载荷。
+3. 使用管理员提供的控制面地址运行 `.\ipv6mesh-installer-debug-0.1.0.exe -control-url 'http://[控制面IPv6]:8080'`。
+4. 在 UAC 对话框中允许提权；安装器默认安装并启动 `IPv6Mesh` 服务。
+5. 重新打开“管理员 PowerShell”，使用本设备专属的一次性邀请令牌执行 `vpnctl join`，再执行 `vpnctl status` 和 `vpnctl connect`。
+
+完整的面向用户的 `.exe` 联机流程、双机互访验证和故障排查请参见仓库根目录的 [Windows 用户使用说明](../../README.md#windows-用户使用说明使用-exe-加入虚拟局域网)。
+
 以管理员身份执行：
 
 ```powershell
