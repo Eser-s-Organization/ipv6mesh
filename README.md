@@ -63,7 +63,7 @@ flowchart LR
 
 ### 1. 首选：使用统一中文 UI
 
-下载 [v0.1.0-debug.5 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.5/ipv6mesh-installer-0.1.0-debug.5.exe)，SHA-256 为 `E7567B8ABC1CE603ED2818CF425D6ED36AC9B5A8A193D2E94838CC7008D66D46`。双击后在 UAC 对话框中点击“是”。程序会打开“IPv6Mesh 远程组网”窗口，顶部可以切换三种角色：
+下载 [v0.1.0-debug.5 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.5/ipv6mesh-installer-0.1.0-debug.5.exe)，SHA-256 为 `4CB927DBE7A680901DA7BB956236D73C29B82A4C2CEDB10810AA0B418CFD9905`。双击后在 UAC 对话框中点击“是”。程序会打开“IPv6Mesh 远程组网”窗口，顶部可以切换三种角色：
 
 | UI 角色 | 主要按钮和操作 |
 | --- | --- |
