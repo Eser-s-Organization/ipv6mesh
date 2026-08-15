@@ -35,8 +35,55 @@ if ([string]::IsNullOrWhiteSpace($ControlUrl)) {
     throw "ControlUrl is required, for example http://[2001:db8::1]:8080"
 }
 
+function Wait-FileAvailable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [int]$TimeoutSeconds = 15
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return
+    }
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $stream = $null
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+            return
+        } catch {
+            if ((Get-Date) -ge $deadline) {
+                throw "Timed out waiting for file to become available: $Path"
+            }
+            Start-Sleep -Milliseconds 250
+        } finally {
+            if ($null -ne $stream) {
+                $stream.Dispose()
+            }
+        }
+    }
+}
+
+$existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if ($null -ne $existingService) {
+    if ($existingService.Status -ne "Stopped") {
+        Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+    }
+    $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($null -ne $existingService) {
+        $existingService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(15))
+    }
+}
+
 New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
 New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
+$servicePath = Join-Path $InstallDirectory "vpn-service.exe"
+Wait-FileAvailable -Path $servicePath
 foreach ($name in @("vpn-service.exe", "vpnctl.exe", "control-server.exe", "relay-agent.exe", "wireguard.dll", "wireguardnt-manifest.json", "wireguardnt-LICENSE.txt", "README.md")) {
     $source = Join-Path $package $name
     if (Test-Path -LiteralPath $source -PathType Leaf) {
@@ -44,14 +91,20 @@ foreach ($name in @("vpn-service.exe", "vpnctl.exe", "control-server.exe", "rela
     }
 }
 
-& sc.exe query $ServiceName *> $null
-if ($LASTEXITCODE -eq 0) {
-    & sc.exe stop $ServiceName *> $null
+if ($null -ne $existingService) {
     & sc.exe delete $ServiceName *> $null
-    Start-Sleep -Milliseconds 500
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to delete existing Windows service $ServiceName"
+    }
+    $deleteDeadline = (Get-Date).AddSeconds(15)
+    while ($null -ne (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
+        if ((Get-Date) -ge $deleteDeadline) {
+            throw "Timed out waiting for existing Windows service $ServiceName to be deleted"
+        }
+        Start-Sleep -Milliseconds 250
+    }
 }
 
-$servicePath = Join-Path $InstallDirectory "vpn-service.exe"
 $binaryPathName = '"' + $servicePath + '"'
 New-Service `
     -Name $ServiceName `
