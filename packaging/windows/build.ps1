@@ -16,9 +16,10 @@ $repositoryRoot = (Resolve-Path (Join-Path $scriptRoot "..\..")).Path
 $go = Get-Command $GoCommand -ErrorAction Stop
 $output = (Resolve-Path $OutputDirectory -ErrorAction SilentlyContinue)
 if ($null -eq $output) {
-    $output = New-Item -ItemType Directory -Path $OutputDirectory -Force
+    New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+    $output = (Resolve-Path -LiteralPath $OutputDirectory -ErrorAction Stop)
 }
-$output = $output.Path
+$output = $output.ProviderPath
 
 foreach ($name in @("vpn-service.exe", "vpnctl.exe", "control-server.exe", "relay-agent.exe")) {
     $path = Join-Path $output $name

@@ -12,6 +12,33 @@
 
 如果暂时没有 DLL，构建脚本仍可生成控制面和客户端二进制，但安装脚本会拒绝安装数据面。
 
+## 单文件调试安装器
+
+可以把节点运行所需的 Windows 二进制、官方 WireGuardNT DLL、许可证和安装脚本封装为一个自包含的 `.exe`。构建时必须提供官方 SDK 中的 `wireguard.dll` 和对应许可证：
+
+```powershell
+.\packaging\windows\build-installer.ps1 `
+    -GoCommand 'C:\Users\Eser\.cache\codex-go\go\bin\go.exe' `
+    -WireGuardDll 'C:\path\to\wireguard.dll' `
+    -WireGuardLicense 'C:\path\to\LICENSE.txt' `
+    -Version '0.1.0-debug.1'
+```
+
+生成的 `ipv6mesh-installer.exe` 会自动请求 UAC 管理员权限；运行时可直接传入控制面地址：
+
+```powershell
+.\ipv6mesh-installer.exe `
+    -control-url 'http://[2001:db8::1]:8080'
+```
+
+不传 `-control-url` 时，安装器会在控制台中提示输入。默认安装后自动启动 `IPv6Mesh` 服务；使用 `-start-service=false` 可只安装不启动。`-keep-temp` 可保留解压目录，便于检查安装脚本和载荷。该调试安装器目前未进行代码签名，Windows SmartScreen 可能显示未识别发布者提示；发布前应使用正式证书签名。
+
+发布前或人工调试时，可以不提权只验证 `.exe` 内嵌的载荷：
+
+```powershell
+.\ipv6mesh-installer.exe -verify-payload
+```
+
 ## 启动临时控制面
 
 第一轮验收可以使用内存仓库；进程退出后网络、邀请和会话会丢失。生产环境应设置 `CONTROL_DB_DSN` 使用 PostgreSQL。
