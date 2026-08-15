@@ -15,7 +15,7 @@ The v0.1 scope is virtual IPv4 node-to-node access, IPv6 Direct connectivity, an
 
 普通用户只需要双击单文件安装器，按程序提示输入信息。程序会自动请求 UAC 权限、安装并启动服务、加入网络、连接虚拟适配器，并显示本机虚拟 IPv4。管理员需要提前提供控制面地址和每台设备各自的一次性邀请令牌；令牌相当于一次性密码，不要公开或截图分享。
 
-当前调试安装器可从 [GitHub v0.1.0-debug.2 发布页](https://github.com/Eser-s-Organization/ipv6mesh/releases/tag/v0.1.0-debug.2)下载，直接文件地址是 [ipv6mesh-installer-0.1.0-debug.2.exe](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.2/ipv6mesh-installer-0.1.0-debug.2.exe)。该版本未进行代码签名，首次运行可能出现 SmartScreen 的“未识别发布者”提示；确认下载来源和 SHA-256 后再继续。
+当前调试安装器可从 [GitHub v0.1.0-debug.3 发布页](https://github.com/Eser-s-Organization/ipv6mesh/releases/tag/v0.1.0-debug.3)下载，直接文件地址是 [ipv6mesh-installer-0.1.0-debug.3.exe](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.3/ipv6mesh-installer-0.1.0-debug.3.exe)。该版本未进行代码签名，首次运行可能出现 SmartScreen 的“未识别发布者”提示；确认下载来源和 SHA-256 后再继续。
 
 ### 1. 双击安装并加入网络
 

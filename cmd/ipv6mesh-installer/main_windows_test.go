@@ -65,3 +65,19 @@ func TestServiceResponseErrorIncludesCodeAndMessage(t *testing.T) {
 		t.Fatalf("serviceResponseError = %v", err)
 	}
 }
+
+func TestBuildInstallArgumentsPassesPackageDirectory(t *testing.T) {
+	args := buildInstallArguments(installerOptions{startService: true}, `C:\Temp\ipv6mesh-installer`, "http://[2001:db8::1]:8080")
+	for i, arg := range args {
+		if arg == "-PackageDirectory" {
+			if i+1 >= len(args) {
+				t.Fatal("-PackageDirectory has no value")
+			}
+			if args[i+1] != `C:\Temp\ipv6mesh-installer` {
+				t.Fatalf("-PackageDirectory value = %q, want extracted package directory", args[i+1])
+			}
+			return
+		}
+	}
+	t.Fatal("install arguments do not include -PackageDirectory")
+}

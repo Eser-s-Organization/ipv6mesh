@@ -126,29 +126,7 @@ func run(options installerOptions) error {
 	}
 
 	powershell := findPowerShell()
-	arguments := []string{
-		"-NoLogo",
-		"-NoProfile",
-		"-NonInteractive",
-		"-ExecutionPolicy",
-		"Bypass",
-		"-File",
-		filepath.Join(tempDirectory, "install.ps1"),
-		"-ControlUrl",
-		controlURL,
-	}
-	if options.installDirectory != "" {
-		arguments = append(arguments, "-InstallDirectory", options.installDirectory)
-	}
-	if options.dataDirectory != "" {
-		arguments = append(arguments, "-DataDirectory", options.dataDirectory)
-	}
-	if options.serviceName != "" {
-		arguments = append(arguments, "-ServiceName", options.serviceName)
-	}
-	if options.startService {
-		arguments = append(arguments, "-StartService")
-	}
+	arguments := buildInstallArguments(options, tempDirectory, controlURL)
 
 	fmt.Printf("IPv6Mesh installer %s\n", version)
 	fmt.Println("Control URL:", controlURL)
@@ -173,6 +151,35 @@ func run(options installerOptions) error {
 		return err
 	}
 	return nil
+}
+
+func buildInstallArguments(options installerOptions, tempDirectory, controlURL string) []string {
+	arguments := []string{
+		"-NoLogo",
+		"-NoProfile",
+		"-NonInteractive",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-File",
+		filepath.Join(tempDirectory, "install.ps1"),
+		"-PackageDirectory",
+		tempDirectory,
+		"-ControlUrl",
+		controlURL,
+	}
+	if options.installDirectory != "" {
+		arguments = append(arguments, "-InstallDirectory", options.installDirectory)
+	}
+	if options.dataDirectory != "" {
+		arguments = append(arguments, "-DataDirectory", options.dataDirectory)
+	}
+	if options.serviceName != "" {
+		arguments = append(arguments, "-ServiceName", options.serviceName)
+	}
+	if options.startService {
+		arguments = append(arguments, "-StartService")
+	}
+	return arguments
 }
 
 func runConnectionWizard(options installerOptions) error {

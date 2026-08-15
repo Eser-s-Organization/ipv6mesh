@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$PackageDirectory = $PSScriptRoot,
+    [string]$PackageDirectory = "",
     [Parameter(Mandatory = $true)]
     [string]$ControlUrl,
     [string]$InstallDirectory = (Join-Path ${env:ProgramFiles} "IPv6Mesh"),
@@ -13,6 +13,13 @@ $ErrorActionPreference = "Stop"
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "install.ps1 must run from an elevated PowerShell window"
+}
+
+if ([string]::IsNullOrWhiteSpace($PackageDirectory)) {
+    $PackageDirectory = $PSScriptRoot
+}
+if ([string]::IsNullOrWhiteSpace($PackageDirectory)) {
+    throw "PackageDirectory could not be resolved; pass -PackageDirectory explicitly"
 }
 
 $package = (Resolve-Path -LiteralPath $PackageDirectory -ErrorAction Stop).Path
