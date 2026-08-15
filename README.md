@@ -20,7 +20,7 @@ The v0.1 scope is virtual IPv4 node-to-node access, IPv6 Direct connectivity, an
 - **游戏房主**：启动游戏并作为第一台 VPN 节点加入网络
 - **成员**：使用自己的邀请令牌加入同一个 VPN 网络
 
-最简单的情况是：第一台电脑同时担任控制面管理员和游戏房主；第二台电脑是成员。新版 `v0.1.0-debug.5` 将三种角色统一放在一个中文可视化界面中，普通成员只需要双击 `.exe`，不需要打开 PowerShell，也不需要使用 `vpnctl`。
+最简单的情况是：第一台电脑同时担任控制面管理员和游戏房主；第二台电脑是成员。新版 `v0.1.0-debug.6` 将三种角色统一放在一个中文可视化界面中，普通成员只需要双击 `.exe`，不需要打开 PowerShell，也不需要使用 `vpnctl`。
 
 > ⚠️ 控制面必须先运行，节点安装器不会自动创建控制面。控制面可以运行在房主电脑、另一台服务器或具有全球 IPv6 的 VPS 上。
 
@@ -63,7 +63,9 @@ flowchart LR
 
 ### 1. 首选：使用统一中文 UI
 
-下载 [v0.1.0-debug.5 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.5/ipv6mesh-installer-0.1.0-debug.5.exe)，SHA-256 为 `4CB927DBE7A680901DA7BB956236D73C29B82A4C2CEDB10810AA0B418CFD9905`。双击后在 UAC 对话框中点击“是”。程序会打开“IPv6Mesh 远程组网”窗口，顶部可以切换三种角色：
+下载 [v0.1.0-debug.6 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.6/ipv6mesh-installer-0.1.0-debug.6.exe)，SHA-256 为 `72949379B89E7C11245E32AAF5E0E1D6E59069AAE11DAE587AABC2906EBC7032`。双击后在 UAC 对话框中点击“是”。程序会打开“IPv6Mesh 远程组网”窗口，顶部可以切换三种角色：
+
+如果旧版 `.5` 弹出 `run Chinese IPv6Mesh UI: exit status 1`，请改用 `.6`；根因是 Windows PowerShell 5.1 读取无 BOM 的 UTF-8 中文 UI 脚本时在启动阶段解析失败，`.6` 已将 `ui.ps1` 固定为 UTF-8 with BOM。
 
 | UI 角色 | 主要按钮和操作 |
 | --- | --- |
@@ -198,7 +200,7 @@ Member invite: <member-one-time-token>
 
 以第一台 Windows 11 作为游戏房主为例：
 
-1. 下载 [v0.1.0-debug.5 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.5/ipv6mesh-installer-0.1.0-debug.5.exe)
+1. 下载 [v0.1.0-debug.6 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.6/ipv6mesh-installer-0.1.0-debug.6.exe)
 2. 双击运行，Windows UAC 弹出后点击“是”，选择角色“游戏房主”
 3. 在 UI 中输入：
 

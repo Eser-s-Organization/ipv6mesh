@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -134,6 +135,9 @@ func TestWindowsPackageIncludesChineseUI(t *testing.T) {
 	uiScript, err := os.ReadFile(filepath.Join(packageRoot, "ui.ps1"))
 	if err != nil {
 		t.Fatalf("read UI script: %v", err)
+	}
+	if !bytes.HasPrefix(uiScript, []byte{0xEF, 0xBB, 0xBF}) {
+		t.Fatal("UI script must be UTF-8 with BOM for Windows PowerShell 5.1")
 	}
 	contents := string(uiScript)
 	for _, required := range []string{
