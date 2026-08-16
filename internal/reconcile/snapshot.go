@@ -148,6 +148,9 @@ func (applier *Applier) Clear(ctx context.Context) error {
 	if err := applier.options.Adapter.SetDown(ctx, applier.state.handle); err != nil {
 		joined = errors.Join(joined, err)
 	}
+	if err := applier.options.Adapter.Delete(ctx, applier.state.handle); err != nil {
+		joined = errors.Join(joined, err)
+	}
 	if joined == nil {
 		applier.state = appliedState{}
 		applier.generation = 0
@@ -280,6 +283,9 @@ func (applier *Applier) rollback(ctx context.Context, previous appliedState, han
 	}
 	if err := applier.options.Adapter.SetDown(ctx, handle); err != nil {
 		joined = errors.Join(joined, fmt.Errorf("restore WireGuard down state: %w", err))
+	}
+	if err := applier.options.Adapter.Delete(ctx, handle); err != nil {
+		joined = errors.Join(joined, fmt.Errorf("delete failed WireGuard adapter: %w", err))
 	}
 	return joined
 }
