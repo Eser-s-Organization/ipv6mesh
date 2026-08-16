@@ -31,6 +31,7 @@ var (
 	errInvalidJSON               = errors.New("invalid JSON request")
 	ErrInvalidInviteToken        = errors.New("invalid invite token")
 	ErrInvalidRequest            = errors.New("invalid enrollment request")
+	ErrRequestTooLarge           = errors.New("request body too large")
 	ErrCommitUnknown             = errors.New("enrollment commit status is uncertain")
 	ErrEnrollmentRecoveryPending = ErrCommitUnknown
 )
@@ -75,6 +76,7 @@ type Handler struct {
 	enrollmentRecoveryTimeout  time.Duration
 	enrollmentRecoveryDelay    time.Duration
 	room                       *roomCoordinator
+	roomLimiter                *roomJoinLimiter
 }
 
 // NewHandler constructs a control-plane HTTP handler around an existing
@@ -132,8 +134,10 @@ func NewHandler(repository TransactionalRepository, options HandlerOptions) *Han
 		bootstrapSubject = "bootstrap-admin"
 	}
 	var room *roomCoordinator
+	var roomLimiter *roomJoinLimiter
 	if options.RoomMode {
 		room = &roomCoordinator{}
+		roomLimiter = newRoomJoinLimiter(options.RoomJoinPerIP, options.RoomJoinGlobal, clock)
 	}
 	return &Handler{
 		repository:                 repository,
@@ -150,6 +154,7 @@ func NewHandler(repository TransactionalRepository, options HandlerOptions) *Han
 		enrollmentRecoveryTimeout:  recoveryTimeout,
 		enrollmentRecoveryDelay:    recoveryDelay,
 		room:                       room,
+		roomLimiter:                roomLimiter,
 	}
 }
 
@@ -367,7 +372,6 @@ func (handler *Handler) createInvite(writer http.ResponseWriter, request *http.R
 }
 
 func (handler *Handler) enroll(writer http.ResponseWriter, request *http.Request) {
-	writer.Header().Set("Cache-Control", "no-store")
 	var body struct {
 		Invite        string `json:"invite"`
 		NodeID        string `json:"node_id"`
@@ -388,20 +392,25 @@ func (handler *Handler) enroll(writer http.ResponseWriter, request *http.Request
 		Platform:      body.Platform,
 		ClientVersion: body.ClientVersion,
 	})
+	handler.writeEnrollmentResult(writer, result, err)
+}
+
+func (handler *Handler) writeEnrollmentResult(writer http.ResponseWriter, result enrollmentResult, err error) {
+	writer.Header().Set("Cache-Control", "no-store")
+	if errors.Is(err, ErrEnrollmentRecoveryPending) && result.SessionToken != "" {
+		writer.Header().Set("Retry-After", "1")
+		writeJSON(writer, http.StatusServiceUnavailable, enrollmentRecoveryResponse{
+			Error:        "enrollment_recovery_pending",
+			Retryable:    true,
+			Node:         makeNodeResponse(result.Node),
+			Membership:   makeMembershipResponse(result.Membership),
+			Network:      makeNetworkResponse(result.Network),
+			Session:      sessionResponse{Token: result.SessionToken, Subject: result.Session.Subject, NetworkID: result.Session.NetworkID, ExpiresAt: result.Session.ExpiresAt},
+			SessionToken: result.SessionToken,
+		})
+		return
+	}
 	if err != nil {
-		if errors.Is(err, ErrEnrollmentRecoveryPending) && result.SessionToken != "" {
-			writer.Header().Set("Retry-After", "1")
-			writeJSON(writer, http.StatusServiceUnavailable, enrollmentRecoveryResponse{
-				Error:        "enrollment_recovery_pending",
-				Retryable:    true,
-				Node:         makeNodeResponse(result.Node),
-				Membership:   makeMembershipResponse(result.Membership),
-				Network:      makeNetworkResponse(result.Network),
-				Session:      sessionResponse{Token: result.SessionToken, Subject: result.Session.Subject, NetworkID: result.Session.NetworkID, ExpiresAt: result.Session.ExpiresAt},
-				SessionToken: result.SessionToken,
-			})
-			return
-		}
 		writeAPIError(writer, statusForError(err), err)
 		return
 	}
@@ -806,10 +815,17 @@ func (handler *Handler) events(writer http.ResponseWriter, request *http.Request
 }
 
 func decodeJSON(writer http.ResponseWriter, request *http.Request, limit int64, destination any) error {
+	if limit > 0 && request.ContentLength > limit {
+		return ErrRequestTooLarge
+	}
 	request.Body = http.MaxBytesReader(writer, request.Body, limit)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			return ErrRequestTooLarge
+		}
 		return errInvalidJSON
 	}
 	var extra any
@@ -1028,6 +1044,8 @@ func writeAPIError(writer http.ResponseWriter, status int, err error) {
 		code = "invalid_request"
 	case http.StatusServiceUnavailable:
 		code = "enrollment_recovery_pending"
+	case http.StatusRequestEntityTooLarge:
+		code = "request_too_large"
 	}
 	writeJSON(writer, status, map[string]string{"error": code})
 }
@@ -1049,6 +1067,8 @@ func statusForError(err error) int {
 	case errors.Is(err, ErrValidation), errors.Is(err, address.ErrInvalidPool), errors.Is(err, address.ErrPoolExhausted),
 		errors.Is(err, ErrInvalidInviteToken), errors.Is(err, ErrInvalidRequest), errors.Is(err, errInvalidJSON):
 		return http.StatusUnprocessableEntity
+	case errors.Is(err, ErrRequestTooLarge):
+		return http.StatusRequestEntityTooLarge
 	default:
 		return http.StatusInternalServerError
 	}
