@@ -132,6 +132,10 @@ func (client *Client) Join(ctx context.Context, request JoinRequest) (Enrollment
 	}, &response); err != nil {
 		return EnrollmentResult{}, err
 	}
+	return enrollmentResultFromWire(response)
+}
+
+func enrollmentResultFromWire(response enrollmentWireResponse) (EnrollmentResult, error) {
 	if response.SessionToken == "" || response.Node.ID == "" || response.Membership.NetworkID == "" || response.Network.ID == "" {
 		return EnrollmentResult{}, fmt.Errorf("%w: enrollment response is incomplete", ErrControlInvalidResponse)
 	}
@@ -232,13 +236,21 @@ func (client *Client) Events(ctx context.Context, networkID, sessionToken string
 }
 
 func (client *Client) doJSON(ctx context.Context, method, path, token string, payload, destination any) error {
+	return client.doJSONWithAuth(ctx, method, path, token, payload, destination, true)
+}
+
+func (client *Client) doJSONNoAuth(ctx context.Context, method, path string, payload, destination any) error {
+	return client.doJSONWithAuth(ctx, method, path, "", payload, destination, false)
+}
+
+func (client *Client) doJSONWithAuth(ctx context.Context, method, path, token string, payload, destination any, useDefaultToken bool) error {
 	if client == nil || client.BaseURL == nil || client.HTTPClient == nil {
 		return ErrInvalidClient
 	}
 	if err := contextError(ctx); err != nil {
 		return err
 	}
-	if token == "" {
+	if useDefaultToken && token == "" {
 		token = client.Token
 	}
 	var body io.Reader
