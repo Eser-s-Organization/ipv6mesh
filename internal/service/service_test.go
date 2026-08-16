@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"testing"
 
 	"github.com/Eser-s-Organization/ipv6mesh/internal/control"
@@ -145,6 +146,51 @@ func TestServiceJoinsRoomWithoutInvite(t *testing.T) {
 	})
 	if !response.OK || response.NetworkID != "room-1" || controlClient.roomJoinCalls != 1 {
 		t.Fatalf("room join response=%#v calls=%d", response, controlClient.roomJoinCalls)
+	}
+}
+
+func TestServiceRoomJoinMapsSafeControlRoomErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		controlCode string
+		wantCode    string
+	}{
+		{name: "room not ready", controlCode: "room_not_ready", wantCode: "room_not_ready"},
+		{name: "room full", controlCode: "room_full", wantCode: "room_full"},
+		{name: "join rate limited", controlCode: "join_rate_limited", wantCode: "join_rate_limited"},
+		{name: "unknown", controlCode: "unexpected-secret-code", wantCode: CodeControlFailed},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			controlClient := &fakeControlClient{
+				joinErr: &control.HTTPError{StatusCode: http.StatusConflict, Code: test.controlCode},
+			}
+			service := New(Options{
+				Identity:   &fakeIdentityStore{identity: identity.Identity{PublicKey: "public-key"}},
+				Control:    controlClient,
+				ControlURL: "http://[2001:db8::1]:8080",
+				Adapter:    &fakeAdapter{},
+			})
+			if err := service.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			response := service.Handle(context.Background(), ipc.Request{
+				Type:        ipc.CommandJoinRoom,
+				ControlURL:  "http://[2001:db8::1]:8080",
+				DisplayName: "MEMBER-PC",
+			})
+			if response.OK || response.Error == nil {
+				t.Fatalf("room join response = %#v, want error", response)
+			}
+			if response.Error.Code != test.wantCode {
+				t.Fatalf("room join error code = %q, want %q", response.Error.Code, test.wantCode)
+			}
+			if response.Error.Message != "" {
+				t.Fatalf("room join error message = %q, want empty", response.Error.Message)
+			}
+		})
 	}
 }
 

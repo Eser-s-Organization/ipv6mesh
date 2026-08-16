@@ -14,6 +14,7 @@ import (
 	"github.com/Eser-s-Organization/ipv6mesh/internal/identity"
 	"github.com/Eser-s-Organization/ipv6mesh/internal/service"
 	"github.com/Eser-s-Organization/ipv6mesh/internal/wgnt"
+	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
 )
 
@@ -60,7 +61,7 @@ func runService(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
-	controlURL := os.Getenv("IPV6MESH_CONTROL_URL")
+	controlURL := serviceEnvironment("IPV6MESH_CONTROL_URL")
 	controlClient, err := control.NewClient(controlURL)
 	if err != nil {
 		return err
@@ -88,11 +89,42 @@ func localServiceOptions(identityStore service.IdentityStore, controlBridge serv
 }
 
 func serviceDataDirectory() string {
-	if value := strings.TrimSpace(os.Getenv("IPV6MESH_DATA_DIR")); value != "" {
+	if value := serviceEnvironment("IPV6MESH_DATA_DIR"); value != "" {
 		return filepath.Clean(value)
 	}
-	if value := strings.TrimSpace(os.Getenv("ProgramData")); value != "" {
+	if value := serviceEnvironment("ProgramData"); value != "" {
 		return filepath.Join(value, "IPv6Mesh")
 	}
 	return `C:\ProgramData\IPv6Mesh`
+}
+
+const machineEnvironmentRegistryPath = `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`
+
+var readMachineEnvironmentValue = readMachineEnvironmentValueFromRegistry
+
+func serviceEnvironment(name string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return strings.TrimSpace(readMachineEnvironmentValue(name))
+}
+
+func readMachineEnvironmentValueFromRegistry(name string) string {
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, machineEnvironmentRegistryPath, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer key.Close()
+	value, valueType, err := key.GetStringValue(name)
+	if err != nil {
+		return ""
+	}
+	if valueType == registry.EXPAND_SZ {
+		expanded, err := registry.ExpandString(value)
+		if err != nil {
+			return ""
+		}
+		return expanded
+	}
+	return value
 }

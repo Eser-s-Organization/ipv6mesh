@@ -251,9 +251,22 @@ func (service *Service) joinRoom(ctx context.Context, request ipc.Request) ipc.R
 	}
 	result, err := roomClient.JoinRoom(ctx, JoinRequest{DisplayName: request.DisplayName, PublicKey: publicKey})
 	if err != nil {
-		return ipc.ErrorResponse(CodeControlFailed)
+		return ipc.ErrorResponse(safeRoomControlErrorCode(err))
 	}
 	return service.finishJoin(ctx, result)
+}
+
+func safeRoomControlErrorCode(err error) string {
+	var httpErr *control.HTTPError
+	if !errors.As(err, &httpErr) {
+		return CodeControlFailed
+	}
+	switch httpErr.Code {
+	case "room_not_ready", "room_mode_disabled", "node_already_joined", "room_full", "join_rate_limited", "enrollment_recovery_pending":
+		return httpErr.Code
+	default:
+		return CodeControlFailed
+	}
 }
 
 func (service *Service) finishJoin(ctx context.Context, result JoinResult) ipc.Response {
