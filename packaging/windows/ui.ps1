@@ -284,7 +284,7 @@ function Convert-ResultToJson {
     if ($Result.ExitCode -ne 0) {
         $stderr = [string]$Result.Stderr
         $code = ""
-        if ($stderr -match '\((room_not_ready|room_mode_disabled|node_already_joined|room_full|join_rate_limited|enrollment_recovery_pending|invalid_node|request_too_large|unauthorized)\)') {
+        if ($stderr -match '(room_not_ready|room_mode_disabled|node_already_joined|room_full|join_rate_limited|enrollment_recovery_pending|invalid_node|request_too_large|unauthorized)') {
             $code = [string]$Matches[1]
         }
         $messages = @{
@@ -682,12 +682,13 @@ function Toggle-Diagnostics {
 }
 
 function New-Label {
-    param([string]$Text, [int]$X, [int]$Y, [int]$Width = 100, [int]$Height = 24)
+    param([string]$Text, [int]$X, [int]$Y, [int]$Width = 100, [int]$Height = 24, [int]$FontSize = 9)
     $label = New-Object System.Windows.Forms.Label
     $label.Text = $Text
     $label.Location = New-Object System.Drawing.Point($X, $Y)
     $label.Size = New-Object System.Drawing.Size($Width, $Height)
     $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $label.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", $FontSize)
     return $label
 }
 
