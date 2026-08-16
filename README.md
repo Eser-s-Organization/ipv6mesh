@@ -35,6 +35,10 @@ and does not require an administrator token, a Network ID, or an invitation toke
 7. The host must allow TCP 8080 to the control plane and both peers must allow
    WireGuard UDP 51820. The host and member must have reachable global IPv6.
 
+Opening the UI does not require a global IPv6 on the current computer. Without one,
+the host create action remains unavailable until a valid host address is detected,
+while a member can still open **加入网络** and enter the host's IPv6 address.
+
 The room endpoint is always derived from the host IPv6 as
 http://[host-ipv6]:8080. Link-local, private, loopback, multicast, unspecified, and
 ULA addresses are rejected. The UI does not display the internal bootstrap token,

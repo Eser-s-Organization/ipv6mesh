@@ -364,7 +364,8 @@ function Wait-ControlPlaneReady {
         }
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $deadline)
-    Add-UiLog "控制面在规定时间内未响应。" "警告"
+    Add-UiLog ('控制面进程已启动，但 {0} 秒内仍未响应 /healthz；可稍后点击“检查健康”。' -f $TimeoutSeconds) -Level '警告'
+    Set-UiStatus "控制面等待中" ([System.Drawing.Color]::DarkOrange)
     return $false
 }
 
@@ -858,7 +859,7 @@ Add-UiLog "关闭窗口时只清理本窗口启动的节点服务和控制面资
 if ($initialIPv6 -ne "") {
     Add-UiLog "已检测到可用的房主 IPv6。"
 } else {
-    Add-UiLog "未检测到可用的全局 IPv6；房主可在页面中重新检测。" "警告"
+    Add-UiLog '未检测到可用的全局 IPv6；仍可选择“加入网络”并输入房主 IPv6。创建网络需要有效的房主 IPv6。' -Level '警告'
 }
 Set-PrimaryBusy $false ""
 Show-WelcomePage
