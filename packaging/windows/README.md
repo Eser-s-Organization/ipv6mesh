@@ -21,7 +21,7 @@
     -GoCommand 'C:\Users\Eser\.cache\codex-go\go\bin\go.exe' `
     -WireGuardDll 'C:\path\to\wireguard.dll' `
     -WireGuardLicense 'C:\path\to\LICENSE.txt' `
-    -Version '0.1.0-debug.12'
+    -Version '0.1.0-debug.13'
 ```
 
 生成的 `ipv6mesh-installer.exe` 面向普通用户的默认操作是双击运行。程序会自动请求 UAC 管理员权限，然后打开中文 WinForms 界面。界面顶部统一提供“控制面管理员”“游戏房主”“游戏成员”三种角色；管理员可以自动检测本机 IPv6、输入端口生成控制面 URL、随机生成管理员令牌和 Network ID、启动控制面、等待/检查健康、创建网络、随机生成并复制两种邀请，房主/成员可以安装服务、加入、连接、断开和离开网络。加入时虚拟 IPv4 由控制面从地址池随机分配并保持稳定。下方日志窗口会收集控制面、安装脚本和 `vpnctl` 输出，并提供复制/导出功能；管理员令牌和一次性邀请令牌不会写入日志。下面的带参数命令仅用于开发者调试：
@@ -63,7 +63,7 @@ http://[2001:db8::1]:8080
 
 普通用户只需使用 GitHub 发布页中的单文件安装器，不需要手动运行 `vpnctl`：
 
-1. 在每台 Windows 电脑下载同一版本的 `ipv6mesh-installer-0.1.0-debug.12.exe`。
+1. 在每台 Windows 电脑下载同一版本的 `ipv6mesh-installer-0.1.0-debug.13.exe`。
 2. 双击运行，在 UAC 对话框中点击“是”。
 3. 在顶部选择“游戏房主”或“游戏成员”，输入控制面 URL、该设备专属的一次性邀请令牌和设备名。
 4. 点击“安装并加入 VPN”，在状态和日志中查看 Network ID、虚拟 IPv4 和 Path。

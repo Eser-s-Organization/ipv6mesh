@@ -20,7 +20,7 @@ The v0.1 scope is virtual IPv4 node-to-node access, IPv6 Direct connectivity, an
 - **游戏房主**：启动游戏并作为第一台 VPN 节点加入网络
 - **成员**：使用自己的邀请令牌加入同一个 VPN 网络
 
-最简单的情况是：第一台电脑同时担任控制面管理员和游戏房主；第二台电脑是成员。新版 `v0.1.0-debug.12` 将三种角色统一放在一个中文可视化界面中，普通成员只需要双击 `.exe`，不需要打开 PowerShell，也不需要使用 `vpnctl`。
+最简单的情况是：第一台电脑同时担任控制面管理员和游戏房主；第二台电脑是成员。新版 `v0.1.0-debug.13` 将三种角色统一放在一个中文可视化界面中，普通成员只需要双击 `.exe`，不需要打开 PowerShell，也不需要使用 `vpnctl`。
 
 > ⚠️ 控制面必须先运行，节点安装器不会自动创建控制面。控制面可以运行在房主电脑、另一台服务器或具有全球 IPv6 的 VPS 上。
 
@@ -63,9 +63,9 @@ flowchart LR
 
 ### 1. 首选：使用统一中文 UI
 
-下载 [v0.1.0-debug.12 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.12/ipv6mesh-installer-0.1.0-debug.12.exe)。双击后在 UAC 对话框中点击“是”。程序会打开“IPv6Mesh 远程组网”窗口，顶部可以切换三种角色。SHA-256 以发布页中的 `.sha256` 文件为准。
+下载 [v0.1.0-debug.13 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.13/ipv6mesh-installer-0.1.0-debug.13.exe)。双击后在 UAC 对话框中点击“是”。程序会打开“IPv6Mesh 远程组网”窗口，顶部可以切换三种角色。SHA-256 以发布页中的 `.sha256` 文件为准。
 
-如果旧版 `.5`、`.6`、`.7`、`.8`、`.9`、`.10` 或 `.11` 弹出 `run Chinese IPv6Mesh UI: exit status 1`，请改用 `.12`；`.12` 还会在控制面尚未启动或刚启动时给出明确提示，明确区分“随机生成 Network ID”和“创建网络”，并提供 Network ID、管理员令牌和邀请令牌的随机生成/一键复制按钮。`.12` 启动控制面和 `vpnctl` 时优先使用本次安装器携带的当前载荷，避免旧安装文件覆盖新版本；管理员令牌错误时会明确提示“健康检查只验证连接，不验证管理员身份”。
+如果旧版 `.5`、`.6`、`.7`、`.8`、`.9`、`.10`、`.11` 或 `.12` 弹出 `run Chinese IPv6Mesh UI: exit status 1`，请改用 `.13`；`.13` 修复了没有全局 IPv6 时中文 UI 启动失败的问题，并继续提供控制面尚未启动或刚启动时的明确提示，区分“随机生成 Network ID”和“创建网络”，以及 Network ID、管理员令牌和邀请令牌的随机生成/一键复制按钮。`.13` 启动控制面和 `vpnctl` 时优先使用本次安装器携带的当前载荷，避免旧安装文件覆盖新版本；管理员令牌错误时会明确提示“健康检查只验证连接，不验证管理员身份”。
 
 | UI 角色 | 主要按钮和操作 |
 | --- | --- |
@@ -204,7 +204,7 @@ Member invite: <member-one-time-token>
 
 以第一台 Windows 11 作为游戏房主为例：
 
-1. 下载 [v0.1.0-debug.12 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.12/ipv6mesh-installer-0.1.0-debug.12.exe)
+1. 下载 [v0.1.0-debug.13 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.13/ipv6mesh-installer-0.1.0-debug.13.exe)
 2. 双击运行，Windows UAC 弹出后点击“是”，选择角色“游戏房主”
 3. 在 UI 中输入：
 

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -199,6 +200,50 @@ func TestWindowsUIUsesRandomTokensAndActionableHealthCheck(t *testing.T) {
 	installedIndex := strings.Index(contents, "$installed = Join-Path $InstallDirectory $Name")
 	if packagedIndex < 0 || installedIndex < 0 || packagedIndex > installedIndex {
 		t.Fatalf("UI must prefer the current packaged executable over a stale installed executable")
+	}
+}
+
+func TestWindowsUIDoesNotDoubleQuoteSmartQuoteLogText(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) {
+    $parseErrors | ForEach-Object { Write-Error $_.Message }
+    exit 1
+}
+$badCommands = $ast.FindAll({
+    param($node)
+    if (-not ($node -is [System.Management.Automation.Language.CommandAst]) -or $node.GetCommandName() -ne 'Add-UiLog') {
+        return $false
+    }
+    for ($index = 1; $index -lt $node.CommandElements.Count; $index++) {
+        $element = $node.CommandElements[$index]
+        $doubleQuoted = $element -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+            $element.StringConstantType -eq 'DoubleQuoted'
+        $expandable = $element -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
+        if (($doubleQuoted -or $expandable) -and
+            $element.Extent.Text -match '[“”]') {
+            return $true
+        }
+    }
+    return $false
+}, $true)
+if ($badCommands.Count -gt 0) {
+    $badCommands | ForEach-Object { Write-Error ("Add-UiLog at line " + $_.Extent.StartLineNumber + " uses smart quotes in a double-quoted argument") }
+    exit 1
+}
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell smart-quote regression check failed: %v\n%s", err, output)
 	}
 }
 

@@ -380,7 +380,7 @@ function Wait-ControlPlaneReady {
         }
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $deadline)
-    Add-UiLog "控制面进程已启动，但 $TimeoutSeconds 秒内仍未响应 /healthz；可稍后点击“检查健康”。" "警告"
+    Add-UiLog ('控制面进程已启动，但 {0} 秒内仍未响应 /healthz；可稍后点击“检查健康”。' -f $TimeoutSeconds) -Level '警告'
     Set-UiStatus "控制面等待中" ([System.Drawing.Color]::DarkOrange)
     return $false
 }
@@ -937,12 +937,12 @@ $script:form.Add_FormClosing({ Stop-AllResources })
 
 Add-UiLog "IPv6Mesh 中文 UI $Version 已启动。"
 Add-UiLog "请先选择角色；管理员先启动控制面并创建网络，房主/成员再安装并加入。"
-Add-UiLog "管理员操作顺序：点击“启动控制面” → 等待健康检查通过 → 点击“创建网络” → 再生成房主/成员邀请。"
+Add-UiLog '管理员操作顺序：点击“启动控制面” → 等待健康检查通过 → 点击“创建网络” → 再生成房主/成员邀请。'
 Add-UiLog "当前 UI 不会把管理员令牌和一次性邀请令牌写入日志。"
 if ($initialIPv6 -ne '') {
     Add-UiLog "已检测本机 IPv6：$initialIPv6；默认控制面 URL：$initialControlUrl"
 } else {
-    Add-UiLog "未检测到可用的全局 IPv6；请点击“自动检测”或手动填写 IPv6。" "警告"
+    Add-UiLog '未检测到可用的全局 IPv6；请点击“自动检测”或手动填写 IPv6。' -Level '警告'
 }
 Add-UiLog "手动关闭窗口时会停止本机 IPv6Mesh 服务、清理虚拟网卡/地址/路由，并停止本窗口启动的控制面。"
 Set-UiStatus "等待操作" ([System.Drawing.Color]::MidnightBlue)
