@@ -172,6 +172,7 @@ type fakeAdapter struct {
 	configs       []wgnt.Configuration
 	configureErr  error
 	configureErrs []error
+	deleteCalls   int
 }
 
 func (adapter *fakeAdapter) Ensure(string) (wgnt.Handle, error) { return 1, nil }
@@ -186,7 +187,10 @@ func (adapter *fakeAdapter) Configure(_ context.Context, _ wgnt.Handle, configur
 }
 func (adapter *fakeAdapter) SetUp(context.Context, wgnt.Handle) error   { return nil }
 func (adapter *fakeAdapter) SetDown(context.Context, wgnt.Handle) error { return nil }
-func (adapter *fakeAdapter) Delete(context.Context, wgnt.Handle) error  { return nil }
+func (adapter *fakeAdapter) Delete(context.Context, wgnt.Handle) error {
+	adapter.deleteCalls++
+	return nil
+}
 func (adapter *fakeAdapter) Status(context.Context, wgnt.Handle) (wgnt.Status, error) {
 	return adapter.status, nil
 }
@@ -207,4 +211,22 @@ func (routes *fakeRoutes) Clear(context.Context) error {
 	routes.address = netwin.Address{}
 	routes.routes = nil
 	return nil
+}
+
+func TestApplierClearReleasesAdapterAndOverlayResources(t *testing.T) {
+	adapter := &fakeAdapter{status: wgnt.Status{LUID: 77}}
+	routes := &fakeRoutes{}
+	applier, err := NewApplier(Options{Adapter: adapter, Routes: routes, PrivateKey: testKey(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applier.Apply(context.Background(), testSnapshot(1)); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if err := applier.Clear(context.Background()); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if routes.clearCalls != 1 || adapter.deleteCalls != 1 || applier.Generation() != 0 {
+		t.Fatalf("clear resources = routes %d, adapter deletes %d, generation %d; want 1, 1, 0", routes.clearCalls, adapter.deleteCalls, applier.Generation())
+	}
 }
