@@ -207,10 +207,10 @@ function Get-PowerShellPath {
 
 function Get-PayloadExecutable {
     param([Parameter(Mandatory = $true)][string]$Name)
-    $installed = Join-Path $InstallDirectory $Name
-    if (Test-Path -LiteralPath $installed -PathType Leaf) { return $installed }
     $packaged = Join-Path $PackageDirectory $Name
     if (Test-Path -LiteralPath $packaged -PathType Leaf) { return $packaged }
+    $installed = Join-Path $InstallDirectory $Name
+    if (Test-Path -LiteralPath $installed -PathType Leaf) { return $installed }
     throw "找不到 $Name；请先安装或重新下载完整安装器。"
 }
 
@@ -291,7 +291,14 @@ function Assert-ControlUrl {
 
 function Convert-ResultToJson {
     param([Parameter(Mandatory = $true)]$Result, [Parameter(Mandatory = $true)][string]$Operation)
-    if ($Result.ExitCode -ne 0) { throw "$Operation 失败，请查看日志窗口中的错误信息。" }
+    if ($Result.ExitCode -ne 0) {
+        $stderr = [string]$Result.Stderr
+        if ($stderr -match 'HTTP status 404\s*\(not_found\)') {
+            $hint = 'Network ID 不存在。请先点击“创建网络”；如果使用已有网络，请确认 Network ID 和控制面 URL。'
+            throw ("{0} 失败：{1}" -f $Operation, $hint)
+        }
+        throw "$Operation 失败，请查看日志窗口中的错误信息。"
+    }
     if ([string]::IsNullOrWhiteSpace($Result.Stdout)) { throw "$Operation 没有返回 JSON 结果。" }
     try { return ($Result.Stdout | ConvertFrom-Json -ErrorAction Stop) }
     catch {
@@ -926,7 +933,7 @@ $script:form.Add_FormClosing({ Stop-AllResources })
 
 Add-UiLog "IPv6Mesh 中文 UI $Version 已启动。"
 Add-UiLog "请先选择角色；管理员先启动控制面并创建网络，房主/成员再安装并加入。"
-Add-UiLog "管理员操作顺序：先点击“启动控制面”，待健康检查通过后，再创建网络并随机生成房主/成员邀请。"
+Add-UiLog "管理员操作顺序：点击“启动控制面” → 等待健康检查通过 → 点击“创建网络” → 再生成房主/成员邀请。"
 Add-UiLog "当前 UI 不会把管理员令牌和一次性邀请令牌写入日志。"
 if ($initialIPv6 -ne '') {
     Add-UiLog "已检测本机 IPv6：$initialIPv6；默认控制面 URL：$initialControlUrl"

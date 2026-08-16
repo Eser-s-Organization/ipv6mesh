@@ -180,6 +180,7 @@ func TestWindowsUIUsesRandomTokensAndActionableHealthCheck(t *testing.T) {
 		"密码学随机数",
 		"Wait-ControlPlaneReady",
 		"请先点击\"启动控制面\"",
+		"Network ID 不存在",
 		"Get-WebException",
 		"随机生成 Network ID",
 		"复制管理员令牌",
@@ -191,6 +192,11 @@ func TestWindowsUIUsesRandomTokensAndActionableHealthCheck(t *testing.T) {
 		if !strings.Contains(contents, required) {
 			t.Fatalf("UI script missing %q", required)
 		}
+	}
+	packagedIndex := strings.Index(contents, "$packaged = Join-Path $PackageDirectory $Name")
+	installedIndex := strings.Index(contents, "$installed = Join-Path $InstallDirectory $Name")
+	if packagedIndex < 0 || installedIndex < 0 || packagedIndex > installedIndex {
+		t.Fatalf("UI must prefer the current packaged executable over a stale installed executable")
 	}
 }
 
