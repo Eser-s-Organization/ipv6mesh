@@ -53,6 +53,9 @@ type HandlerOptions struct {
 	EnrollmentRecoveryAttempts int
 	EnrollmentRecoveryTimeout  time.Duration
 	EnrollmentRecoveryDelay    time.Duration
+	RoomMode                   bool
+	RoomJoinPerIP              int
+	RoomJoinGlobal             int
 }
 
 // Handler serves only control-plane resources. It does not carry VPN data or
@@ -71,6 +74,7 @@ type Handler struct {
 	enrollmentRecoveryAttempts int
 	enrollmentRecoveryTimeout  time.Duration
 	enrollmentRecoveryDelay    time.Duration
+	room                       *roomCoordinator
 }
 
 // NewHandler constructs a control-plane HTTP handler around an existing
@@ -127,6 +131,10 @@ func NewHandler(repository TransactionalRepository, options HandlerOptions) *Han
 	if bootstrapSubject == "" {
 		bootstrapSubject = "bootstrap-admin"
 	}
+	var room *roomCoordinator
+	if options.RoomMode {
+		room = &roomCoordinator{}
+	}
 	return &Handler{
 		repository:                 repository,
 		sessions:                   sessions,
@@ -141,6 +149,7 @@ func NewHandler(repository TransactionalRepository, options HandlerOptions) *Han
 		enrollmentRecoveryAttempts: recoveryAttempts,
 		enrollmentRecoveryTimeout:  recoveryTimeout,
 		enrollmentRecoveryDelay:    recoveryDelay,
+		room:                       room,
 	}
 }
 
@@ -157,6 +166,10 @@ type principal struct {
 func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	writer.Header().Set("X-Request-ID", requestID(request))
 	switch {
+	case request.Method == http.MethodPost && request.URL.Path == "/v1/room":
+		handler.createRoom(writer, request)
+	case request.Method == http.MethodPost && request.URL.Path == "/v1/room/join":
+		handler.joinRoom(writer, request)
 	case request.Method == http.MethodPost && request.URL.Path == "/v1/networks":
 		handler.createNetwork(writer, request)
 	case request.Method == http.MethodPost && hasPathSuffix(request.URL.Path, "/invites"):

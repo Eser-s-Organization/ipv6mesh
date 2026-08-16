@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,5 +73,30 @@ func TestNewHTTPServerRejectsNilRepository(t *testing.T) {
 	server := newHTTPServer(Config{}, nil)
 	if server != nil {
 		t.Fatal("newHTTPServer(nil repository) returned a server")
+	}
+}
+
+func TestNewHTTPServerWiresRoomMode(t *testing.T) {
+	config := Config{
+		BootstrapToken: "bootstrap-token",
+		SessionTTL:     time.Hour,
+		InviteTTL:      time.Hour,
+		RoomMode:       true,
+	}
+	repository, closeRepository, err := openRepository(Config{RepositoryMode: "memory"})
+	if err != nil {
+		t.Fatalf("open repository: %v", err)
+	}
+	defer closeRepository()
+	server := newHTTPServer(config, repository)
+	if server == nil {
+		t.Fatal("newHTTPServer returned nil")
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/room", strings.NewReader(`{"name":"IPv6Mesh-HOST","ipv4_pool":"10.42.0.0/24"}`))
+	request.Header.Set("Authorization", "Bearer bootstrap-token")
+	response := httptest.NewRecorder()
+	server.Handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("room creation = %d %s, want 201", response.Code, response.Body.String())
 	}
 }

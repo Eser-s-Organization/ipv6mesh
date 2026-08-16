@@ -48,6 +48,7 @@ func newHTTPServer(config Config, repository control.TransactionalRepository) *h
 		SessionTTL:     config.SessionTTL,
 		InviteTTL:      config.InviteTTL,
 		MaxBodyBytes:   config.MaxBodyBytes,
+		RoomMode:       config.RoomMode,
 	})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(writer http.ResponseWriter, request *http.Request) {

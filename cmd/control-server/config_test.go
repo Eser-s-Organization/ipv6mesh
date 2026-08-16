@@ -66,3 +66,24 @@ func TestLoadConfigSelectsRepositoryMode(t *testing.T) {
 		t.Fatalf("invalid repository mode error = %v, want ErrInvalidConfig", err)
 	}
 }
+
+func TestLoadConfigParsesRoomMode(t *testing.T) {
+	environment := map[string]string{
+		"CONTROL_BOOTSTRAP_TOKEN": "secret",
+		"CONTROL_SESSION_TTL":     "1h",
+		"CONTROL_INVITE_TTL":      "1h",
+		"CONTROL_ROOM_MODE":       "true",
+	}
+	config, err := LoadConfigFrom(func(name string) string { return environment[name] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !config.RoomMode {
+		t.Fatal("RoomMode = false, want true")
+	}
+
+	environment["CONTROL_ROOM_MODE"] = "not-a-bool"
+	if _, err := LoadConfigFrom(func(name string) string { return environment[name] }); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("invalid room mode error = %v", err)
+	}
+}

@@ -24,6 +24,7 @@ type Config struct {
 	DBDSN            string
 	DBEndpoint       string
 	MaxBodyBytes     int64
+	RoomMode         bool
 }
 
 type configError struct {
@@ -73,6 +74,13 @@ func LoadConfigFrom(getenv func(string) string) (Config, error) {
 	}
 	if config.RepositoryMode != "memory" && config.RepositoryMode != "postgres" {
 		return Config{}, &configError{Field: "repository_mode", Reason: "must be memory or postgres"}
+	}
+	if raw := strings.TrimSpace(firstEnv(getenv, "CONTROL_ROOM_MODE")); raw != "" {
+		value, parseErr := strconv.ParseBool(raw)
+		if parseErr != nil {
+			return Config{}, &configError{Field: "room_mode", Reason: "must be true or false"}
+		}
+		config.RoomMode = value
 	}
 	if strings.TrimSpace(config.BootstrapToken) == "" {
 		return Config{}, &configError{Field: "bootstrap_token", Reason: "is required"}
