@@ -15,12 +15,20 @@ type networkOutput struct {
 	ConfigVersion int64  `json:"config_version"`
 }
 
+type roomEndpointOutput struct {
+	ControlURL string `json:"control_url"`
+}
+
 func writeNetworkOutput(writer io.Writer, network control.Network) error {
 	return writeJSONOutput(writer, networkOutput{ID: network.ID, Name: network.Name, IPv4Pool: network.IPv4Pool, OwnerID: network.OwnerID, ConfigVersion: network.ConfigVersion})
 }
 
 func writeInviteOutput(writer io.Writer, invite control.InviteResult) error {
 	return writeJSONOutput(writer, invite)
+}
+
+func writeRoomEndpointOutput(writer io.Writer, controlURL string) error {
+	return writeJSONOutput(writer, roomEndpointOutput{ControlURL: controlURL})
 }
 
 func writeJSONOutput(writer io.Writer, value any) error {

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Eser-s-Organization/ipv6mesh/internal/ipc"
+	"github.com/Eser-s-Organization/ipv6mesh/internal/room"
 )
 
 var ErrControlCommand = errors.New("command targets the control plane")
@@ -15,20 +16,24 @@ type commandKind string
 const (
 	serviceCommand commandKind = "service"
 	controlCommand commandKind = "control"
+	localCommand   commandKind = "local"
 )
 
 type command struct {
-	Kind        commandKind
-	Service     ipc.Request
-	NetworkName string
-	Pool        string
-	NetworkID   string
-	Expires     string
+	Kind         commandKind
+	Service      ipc.Request
+	NetworkName  string
+	Pool         string
+	NetworkID    string
+	Expires      string
+	ControlURL   string
+	RoomCreate   bool
+	RoomEndpoint bool
 }
 
 func parseCommand(args []string) (command, error) {
 	if len(args) == 0 {
-		return command{}, errors.New("usage: vpnctl status|join|leave|connect|disconnect|network create|invite create")
+		return command{}, errors.New("usage: vpnctl status|join|leave|connect|disconnect|network create|invite create|room create|room endpoint|room join")
 	}
 	switch args[0] {
 	case "status":
@@ -82,6 +87,44 @@ func parseCommand(args []string) (command, error) {
 			return command{}, err
 		}
 		return command{Kind: controlCommand, NetworkID: values["--network"], Expires: values["--expires"]}, nil
+	case "room":
+		if len(args) < 2 {
+			return command{}, errors.New("usage: vpnctl room create|endpoint|join")
+		}
+		switch args[1] {
+		case "create":
+			values, err := parseOptions(args[2:], map[string]struct{}{"--name": {}, "--pool": {}}, "--name", "--pool")
+			if err != nil {
+				return command{}, err
+			}
+			return command{Kind: controlCommand, NetworkName: values["--name"], Pool: values["--pool"], RoomCreate: true}, nil
+		case "endpoint":
+			values, err := parseOptions(args[2:], map[string]struct{}{"--host-ipv6": {}}, "--host-ipv6")
+			if err != nil {
+				return command{}, err
+			}
+			controlURL, err := room.ControlURL(values["--host-ipv6"])
+			if err != nil {
+				return command{}, err
+			}
+			return command{Kind: localCommand, ControlURL: controlURL, RoomEndpoint: true}, nil
+		case "join":
+			values, err := parseOptions(args[2:], map[string]struct{}{"--host-ipv6": {}, "--name": {}}, "--host-ipv6", "--name")
+			if err != nil {
+				return command{}, err
+			}
+			controlURL, err := room.ControlURL(values["--host-ipv6"])
+			if err != nil {
+				return command{}, err
+			}
+			request := ipc.Request{Type: ipc.CommandJoinRoom, ControlURL: controlURL, DisplayName: values["--name"]}
+			if _, err := ipc.MarshalRequest(request); err != nil {
+				return command{}, err
+			}
+			return command{Kind: serviceCommand, Service: request, ControlURL: controlURL}, nil
+		default:
+			return command{}, errors.New("usage: vpnctl room create|endpoint|join")
+		}
 	default:
 		return command{}, fmt.Errorf("unknown command %q", args[0])
 	}

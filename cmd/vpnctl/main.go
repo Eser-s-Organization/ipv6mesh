@@ -19,6 +19,8 @@ func main() {
 	}
 	if parsed.Kind == serviceCommand {
 		err = runServiceRequest(parsed.Service, os.Stdout, ipc.NewClient(ipc.DefaultPipeName))
+	} else if parsed.Kind == localCommand {
+		err = runLocalCommand(parsed, os.Stdout)
 	} else {
 		baseURL := os.Getenv("IPV6MESH_CONTROL_URL")
 		token := os.Getenv("IPV6MESH_ADMIN_TOKEN")
@@ -69,15 +71,30 @@ func runServiceRequest(request ipc.Request, output io.Writer, client caller) err
 	return nil
 }
 
+func runLocalCommand(parsed command, output io.Writer) error {
+	if parsed.Kind != localCommand || !parsed.RoomEndpoint || parsed.ControlURL == "" {
+		return errors.New("unsupported local command")
+	}
+	return writeRoomEndpointOutput(output, parsed.ControlURL)
+}
+
 type controlAdminClient interface {
 	CreateNetwork(context.Context, string, string, string) (control.Network, error)
 	CreateNetworkWithID(context.Context, string, string, string, string) (control.Network, error)
+	CreateRoom(context.Context, string, string, string) (control.Network, error)
 	CreateInvite(context.Context, string, string, string) (control.InviteResult, error)
 }
 
 func runControlCommand(ctx context.Context, parsed command, output io.Writer, client controlAdminClient) error {
 	if parsed.Kind != controlCommand || client == nil {
 		return ErrControlCommand
+	}
+	if parsed.RoomCreate {
+		network, err := client.CreateRoom(ctx, parsed.NetworkName, parsed.Pool, "")
+		if err != nil {
+			return err
+		}
+		return writeNetworkOutput(output, network)
 	}
 	switch {
 	case parsed.NetworkName != "":
