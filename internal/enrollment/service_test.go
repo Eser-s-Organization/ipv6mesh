@@ -76,7 +76,7 @@ func enrollRequest(token, nodeID, publicKey string) enrollment.Request {
 	}
 }
 
-func TestEnrollAllocatesStableDistinctAddressesAndSnapshotRemovesDeletedNode(t *testing.T) {
+func TestEnrollAllocatesRandomDistinctAddressesAndSnapshotRemovesDeletedNode(t *testing.T) {
 	repository := db.NewMemoryRepository()
 	if err := repository.CreateNetwork(context.Background(), enrollmentNetwork("10.42.0.0/29")); err != nil {
 		t.Fatalf("create network: %v", err)
@@ -96,8 +96,12 @@ func TestEnrollAllocatesStableDistinctAddressesAndSnapshotRemovesDeletedNode(t *
 	if a.Node.ID != "node-a" || b.Node.ID != "node-b" {
 		t.Fatalf("unexpected node IDs: %q, %q", a.Node.ID, b.Node.ID)
 	}
-	if a.Membership.VirtualIPv4.String() != "10.42.0.1" || b.Membership.VirtualIPv4.String() != "10.42.0.2" {
-		t.Fatalf("unexpected stable allocations: %s, %s", a.Membership.VirtualIPv4, b.Membership.VirtualIPv4)
+	pool, err := address.NewPool("10.42.0.0/29")
+	if err != nil {
+		t.Fatalf("create verification pool: %v", err)
+	}
+	if !pool.Usable(a.Membership.VirtualIPv4) || !pool.Usable(b.Membership.VirtualIPv4) || a.Membership.VirtualIPv4.Equal(b.Membership.VirtualIPv4) {
+		t.Fatalf("unexpected random allocations: %s, %s", a.Membership.VirtualIPv4, b.Membership.VirtualIPv4)
 	}
 	if a.Network.ID != "network-1" || a.Subject != "node-a" || a.NetworkID != "network-1" {
 		t.Fatalf("enrollment result lacks session claims: %+v", a)

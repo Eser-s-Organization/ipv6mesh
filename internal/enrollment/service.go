@@ -123,8 +123,9 @@ func NewServiceWithOptions(repository db.TransactionalRepository, options Servic
 	return &Service{repository: repository, clock: clock, newID: newID, parseToken: parseToken}
 }
 
-// Enroll performs node creation, invite consumption, and deterministic address
-// assignment in one repository transaction.
+// Enroll performs node creation, invite consumption, and random address
+// assignment in one repository transaction. The selected address is persisted
+// by the repository, so it remains stable for the life of the membership.
 func (service *Service) Enroll(ctx context.Context, request Request) (Result, error) {
 	if service == nil || service.repository == nil {
 		return Result{}, db.ErrDatabaseUnavailable
@@ -183,19 +184,28 @@ func (service *Service) Enroll(ctx context.Context, request Request) (Result, er
 			Status:    control.MembershipActive,
 		}
 		allocated := false
-		allocationErr := pool.ForEachCandidate(func(candidateIP net.IP) error {
+		var allocationErr error
+		occupied := make([]net.IP, 0)
+		for attempts := uint64(0); attempts < pool.Size(); attempts++ {
+			candidateIP, err := pool.RandomNext(nil, occupied)
+			if err != nil {
+				allocationErr = err
+				break
+			}
 			membership.VirtualIPv4 = candidateIP
 			addErr := transaction.AddMembership(transactionContext, membership)
 			if addErr == nil {
 				allocated = true
-				return stopAllocation
+				break
 			}
 			if errors.Is(addErr, db.ErrConflict) {
-				return nil
+				occupied = append(occupied, candidateIP)
+				continue
 			}
-			return addErr
-		})
-		if !errors.Is(allocationErr, stopAllocation) && allocationErr != nil {
+			allocationErr = addErr
+			break
+		}
+		if allocationErr != nil && !errors.Is(allocationErr, address.ErrPoolExhausted) {
 			return allocationErr
 		}
 		if !allocated {
@@ -227,8 +237,6 @@ func (service *Service) Enroll(ctx context.Context, request Request) (Result, er
 func (service *Service) Register(ctx context.Context, request Request) (Result, error) {
 	return service.Enroll(ctx, request)
 }
-
-var stopAllocation = errors.New("allocation completed")
 
 func randomID() string {
 	value := make([]byte, 16)

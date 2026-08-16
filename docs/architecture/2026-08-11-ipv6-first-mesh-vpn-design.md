@@ -6,7 +6,7 @@ This source repository implements the design approved in the [Memory repository 
 
 - Windows-first client service.
 - WireGuardNT data plane.
-- Stable virtual IPv4 per enrolled node.
+- Randomly selected, then stable virtual IPv4 per enrolled node.
 - IPv6 Direct path preferred.
 - Trusted WireGuard Relay fallback.
 - Node-to-node access only.

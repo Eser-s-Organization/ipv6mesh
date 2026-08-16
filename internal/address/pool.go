@@ -1,12 +1,15 @@
-// Package address provides deterministic, stateless virtual IPv4 pool
-// traversal. Allocation ownership remains in the repository uniqueness
-// constraint rather than in this package.
+// Package address provides stateless virtual IPv4 pool traversal. Allocation
+// ownership remains in the repository uniqueness constraint rather than in
+// this package.
 package address
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"math/big"
 	"net"
 	"strings"
 )
@@ -203,6 +206,44 @@ func (pool *Pool) Next(occupied ...any) (net.IP, error) {
 // NextAvailable is a typed convenience form for callers with a net.IP slice.
 func (pool *Pool) NextAvailable(occupied []net.IP) (net.IP, error) {
 	return pool.Next(occupied)
+}
+
+// RandomNext returns a randomly selected usable address, starting at a
+// cryptographically random position and wrapping around the pool until it
+// finds an unoccupied address. The caller still owns the final uniqueness
+// check: concurrent allocators must handle a repository conflict and retry.
+// A nil random reader uses crypto/rand.Reader.
+func (pool *Pool) RandomNext(random io.Reader, occupied ...any) (net.IP, error) {
+	if pool == nil || !pool.valid {
+		return nil, ErrInvalidPool
+	}
+	if pool.usableCount == 0 {
+		return nil, &PoolExhaustedError{CIDR: pool.cidr}
+	}
+	if random == nil {
+		random = rand.Reader
+	}
+	used := make(map[uint32]struct{})
+	for _, value := range occupied {
+		addOccupied(used, value)
+	}
+	limit := new(big.Int).SetUint64(pool.usableCount)
+	start, err := rand.Int(random, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select random IPv4 address: %w", err)
+	}
+	startOffset := start.Uint64()
+	for offset := uint64(0); offset < pool.usableCount; offset++ {
+		candidateOffset := (startOffset + offset) % pool.usableCount
+		value := pool.first + uint32(candidateOffset)
+		if _, exists := used[value]; exists {
+			continue
+		}
+		candidate := make(net.IP, net.IPv4len)
+		binary.BigEndian.PutUint32(candidate, value)
+		return candidate, nil
+	}
+	return nil, &PoolExhaustedError{CIDR: pool.cidr}
 }
 
 var errStop = errors.New("stop candidate traversal")

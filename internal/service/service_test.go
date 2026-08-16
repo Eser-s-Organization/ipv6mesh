@@ -165,6 +165,50 @@ func TestLeaveCleansLocalState(t *testing.T) {
 	}
 }
 
+func TestShutdownClearsAppliedDataPlaneWithoutLeavingMembership(t *testing.T) {
+	controlClient := &fakeControlClient{joinResult: JoinResult{NetworkID: "network-a", VirtualIPv4: "10.42.0.2", ConfigGeneration: 7}, snapshot: control.NetworkSnapshot{NetworkID: "network-a", Generation: 7, LocalNodeID: "node-1", LocalVirtualIPv4: net.ParseIP("10.42.0.2")}}
+	reconciler := &fakeSnapshotApplier{}
+	service := New(Options{Identity: &fakeIdentityStore{identity: identity.Identity{PublicKey: "public-key"}}, Control: controlClient, Reconciler: reconciler})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if response := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandJoin, Invite: "invite-value", DisplayName: "device-a"}); !response.OK {
+		t.Fatalf("join failed: %#v", response)
+	}
+	if err := service.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
+	if reconciler.clearCalls != 1 {
+		t.Fatalf("reconciler clear calls = %d, want 1", reconciler.clearCalls)
+	}
+	if controlClient.leaveCalls != 0 {
+		t.Fatalf("shutdown unexpectedly left control-plane membership: %d calls", controlClient.leaveCalls)
+	}
+	status := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandStatus})
+	if status.OK || status.Error == nil || status.Error.Code != ipc.CodeNotStarted {
+		t.Fatalf("status after shutdown = %#v, want not_started", status)
+	}
+}
+
+func TestShutdownDisconnectsConnectedAdapterWhenNoReconciler(t *testing.T) {
+	service, _, adapter := newTestService()
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if response := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandJoin, Invite: "invite-value", DisplayName: "device-a"}); !response.OK {
+		t.Fatalf("join failed: %#v", response)
+	}
+	if response := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandConnect, NetworkID: "network-a"}); !response.OK {
+		t.Fatalf("connect failed: %#v", response)
+	}
+	if err := service.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown failed: %v", err)
+	}
+	if adapter.disconnectCalls != 1 {
+		t.Fatalf("adapter disconnect calls = %d, want 1", adapter.disconnectCalls)
+	}
+}
+
 func TestServiceAppliesInitialSnapshotDuringJoin(t *testing.T) {
 	controlClient := &fakeControlClient{joinResult: JoinResult{NetworkID: "network-a", VirtualIPv4: "10.42.0.2", ConfigGeneration: 7}, snapshot: control.NetworkSnapshot{NetworkID: "network-a", Generation: 7, LocalNodeID: "node-1", LocalVirtualIPv4: net.ParseIP("10.42.0.2")}}
 	reconciler := &fakeSnapshotApplier{}
