@@ -20,31 +20,45 @@ $script:logLines = New-Object 'System.Collections.Generic.List[string]'
 $script:controlProcess = $null
 $script:controlEventSources = @()
 $script:form = $null
-$script:logBox = $null
 $script:statusLabel = $null
+$script:logBox = $null
 $script:controlUrlBox = $null
 $script:ipv6AddressBox = $null
-$script:portBox = $null
-$script:listenAddressBox = $null
-$script:adminTokenBox = $null
-$script:networkNameBox = $null
-$script:poolBox = $null
-$script:expiryBox = $null
-$script:networkIdBox = $null
-$script:hostInviteBox = $null
-$script:memberInviteBox = $null
-$script:nodeInviteBox = $null
-$script:deviceNameBox = $null
-$script:roleBox = $null
+$script:memberHostIPv6Box = $null
+$script:memberNameLabel = $null
 $script:nodeStatusLabel = $null
-$script:roleHintLabel = $null
-$script:nodeActionButton = $null
+$script:hostVirtualIPv4Label = $null
+$script:memberVirtualIPv4Label = $null
+$script:welcomePanel = $null
+$script:hostPanel = $null
+$script:memberPanel = $null
+$script:diagnosticsPanel = $null
+$script:hostStartButton = $null
+$script:memberJoinButton = $null
+$script:backButtons = @()
+$script:controlUrl = ""
+$script:adminToken = ""
+$script:activeNetworkId = ""
+$script:startedControlPlane = $false
+$script:startedNodeService = $false
 $script:cleanupStarted = $false
+$script:primaryBusy = $false
 $script:updatingEndpoint = $false
+
+function Redact-Secret {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return "" }
+    $result = $Value
+    if (![string]::IsNullOrWhiteSpace($script:adminToken)) {
+        $result = $result.Replace($script:adminToken, "[redacted]")
+    }
+    return $result
+}
 
 function Add-UiLog {
     param([Parameter(Mandatory = $true)][string]$Message, [string]$Level = "信息")
-    $line = "[{0}] [{1}] {2}" -f (Get-Date).ToString("HH:mm:ss"), $Level, $Message
+    $safeMessage = Redact-Secret $Message
+    $line = "[{0}] [{1}] {2}" -f (Get-Date).ToString("HH:mm:ss"), $Level, $safeMessage
     [void]$script:logLines.Add($line)
     if ($null -eq $script:logBox -or $script:logBox.IsDisposed) { return }
     $update = [Action]{
@@ -82,25 +96,14 @@ function New-RandomToken {
     return ([Convert]::ToBase64String($bytes)).TrimEnd("=").Replace("+", "-").Replace("/", "_")
 }
 
-function Generate-AdminToken {
+function Test-GlobalIPv6 {
+    param([Parameter(Mandatory = $true)][string]$Value)
     try {
-        $script:adminTokenBox.Text = New-RandomToken
-        Add-UiLog "已在本机用密码学随机数生成管理员令牌；令牌不会写入日志。"
-        Set-UiStatus "管理员令牌已随机生成" ([System.Drawing.Color]::ForestGreen)
+        $parsed = [System.Net.IPAddress]::Parse($Value.Trim('[', ']'))
+        $bytes = $parsed.GetAddressBytes()
+        return $bytes.Length -eq 16 -and (($bytes[0] -band 0xe0) -eq 0x20)
     } catch {
-        Add-UiLog "随机生成管理员令牌失败：$($_.Exception.Message)" "错误"
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("随机生成管理员令牌失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-    }
-}
-
-function Generate-NetworkId {
-    try {
-        $script:networkIdBox.Text = New-RandomToken -ByteCount 16
-        Add-UiLog "已在本机用密码学随机数生成 Network ID；创建网络时会使用该 ID。"
-        Set-UiStatus "Network ID 已随机生成" ([System.Drawing.Color]::ForestGreen)
-    } catch {
-        Add-UiLog "随机生成 Network ID 失败：$($_.Exception.Message)" "错误"
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("随机生成 Network ID 失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        return $false
     }
 }
 
@@ -110,23 +113,17 @@ function Get-DetectedIPv6Address {
     } catch {
         return ""
     }
-
     $candidates = foreach ($entry in $addresses) {
         $value = ([string]$entry.IPAddress).Trim()
         if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        if ([string]$entry.AddressState -ne "Preferred") { continue }
+        if ([bool]$entry.SkipAsSource) { continue }
+        if (!(Test-GlobalIPv6 $value)) { continue }
         try {
             $parsed = [System.Net.IPAddress]::Parse($value)
-            $bytes = $parsed.GetAddressBytes()
-            if ($bytes.Length -ne 16) { continue }
-            if ($value -eq "::1") { continue }
-            $isLinkLocal = $bytes[0] -eq 0xfe -and (($bytes[1] -band 0xc0) -eq 0x80)
-            if ($isLinkLocal) { continue }
-            $isGlobal = (($bytes[0] -band 0xe0) -eq 0x20)
+            if ($parsed.GetAddressBytes().Length -ne 16) { continue }
             [pscustomobject]@{
                 Address = $value
-                IsGlobal = $isGlobal
-                IsPreferred = ([string]$entry.AddressState -eq "Preferred")
-                SkipAsSource = [bool]$entry.SkipAsSource
                 PrefixOrigin = [string]$entry.PrefixOrigin
                 InterfaceIndex = [int]$entry.InterfaceIndex
             }
@@ -134,68 +131,46 @@ function Get-DetectedIPv6Address {
             continue
         }
     }
-
-    $global = @($candidates | Where-Object { $_.IsGlobal } | Sort-Object `
-        @{ Expression = { if ($_.IsPreferred) { 0 } else { 1 } } }, `
-        @{ Expression = { if ($_.SkipAsSource) { 1 } else { 0 } } }, `
-        @{ Expression = { if ($_.PrefixOrigin -eq "RouterAdvertisement") { 0 } else { 1 } } }, `
-        InterfaceIndex)
-    if ($global.Count -gt 0) { return [string]$global[0].Address }
-
-    # A ULA is not normally reachable from the public Internet, but it is a
-    # useful fallback for a controlled IPv6-only LAN test.
-    $fallback = @($candidates | Sort-Object `
-        @{ Expression = { if ($_.IsPreferred) { 0 } else { 1 } } }, `
-        @{ Expression = { if ($_.SkipAsSource) { 1 } else { 0 } } }, `
-        InterfaceIndex)
-    if ($fallback.Count -gt 0) { return [string]$fallback[0].Address }
+    $selected = @($candidates | Sort-Object @{ Expression = { if ($_.PrefixOrigin -eq "RouterAdvertisement") { 0 } else { 1 } } }, @{ Expression = { $_.InterfaceIndex } })
+    if ($selected.Count -gt 0) { return [string]$selected[0].Address }
     return ""
-}
-
-function Get-ControlPort {
-    $value = Get-BoxText $script:portBox
-    $port = 0
-    if (![int]::TryParse($value, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
-        throw "控制面端口必须是 1 到 65535 之间的数字。"
-    }
-    return $port
 }
 
 function Update-ControlEndpoint {
     $address = (Get-BoxText $script:ipv6AddressBox).Trim('[', ']')
-    if ($address -eq "") { throw "本机 IPv6 不能为空。" }
-    try {
-        $parsed = [System.Net.IPAddress]::Parse($address)
-        $bytes = $parsed.GetAddressBytes()
-        if ($bytes.Length -ne 16) { throw "不是 IPv6 地址。" }
-        $isLinkLocal = $bytes[0] -eq 0xfe -and (($bytes[1] -band 0xc0) -eq 0x80)
-        if ($isLinkLocal) { throw "不能使用 fe80:: 链路本地地址作为远程控制面地址。" }
-    } catch {
-        throw "本机 IPv6 无效：$($_.Exception.Message)"
+    if ($address -eq "" -or !(Test-GlobalIPv6 $address)) {
+        throw "房主必须使用可从公网访问的 2000::/3 全局 IPv6 地址。"
     }
-    $port = Get-ControlPort
     $script:updatingEndpoint = $true
     try {
         $script:ipv6AddressBox.Text = $address
-        $script:controlUrlBox.Text = "http://[$address]:$port"
-        $script:listenAddressBox.Text = "[::]:$port"
+        $script:controlUrl = "http://[$address]:8080"
+        if ($null -ne $script:controlUrlBox) {
+            $script:controlUrlBox.Text = $script:controlUrl
+        }
     } finally {
         $script:updatingEndpoint = $false
     }
-    return $script:controlUrlBox.Text
+    return $script:controlUrl
 }
 
 function Refresh-LocalIPv6 {
     try {
         $address = Get-DetectedIPv6Address
-        if ($address -eq "") { throw "没有检测到可用的非链路本地 IPv6 地址。请确认网卡已启用 IPv6。" }
+        if ($address -eq "") {
+            throw "没有检测到首选且非 SkipAsSource 的 2000::/3 全局 IPv6 地址。"
+        }
         $script:ipv6AddressBox.Text = $address
-        $url = Update-ControlEndpoint
-        Add-UiLog "已自动检测本机 IPv6：$address；已生成控制面 URL：$url"
-        Set-UiStatus "已生成控制面 URL" ([System.Drawing.Color]::ForestGreen)
+        $null = Update-ControlEndpoint
+        $script:hostStartButton.Enabled = !$script:primaryBusy
+        Add-UiLog "已检测本机全局 IPv6；房主控制面地址已准备。"
+        Set-UiStatus "房主 IPv6 已就绪" ([System.Drawing.Color]::ForestGreen)
+        return $true
     } catch {
-        Add-UiLog "自动检测本机 IPv6 失败：$($_.Exception.Message)" "警告"
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("自动检测 IPv6 失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        $script:hostStartButton.Enabled = $false
+        Add-UiLog "检测房主 IPv6 失败：$($_.Exception.Message)" "警告"
+        Set-UiStatus "需要可访问的全局 IPv6" ([System.Drawing.Color]::Firebrick)
+        return $false
     }
 }
 
@@ -223,6 +198,17 @@ function Quote-ProcessArgument {
     return '"' + $escaped + '"'
 }
 
+function Get-ClientEnvironment {
+    $environment = @{}
+    if (![string]::IsNullOrWhiteSpace($script:controlUrl)) {
+        $environment["IPV6MESH_CONTROL_URL"] = $script:controlUrl
+    }
+    if (![string]::IsNullOrWhiteSpace($script:adminToken)) {
+        $environment["IPV6MESH_ADMIN_TOKEN"] = $script:adminToken
+    }
+    return $environment
+}
+
 function Invoke-External {
     param(
         [Parameter(Mandatory = $true)][string]$FileName,
@@ -238,7 +224,9 @@ function Invoke-External {
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
-    foreach ($key in $Environment.Keys) { $psi.EnvironmentVariables[$key] = [string]$Environment[$key] }
+    foreach ($key in $Environment.Keys) {
+        $psi.EnvironmentVariables[$key] = [string]$Environment[$key]
+    }
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $psi
     Add-UiLog "开始执行 $Source" "调试"
@@ -267,48 +255,7 @@ function Invoke-External {
         }
     }
     if ($exitCode -ne 0) { Add-UiLog "$Source 退出码：$exitCode" "错误" }
-    else { Add-UiLog "$Source 执行完成" "调试" }
     return [pscustomobject]@{ ExitCode = $exitCode; Stdout = $stdout; Stderr = $stderr }
-}
-
-function Get-ClientEnvironment {
-    $environment = @{}
-    $url = Get-BoxText $script:controlUrlBox
-    if ($url -ne "") { $environment["IPV6MESH_CONTROL_URL"] = $url }
-    $adminToken = Get-BoxText $script:adminTokenBox
-    if ($adminToken -ne "") { $environment["IPV6MESH_ADMIN_TOKEN"] = $adminToken }
-    return $environment
-}
-
-function Assert-ControlUrl {
-    $value = Get-BoxText $script:controlUrlBox
-    $parsed = $null
-    if (![Uri]::TryCreate($value, [UriKind]::Absolute, [ref]$parsed) -or $parsed.Scheme -notin @("http", "https") -or [string]::IsNullOrWhiteSpace($parsed.Host)) {
-        throw "控制面 URL 无效。IPv6 地址必须写成 http://[IPv6]:8080。"
-    }
-    return $value.TrimEnd("/")
-}
-
-function Convert-ResultToJson {
-    param([Parameter(Mandatory = $true)]$Result, [Parameter(Mandatory = $true)][string]$Operation)
-    if ($Result.ExitCode -ne 0) {
-        $stderr = [string]$Result.Stderr
-        if ($stderr -match 'HTTP status 401\s*\(unauthorized\)') {
-            $hint = '管理员令牌无效或与控制面启动令牌不一致。健康检查只验证连接，不验证管理员身份。请填入启动该控制面时使用的令牌；如果控制面是本机旧进程，请先停止旧 control-server.exe，再用当前令牌点击“启动控制面”。'
-            throw ("{0} 失败：{1}" -f $Operation, $hint)
-        }
-        if ($stderr -match 'HTTP status 404\s*\(not_found\)') {
-            $hint = 'Network ID 不存在。请先点击“创建网络”；如果使用已有网络，请确认 Network ID 和控制面 URL。'
-            throw ("{0} 失败：{1}" -f $Operation, $hint)
-        }
-        throw "$Operation 失败，请查看日志窗口中的错误信息。"
-    }
-    if ([string]::IsNullOrWhiteSpace($Result.Stdout)) { throw "$Operation 没有返回 JSON 结果。" }
-    try { return ($Result.Stdout | ConvertFrom-Json -ErrorAction Stop) }
-    catch {
-        Add-UiLog "$Operation 返回内容不是有效 JSON：$($_.Exception.Message)" "错误"
-        throw
-    }
 }
 
 function Invoke-VpnCtl {
@@ -323,36 +270,49 @@ function Invoke-VpnCtl {
     return Invoke-External @spec
 }
 
-function Test-ControlHealth {
-    param([switch]$Quiet)
-    try {
-        $url = Assert-ControlUrl
-        $request = [System.Net.HttpWebRequest]::Create($url + "/healthz")
-        $request.Proxy = $null
-        $request.Timeout = 5000
-        $response = $request.GetResponse()
-        try {
-            $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
-            try { $body = $reader.ReadToEnd().Trim() } finally { $reader.Dispose() }
-            if (!$Quiet) {
-                Add-UiLog "控制面健康检查：HTTP $([int]$response.StatusCode)，响应：$body"
-                Set-UiStatus "控制面可访问" ([System.Drawing.Color]::ForestGreen)
-            }
-        } finally { $response.Dispose() }
-        return $true
-    } catch {
-        if (!$Quiet) {
-            $webException = Get-WebException $_.Exception
-            if ($null -ne $webException -and $script:controlProcess -and !$script:controlProcess.HasExited) {
-                Add-UiLog "控制面进程已启动，但监听端口尚未就绪；请等待片刻后再次检查。" "警告"
-            } elseif ($null -ne $webException) {
-                Add-UiLog '无法连接控制面：请确认控制面已经运行；如果控制面在本机，请先点击"启动控制面"。' "警告"
-            } else {
-                Add-UiLog "控制面健康检查失败：$($_.Exception.Message)" "错误"
-            }
-            Set-UiStatus "控制面不可访问" ([System.Drawing.Color]::Firebrick)
+function Assert-ControlUrl {
+    $value = [string]$script:controlUrl
+    $parsed = $null
+    if (![Uri]::TryCreate($value, [UriKind]::Absolute, [ref]$parsed) -or $parsed.Scheme -notin @("http", "https") -or [string]::IsNullOrWhiteSpace($parsed.Host)) {
+        throw "控制面地址无效。"
+    }
+    return $value.TrimEnd("/")
+}
+
+function Convert-ResultToJson {
+    param([Parameter(Mandatory = $true)]$Result, [Parameter(Mandatory = $true)][string]$Operation)
+    if ($Result.ExitCode -ne 0) {
+        $stderr = [string]$Result.Stderr
+        $code = ""
+        if ($stderr -match '\((room_not_ready|room_mode_disabled|node_already_joined|room_full|join_rate_limited|enrollment_recovery_pending|invalid_node|request_too_large|unauthorized)\)') {
+            $code = [string]$Matches[1]
         }
-        return $false
+        $messages = @{
+            room_not_ready = "房主尚未完成创建网络。"
+            room_mode_disabled = "目标控制面未启用房间模式。"
+            node_already_joined = "本机已经加入当前房间。"
+            room_full = "房间地址池已满。"
+            join_rate_limited = "加入过于频繁，请稍后重试。"
+            enrollment_recovery_pending = "加入结果待恢复，请稍后刷新状态。"
+            invalid_node = "节点信息无效，请检查本机服务。"
+            request_too_large = "请求内容超出允许大小。"
+            unauthorized = "控制面拒绝了当前操作。"
+        }
+        if ($code -ne "" -and $messages.ContainsKey($code)) {
+            Add-UiLog "$Operation 失败，错误码：$code" "警告"
+            throw "$Operation 失败：$($messages[$code])"
+        }
+        Add-UiLog "$Operation 失败；原始错误已隐藏。" "错误"
+        throw "$Operation 失败，请查看诊断日志。"
+    }
+    if ([string]::IsNullOrWhiteSpace($Result.Stdout)) {
+        throw "$Operation 没有返回 JSON 结果。"
+    }
+    try {
+        return ($Result.Stdout | ConvertFrom-Json -ErrorAction Stop)
+    } catch {
+        Add-UiLog "$Operation 返回内容不是有效 JSON。" "错误"
+        throw "$Operation 返回内容无效。"
     }
 }
 
@@ -365,96 +325,108 @@ function Get-WebException {
     return $null
 }
 
+function Test-ControlHealth {
+    param([switch]$Quiet)
+    try {
+        $url = Assert-ControlUrl
+        $request = [System.Net.HttpWebRequest]::Create($url + "/healthz")
+        $request.Proxy = $null
+        $request.Timeout = 5000
+        $response = $request.GetResponse()
+        try { $response.Dispose() } finally {}
+        if (!$Quiet) { Set-UiStatus "控制面可访问" ([System.Drawing.Color]::ForestGreen) }
+        return $true
+    } catch {
+        if (!$Quiet) {
+            $webException = Get-WebException $_.Exception
+            if ($null -ne $webException) {
+                Add-UiLog "控制面暂不可访问，请确认房主流程仍在运行。" "警告"
+            } else {
+                Add-UiLog "控制面健康检查失败。" "错误"
+            }
+            Set-UiStatus "控制面不可访问" ([System.Drawing.Color]::Firebrick)
+        }
+        return $false
+    }
+}
+
 function Wait-ControlPlaneReady {
-    param([int]$TimeoutSeconds = 10)
+    param([int]$TimeoutSeconds = 15)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         if ($script:controlProcess -and $script:controlProcess.HasExited) {
-            Add-UiLog "控制面进程已退出，未能完成健康检查。请查看控制面日志。" "错误"
+            Add-UiLog "控制面进程已退出，未能完成健康检查。" "错误"
             return $false
         }
         if (Test-ControlHealth -Quiet) {
-            Add-UiLog "控制面已就绪，健康检查通过。"
-            Set-UiStatus "控制面可访问" ([System.Drawing.Color]::ForestGreen)
+            Add-UiLog "控制面已就绪。"
             return $true
         }
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $deadline)
-    Add-UiLog "控制面进程已启动，但 $TimeoutSeconds 秒内仍未响应 /healthz；可稍后点击“检查健康”。" "警告"
-    Set-UiStatus "控制面等待中" ([System.Drawing.Color]::DarkOrange)
+    Add-UiLog "控制面在规定时间内未响应。" "警告"
     return $false
 }
 
 function Open-ControlFirewall {
-    param([Parameter(Mandatory = $true)][string]$ListenAddress)
-    $port = 8080
-    if ($ListenAddress -match ':(\d+)$') {
-        $port = [int]$Matches[1]
-    }
-    $ruleName = "IPv6Mesh Control Plane TCP $port"
+    param([Parameter(Mandatory = $true)][int]$Port)
+    $ruleName = "IPv6Mesh Control Plane TCP $Port"
     try {
         if (!(Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow -Profile Any | Out-Null
-            Add-UiLog "已放行控制面 TCP $port 防火墙规则。"
-        } else {
-            Add-UiLog "控制面 TCP $port 防火墙规则已存在。"
+            New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow -Profile Any | Out-Null
+            Add-UiLog "已放行控制面 TCP $Port 防火墙规则。"
         }
     } catch {
-        Add-UiLog "自动放行控制面防火墙失败：$($_.Exception.Message)；请手动放行 TCP $port。" "警告"
+        Add-UiLog "自动放行控制面防火墙失败，请手动放行 TCP $Port。" "警告"
     }
 }
 
 function Start-ControlPlane {
-    try {
-        $null = Assert-ControlUrl
-        $port = Get-ControlPort
-        $listenAddress = "[::]:$port"
-        $script:listenAddressBox.Text = $listenAddress
-        $adminToken = Get-BoxText $script:adminTokenBox
-        $expiry = Get-BoxText $script:expiryBox
-        if ($listenAddress -eq "") { throw "监听地址不能为空，例如 [::]:8080。" }
-        if ($adminToken -eq "") { throw "管理员令牌不能为空，请使用长随机令牌。" }
-        if ($script:controlProcess -and !$script:controlProcess.HasExited) {
-            Add-UiLog "控制面已经由本窗口启动。"
-            return
-        }
-        Open-ControlFirewall $listenAddress
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = Get-PayloadExecutable "control-server.exe"
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
-        $psi.EnvironmentVariables["CONTROL_LISTEN_ADDRESS"] = $listenAddress
-        $psi.EnvironmentVariables["CONTROL_BOOTSTRAP_TOKEN"] = $adminToken
-        $psi.EnvironmentVariables["CONTROL_SESSION_TTL"] = "24h"
-        $psi.EnvironmentVariables["CONTROL_INVITE_TTL"] = if ($expiry -eq "") { "24h" } else { $expiry }
-        $psi.EnvironmentVariables["CONTROL_REPOSITORY_MODE"] = "memory"
-        $process = New-Object System.Diagnostics.Process
-        $process.StartInfo = $psi
-        $process.EnableRaisingEvents = $true
-        $sourceBase = "IPv6Mesh.Control.$PID"
-        $script:controlEventSources = @("$sourceBase.Stdout", "$sourceBase.Stderr", "$sourceBase.Exited")
-        [void](Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -SourceIdentifier $script:controlEventSources[0] -Action {
-            if ($EventArgs.Data) { Add-UiLog $EventArgs.Data "控制面" }
-        })
-        [void](Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -SourceIdentifier $script:controlEventSources[1] -Action {
-            if ($EventArgs.Data) { Add-UiLog $EventArgs.Data "控制面" }
-        })
-        [void](Register-ObjectEvent -InputObject $process -EventName Exited -SourceIdentifier $script:controlEventSources[2] -Action {
-            Add-UiLog "控制面进程已退出，退出码：$($Event.Sender.ExitCode)" "警告"
-        })
-        [void]$process.Start()
-        $process.BeginOutputReadLine()
-        $process.BeginErrorReadLine()
-        $script:controlProcess = $process
-        Add-UiLog "控制面已启动：$($psi.FileName)"
-        Add-UiLog "监听地址：$listenAddress；当前使用内存仓库。"
-        Set-UiStatus "控制面启动中" ([System.Drawing.Color]::DarkOrange)
-        [void](Wait-ControlPlaneReady)
-    } catch {
-        Add-UiLog "启动控制面失败：$($_.Exception.Message)" "错误"
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("启动控制面失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    $url = Assert-ControlUrl
+    $parsed = [Uri]$url
+    $port = if ($parsed.Port -gt 0) { $parsed.Port } else { 8080 }
+    $listenAddress = "[::]:$port"
+    if ($script:controlProcess -and !$script:controlProcess.HasExited) {
+        Add-UiLog "控制面已经由本窗口启动。"
+        return
+    }
+    $script:adminToken = New-RandomToken
+    Open-ControlFirewall $port
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Get-PayloadExecutable "control-server.exe"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables["CONTROL_LISTEN_ADDRESS"] = $listenAddress
+    $psi.EnvironmentVariables["CONTROL_BOOTSTRAP_TOKEN"] = $script:adminToken
+    $psi.EnvironmentVariables["CONTROL_ROOM_MODE"] = "true"
+    $psi.EnvironmentVariables["CONTROL_REPOSITORY_MODE"] = "memory"
+    $psi.EnvironmentVariables["CONTROL_SESSION_TTL"] = "24h"
+    $psi.EnvironmentVariables["CONTROL_INVITE_TTL"] = "24h"
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    $process.EnableRaisingEvents = $true
+    $sourceBase = "IPv6Mesh.Control.$PID"
+    $script:controlEventSources = @("$sourceBase.Stdout", "$sourceBase.Stderr", "$sourceBase.Exited")
+    [void](Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -SourceIdentifier $script:controlEventSources[0] -Action {
+        if ($EventArgs.Data) { Add-UiLog $EventArgs.Data "控制面" }
+    })
+    [void](Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -SourceIdentifier $script:controlEventSources[1] -Action {
+        if ($EventArgs.Data) { Add-UiLog $EventArgs.Data "控制面" }
+    })
+    [void](Register-ObjectEvent -InputObject $process -EventName Exited -SourceIdentifier $script:controlEventSources[2] -Action {
+        Add-UiLog "控制面进程已退出。" "警告"
+    })
+    [void]$process.Start()
+    $process.BeginOutputReadLine()
+    $process.BeginErrorReadLine()
+    $script:controlProcess = $process
+    $script:startedControlPlane = $true
+    Add-UiLog "控制面已启动，使用临时内存房间模式。"
+    Set-UiStatus "控制面启动中" ([System.Drawing.Color]::DarkOrange)
+    if (!(Wait-ControlPlaneReady)) {
+        throw "控制面未能就绪。"
     }
 }
 
@@ -470,213 +442,183 @@ function Stop-ControlPlane {
                 $script:controlProcess.WaitForExit()
                 Add-UiLog "已停止本窗口启动的控制面进程。"
             }
-        } catch { Add-UiLog "停止控制面进程时出现问题：$($_.Exception.Message)" "警告" }
-        finally { $script:controlProcess.Dispose(); $script:controlProcess = $null }
+        } catch {
+            Add-UiLog "停止控制面进程失败。" "警告"
+        } finally {
+            $script:controlProcess.Dispose()
+            $script:controlProcess = $null
+        }
     }
+    $script:adminToken = ""
+    $script:startedControlPlane = $false
 }
 
 function Stop-NodeService {
     try {
         $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        if ($null -eq $service) {
-            Add-UiLog "未发现本机 IPv6Mesh 服务。"
-            return
+        if ($null -eq $service) { return }
+        if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
+            Stop-Service -Name $ServiceName -Force -ErrorAction Stop
         }
-        if ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
-            Add-UiLog "IPv6Mesh 服务已经停止。"
-            return
-        }
-        Add-UiLog "正在停止 IPv6Mesh 服务并清理 WireGuard 适配器、虚拟 IPv4 地址和路由……"
-        Stop-Service -Name $ServiceName -Force -ErrorAction Stop
-        $deadline = (Get-Date).AddSeconds(20)
-        do {
-            $service.Refresh()
-            if ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Stopped) { break }
-            if ((Get-Date) -ge $deadline) { throw "等待 IPv6Mesh 服务停止超时。" }
-            Start-Sleep -Milliseconds 250
-        } while ($true)
-        Add-UiLog "IPv6Mesh 服务已停止，本机网络资源已释放。"
+        Add-UiLog "IPv6Mesh 节点服务已停止，本机网络资源已释放。"
     } catch {
-        Add-UiLog "停止 IPv6Mesh 服务失败：$($_.Exception.Message)" "警告"
+        Add-UiLog "停止 IPv6Mesh 节点服务失败。" "警告"
+    }
+}
+
+function Stop-StartedResources {
+    if ($script:startedNodeService) {
+        Stop-NodeService
+        $script:startedNodeService = $false
+    }
+    if ($script:startedControlPlane) {
+        Stop-ControlPlane
     }
 }
 
 function Stop-AllResources {
     if ($script:cleanupStarted) { return }
     $script:cleanupStarted = $true
-    Add-UiLog "正在执行退出清理……"
-    Stop-NodeService
-    Stop-ControlPlane
+    Add-UiLog "正在执行退出清理。"
+    Stop-StartedResources
     Add-UiLog "退出清理完成。"
 }
 
-function Create-Network {
-    try {
-        $null = Assert-ControlUrl
-        if ((Get-BoxText $script:adminTokenBox) -eq "") { throw "请先填写管理员令牌。" }
-        if (!(Test-ControlHealth)) { throw "控制面不可访问，请先点击启动控制面按钮，等待健康检查通过后再创建网络。" }
-        $name = Get-BoxText $script:networkNameBox
-        $pool = Get-BoxText $script:poolBox
-        if ($name -eq "" -or $pool -eq "") { throw "网络名称和 IPv4 地址池不能为空。" }
-        $networkId = Get-BoxText $script:networkIdBox
-        if ($networkId -eq "") {
-            Generate-NetworkId
-            $networkId = Get-BoxText $script:networkIdBox
-        }
-        $result = Invoke-VpnCtl -Arguments @("network", "create", "--name", $name, "--pool", $pool, "--id", $networkId)
-        $network = Convert-ResultToJson $result "创建网络"
-        $script:networkIdBox.Text = [string]$network.id
-        Add-UiLog "网络已创建：$($network.name)，Network ID：$($network.id)；成员加入时将从 $pool 随机分配虚拟 IPv4。"
-        Set-UiStatus "网络已创建" ([System.Drawing.Color]::ForestGreen)
-    } catch {
-        Add-UiLog "创建网络失败：$($_.Exception.Message)" "错误"
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("创建网络失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-    }
-}
-
-function Create-Invite {
-    param([Parameter(Mandatory = $true)][ValidateSet("房主", "成员")][string]$Role)
-    try {
-        $null = Assert-ControlUrl
-        if ((Get-BoxText $script:adminTokenBox) -eq "") { throw "请先填写管理员令牌。" }
-        if (!(Test-ControlHealth)) { throw "控制面不可访问，请先点击启动控制面按钮，等待健康检查通过后再生成邀请。" }
-        $networkId = Get-BoxText $script:networkIdBox
-        $expiry = Get-BoxText $script:expiryBox
-        if ($networkId -eq "") { throw "请先创建网络，或填写已有 Network ID。" }
-        if ($expiry -eq "") { $expiry = "24h" }
-        $result = Invoke-VpnCtl -Arguments @("invite", "create", "--network", $networkId, "--expires", $expiry) -SuppressStandardOutput
-        $inviteResult = Convert-ResultToJson $result "生成$Role邀请"
-        if ($Role -eq "房主") { $script:hostInviteBox.Text = [string]$inviteResult.token }
-        else { $script:memberInviteBox.Text = [string]$inviteResult.token }
-        Add-UiLog "$Role邀请已由控制面使用密码学随机数生成，令牌已放入专用框；日志不会记录令牌正文。"
-        Set-UiStatus "$Role邀请已生成" ([System.Drawing.Color]::ForestGreen)
-    } catch {
-        Add-UiLog "生成$Role邀请失败：$($_.Exception.Message)" "错误"
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("生成" + $Role + "邀请失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-    }
-}
-
 function Install-NodeService {
+    param([Parameter(Mandatory = $true)][string]$ControlUrl)
     try {
-        $url = Assert-ControlUrl
+        $resolvedUrl = $ControlUrl.TrimEnd("/")
+        if ([string]::IsNullOrWhiteSpace($resolvedUrl)) { throw "控制面地址为空。" }
         $installScript = Join-Path $PackageDirectory "install.ps1"
         if (!(Test-Path -LiteralPath $installScript -PathType Leaf)) { throw "载荷中缺少 install.ps1。" }
-        $arguments = @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $installScript, "-PackageDirectory", $PackageDirectory, "-ControlUrl", $url, "-InstallDirectory", $InstallDirectory, "-DataDirectory", $DataDirectory, "-ServiceName", $ServiceName, "-StartService")
-        $spec = @{ FileName = (Get-PowerShellPath); Arguments = $arguments; Source = "安装/更新 IPv6Mesh 服务" }
-        $result = Invoke-External @spec
-        if ($result.ExitCode -ne 0) { throw "安装脚本返回退出码 $($result.ExitCode)。" }
-        Add-UiLog "IPv6Mesh 服务安装并启动完成。"
+        $arguments = @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $installScript, "-PackageDirectory", $PackageDirectory, "-ControlUrl", $resolvedUrl, "-InstallDirectory", $InstallDirectory, "-DataDirectory", $DataDirectory, "-ServiceName", $ServiceName, "-StartService")
+        $result = Invoke-External -FileName (Get-PowerShellPath) -Arguments $arguments -Source "安装节点服务"
+        if ($result.ExitCode -ne 0) { throw "安装脚本失败。" }
+        $script:startedNodeService = $true
         Set-UiStatus "节点服务已启动" ([System.Drawing.Color]::ForestGreen)
         return $true
     } catch {
-        Add-UiLog "安装节点服务失败：$($_.Exception.Message)" "错误"
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("安装节点服务失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        Add-UiLog "安装节点服务失败。" "错误"
         return $false
     }
 }
 
 function Get-NodeStatus {
     try {
-        $status = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("status")) "读取节点状态"
-        $networkId = [string]$status.network_id
+        $status = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("status") -SuppressStandardOutput) "读取节点状态"
+        $script:activeNetworkId = [string]$status.network_id
         $virtualIPv4 = [string]$status.virtual_ipv4
         $path = [string]$status.path_state
-        $errorText = [string]$status.last_error
-        if ($networkId -ne "") { $script:networkIdBox.Text = $networkId }
-        $script:nodeStatusLabel.Text = "网络：$networkId    虚拟 IPv4：$virtualIPv4    路径：$path"
-        if ($errorText -ne "") { $script:nodeStatusLabel.Text += "    最近错误：$errorText" }
-        Add-UiLog "节点状态：Network=$networkId，VirtualIPv4=$virtualIPv4，Path=$path"
+        $errorCode = [string]$status.last_error
+        $summary = "本机虚拟 IPv4：$virtualIPv4    路径：$path"
+        if ($errorCode -ne "") { $summary += "    错误码：$errorCode" }
+        if ($null -ne $script:nodeStatusLabel) { $script:nodeStatusLabel.Text = $summary }
+        Add-UiLog "节点状态已刷新：VirtualIPv4=$virtualIPv4，Path=$path，ErrorCode=$errorCode"
         return $status
     } catch {
-        Add-UiLog "读取节点状态失败：$($_.Exception.Message)" "错误"
-        $script:nodeStatusLabel.Text = "节点服务未连接或尚未加入网络"
+        Add-UiLog "读取节点状态失败。" "错误"
+        if ($null -ne $script:nodeStatusLabel) { $script:nodeStatusLabel.Text = "节点服务未连接或尚未加入房间" }
         return $null
     }
 }
 
-function Join-And-ConnectNode {
+function Set-ActiveVirtualIPv4 {
+    param([Parameter(Mandatory = $true)]$Joined, [Parameter(Mandatory = $true)][string]$Role)
+    $virtualIPv4 = [string]$Joined.virtual_ipv4
+    if ($Role -eq "Host") {
+        $script:hostVirtualIPv4Label.Text = "房主虚拟 IPv4：$virtualIPv4"
+    } else {
+        $script:memberVirtualIPv4Label.Text = "本机虚拟 IPv4：$virtualIPv4"
+    }
+}
+
+function Start-HostRoom {
+    Set-PrimaryBusy $true "正在创建房间并连接本机……"
     try {
-        $null = Assert-ControlUrl
-        $device = Get-BoxText $script:deviceNameBox
-        if ($device -eq "") { $device = $env:COMPUTERNAME; $script:deviceNameBox.Text = $device }
-        if (!(Install-NodeService)) { return }
-        $status = Get-NodeStatus
-        $networkId = [string]$status.network_id
-        if ($networkId -eq "") {
-            $inviteValue = Get-BoxText $script:nodeInviteBox
-            if ($inviteValue -eq "") { throw "请填写当前角色对应的一次性邀请令牌。" }
-            $joined = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("join", "--invite", $inviteValue, "--name", $device)) "加入网络"
-            $networkId = [string]$joined.network_id
-            $script:networkIdBox.Text = $networkId
-            Add-UiLog "已加入网络：$networkId；虚拟 IPv4：$($joined.virtual_ipv4)"
-        } else {
-            Add-UiLog "本机已经加入网络 $networkId，本次不重复消耗邀请令牌。"
-        }
-        if ($networkId -eq "") { throw "无法确定 Network ID。" }
-        $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("connect", "--network", $networkId)) "连接虚拟网络"
+        if (!(Refresh-LocalIPv6)) { throw "没有可用的房主全局 IPv6。" }
+        $hostIPv6 = Get-BoxText $script:ipv6AddressBox
+        $endpoint = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("room", "endpoint", "--host-ipv6", $hostIPv6) -SuppressStandardOutput) "验证房主 IPv6"
+        $script:controlUrl = [string]$endpoint.control_url
+        $script:controlUrlBox.Text = $script:controlUrl
+        Start-ControlPlane
+        $roomName = "IPv6Mesh-$env:COMPUTERNAME"
+        $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("room", "create", "--name", $roomName, "--pool", "10.42.0.0/24") -SuppressStandardOutput) "创建房间"
+        if (!(Install-NodeService -ControlUrl $script:controlUrl)) { throw "节点服务安装失败。" }
+        $joined = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("room", "join", "--host-ipv6", $hostIPv6, "--name", $env:COMPUTERNAME) -SuppressStandardOutput) "房主加入房间"
+        $script:activeNetworkId = [string]$joined.network_id
+        Set-ActiveVirtualIPv4 $joined "Host"
+        $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("connect", "--network", $script:activeNetworkId) -SuppressStandardOutput) "连接虚拟网络"
         $null = Get-NodeStatus
-        Set-UiStatus "节点已连接" ([System.Drawing.Color]::ForestGreen)
+        Set-UiStatus "房主已连接" ([System.Drawing.Color]::ForestGreen)
+        Add-UiLog "房间创建完成；可将房主 IPv6 提供给成员。"
     } catch {
-        Add-UiLog "加入或连接网络失败：$($_.Exception.Message)" "错误"
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("加入或连接网络失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        Add-UiLog "创建房间失败，正在清理本次启动的资源。" "错误"
+        Stop-StartedResources
+        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("创建房间失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    } finally {
+        Set-PrimaryBusy $false ""
+    }
+}
+
+function Join-MemberRoom {
+    Set-PrimaryBusy $true "正在加入房间并连接本机……"
+    try {
+        $hostIPv6 = Get-BoxText $script:memberHostIPv6Box
+        if ($hostIPv6 -eq "") { throw "请输入房主 IPv6。" }
+        $endpoint = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("room", "endpoint", "--host-ipv6", $hostIPv6) -SuppressStandardOutput) "验证房主 IPv6"
+        $script:controlUrl = [string]$endpoint.control_url
+        $script:controlUrlBox.Text = $script:controlUrl
+        if (!(Install-NodeService -ControlUrl $script:controlUrl)) { throw "节点服务安装失败。" }
+        $joined = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("room", "join", "--host-ipv6", $hostIPv6, "--name", $env:COMPUTERNAME) -SuppressStandardOutput) "加入房间"
+        $script:activeNetworkId = [string]$joined.network_id
+        Set-ActiveVirtualIPv4 $joined "Member"
+        $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("connect", "--network", $script:activeNetworkId) -SuppressStandardOutput) "连接虚拟网络"
+        $null = Get-NodeStatus
+        Set-UiStatus "成员已连接" ([System.Drawing.Color]::ForestGreen)
+        Add-UiLog "已加入房间并连接本机。"
+    } catch {
+        Add-UiLog "加入房间失败，正在清理本次启动的资源。" "错误"
+        Stop-StartedResources
+        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("加入房间失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    } finally {
+        Set-PrimaryBusy $false ""
     }
 }
 
 function Connect-Node {
-    try {
-        $networkId = Get-BoxText $script:networkIdBox
-        if ($networkId -eq "") { $networkId = [string](Get-NodeStatus).network_id }
-        if ($networkId -eq "") { throw "请先加入网络。" }
-        $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("connect", "--network", $networkId)) "连接虚拟网络"
+    if ([string]::IsNullOrWhiteSpace($script:activeNetworkId)) {
         $null = Get-NodeStatus
-        Set-UiStatus "节点已连接" ([System.Drawing.Color]::ForestGreen)
-    } catch {
-        Add-UiLog "连接失败：$($_.Exception.Message)" "错误"
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("连接失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     }
+    if ([string]::IsNullOrWhiteSpace($script:activeNetworkId)) { throw "本机尚未加入房间。" }
+    $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("connect", "--network", $script:activeNetworkId) -SuppressStandardOutput) "连接虚拟网络"
+    $null = Get-NodeStatus
+    Set-UiStatus "节点已连接" ([System.Drawing.Color]::ForestGreen)
 }
 
 function Disconnect-Node {
-    try {
-        $networkId = Get-BoxText $script:networkIdBox
-        if ($networkId -eq "") { throw "请先填写或读取 Network ID。" }
-        $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("disconnect", "--network", $networkId)) "断开虚拟网络"
-        $null = Get-NodeStatus
-        Set-UiStatus "节点已断开" ([System.Drawing.Color]::DarkOrange)
-    } catch {
-        Add-UiLog "断开失败：$($_.Exception.Message)" "错误"
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("断开失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-    }
+    if ([string]::IsNullOrWhiteSpace($script:activeNetworkId)) { return }
+    $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("disconnect", "--network", $script:activeNetworkId) -SuppressStandardOutput) "断开虚拟网络"
+    $null = Get-NodeStatus
+    Set-UiStatus "节点已断开" ([System.Drawing.Color]::DarkOrange)
 }
 
 function Leave-Node {
-    try {
-        $networkId = Get-BoxText $script:networkIdBox
-        if ($networkId -eq "") { throw "请先填写或读取 Network ID。" }
-        $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("leave", "--network", $networkId)) "离开网络"
-        $script:networkIdBox.Text = ""
-        $script:nodeStatusLabel.Text = "本机尚未加入网络"
-        Add-UiLog "本机已离开网络；再次加入需要新的邀请令牌。"
-        Set-UiStatus "节点未加入网络" ([System.Drawing.Color]::DarkOrange)
-    } catch {
-        Add-UiLog "离开网络失败：$($_.Exception.Message)" "错误"
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("离开网络失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-    }
+    if ([string]::IsNullOrWhiteSpace($script:activeNetworkId)) { return }
+    $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("leave", "--network", $script:activeNetworkId) -SuppressStandardOutput) "离开房间"
+    $script:activeNetworkId = ""
+    if ($null -ne $script:nodeStatusLabel) { $script:nodeStatusLabel.Text = "本机尚未加入房间" }
+    Set-UiStatus "节点未加入房间" ([System.Drawing.Color]::DarkOrange)
 }
 
 function Copy-UiField {
     param([Parameter(Mandatory = $true)][System.Windows.Forms.TextBox]$Box, [Parameter(Mandatory = $true)][string]$Description)
     $value = Get-BoxText $Box
-    if ($value -eq "") {
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, "$Description 为空。", "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-        return
-    }
+    if ($value -eq "") { return }
     try {
         [System.Windows.Forms.Clipboard]::SetText($value)
         Add-UiLog "已复制 $Description；日志不会记录其正文。"
     } catch {
-        Add-UiLog "复制 $Description 失败：$($_.Exception.Message)" "错误"
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("复制" + $Description + "失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        Add-UiLog "复制 $Description 失败。" "错误"
     }
 }
 
@@ -687,8 +629,56 @@ function Export-UiLog {
     if ($dialog.ShowDialog($script:form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
     try {
         [IO.File]::WriteAllText($dialog.FileName, ($script:logLines -join [Environment]::NewLine) + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
-        Add-UiLog "日志已导出：$($dialog.FileName)"
-    } catch { Add-UiLog "导出日志失败：$($_.Exception.Message)" "错误" }
+        Add-UiLog "日志已导出。"
+    } catch {
+        Add-UiLog "导出日志失败。" "错误"
+    }
+}
+
+function Set-PrimaryBusy {
+    param([bool]$Busy, [string]$Status = "")
+    $script:primaryBusy = $Busy
+    if ($null -ne $script:hostStartButton) {
+        $hostReady = $false
+        if ($null -ne $script:ipv6AddressBox) { $hostReady = Test-GlobalIPv6 (Get-BoxText $script:ipv6AddressBox) }
+        $script:hostStartButton.Enabled = !$Busy -and $hostReady
+    }
+    if ($null -ne $script:memberJoinButton) { $script:memberJoinButton.Enabled = !$Busy }
+    foreach ($button in $script:backButtons) {
+        if ($null -ne $button) { $button.Enabled = !$Busy }
+    }
+    if (![string]::IsNullOrWhiteSpace($Status)) {
+        Set-UiStatus $Status ([System.Drawing.Color]::DarkOrange)
+    }
+}
+
+function Show-Page {
+    param([ValidateSet("Welcome", "Host", "Member")][string]$Name)
+    if ($null -ne $script:welcomePanel) { $script:welcomePanel.Visible = ($Name -eq "Welcome") }
+    if ($null -ne $script:hostPanel) { $script:hostPanel.Visible = ($Name -eq "Host") }
+    if ($null -ne $script:memberPanel) { $script:memberPanel.Visible = ($Name -eq "Member") }
+    if ($null -ne $script:diagnosticsPanel) { $script:diagnosticsPanel.Visible = $false }
+}
+
+function Show-WelcomePage {
+    Show-Page "Welcome"
+    Set-UiStatus "等待选择" ([System.Drawing.Color]::MidnightBlue)
+}
+
+function Show-HostPage {
+    Show-Page "Host"
+    $null = Refresh-LocalIPv6
+}
+
+function Show-MemberPage {
+    Show-Page "Member"
+    Set-UiStatus "请输入房主 IPv6" ([System.Drawing.Color]::MidnightBlue)
+}
+
+function Toggle-Diagnostics {
+    if ($null -ne $script:diagnosticsPanel) {
+        $script:diagnosticsPanel.Visible = !$script:diagnosticsPanel.Visible
+    }
 }
 
 function New-Label {
@@ -712,7 +702,7 @@ function New-TextBox {
 }
 
 function New-Button {
-    param([string]$Text, [int]$X, [int]$Y, [int]$Width = 110, [int]$Height = 28)
+    param([string]$Text, [int]$X, [int]$Y, [int]$Width = 120, [int]$Height = 30)
     $button = New-Object System.Windows.Forms.Button
     $button.Text = $Text
     $button.Location = New-Object System.Drawing.Point($X, $Y)
@@ -721,231 +711,156 @@ function New-Button {
 }
 
 $initialIPv6 = Get-DetectedIPv6Address
-$initialPort = 8080
-$initialControlUrl = [string]$ControlUrl
-if (![string]::IsNullOrWhiteSpace($ControlUrl)) {
+if ([string]::IsNullOrWhiteSpace($initialIPv6) -and ![string]::IsNullOrWhiteSpace($ControlUrl)) {
     try {
-        $providedUri = $null
-        if ([Uri]::TryCreate($ControlUrl, [UriKind]::Absolute, [ref]$providedUri)) {
-            if ($providedUri.Port -gt 0) { $initialPort = $providedUri.Port }
-            if ($providedUri.Host.Contains(':')) { $initialIPv6 = $providedUri.Host }
-        }
+        $providedUri = [Uri]$ControlUrl
+        if ($providedUri.Host.Contains(":")) { $initialIPv6 = $providedUri.Host }
     } catch {}
-} elseif ($initialIPv6 -ne '') {
-    $initialControlUrl = "http://[$initialIPv6]:$initialPort"
 }
 
 $script:form = New-Object System.Windows.Forms.Form
 $script:form.Text = "IPv6Mesh 远程组网"
 $script:form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-$script:form.ClientSize = New-Object System.Drawing.Size(1160, 875)
-$script:form.MinimumSize = New-Object System.Drawing.Size(1160, 875)
+$script:form.ClientSize = New-Object System.Drawing.Size(1120, 720)
+$script:form.MinimumSize = New-Object System.Drawing.Size(1120, 720)
 $script:form.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
 
-$title = New-Label "IPv6Mesh 远程组网（中文调试界面）" 15 10 460 30
-$title.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 14, [System.Drawing.FontStyle]::Bold)
+$title = New-Label "IPv6Mesh 远程组网" 20 15 500 32
+$title.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 15, [System.Drawing.FontStyle]::Bold)
 $script:form.Controls.Add($title)
-$script:form.Controls.Add((New-Label "当前角色：" 620 12 75 26))
-$script:roleBox = New-Object System.Windows.Forms.ComboBox
-$script:roleBox.Location = New-Object System.Drawing.Point(700, 10)
-$script:roleBox.Size = New-Object System.Drawing.Size(170, 28)
-$script:roleBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-[void]$script:roleBox.Items.AddRange([object[]]@("控制面管理员", "游戏房主", "游戏成员"))
-$script:roleBox.SelectedIndex = 0
-$script:form.Controls.Add($script:roleBox)
-$script:roleHintLabel = New-Label "管理员可启动控制面、创建网络并生成房主/成员一次性邀请。" 15 42 1080 24
-$script:roleHintLabel.ForeColor = [System.Drawing.Color]::DimGray
-$script:form.Controls.Add($script:roleHintLabel)
+$script:statusLabel = New-Label "等待选择" 620 18 470 28
+$script:statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+$script:form.Controls.Add($script:statusLabel)
 
-$controlGroup = New-Object System.Windows.Forms.GroupBox
-$controlGroup.Text = "一、控制面和网络管理（管理员；邀请令牌由控制面随机生成）"
-$controlGroup.Location = New-Object System.Drawing.Point(10, 70)
-$controlGroup.Size = New-Object System.Drawing.Size(1140, 275)
-$script:form.Controls.Add($controlGroup)
-$controlGroup.Controls.Add((New-Label "控制面 URL：" 15 27 105 25))
-$script:controlUrlBox = New-TextBox 120 24 650
-$script:controlUrlBox.Text = $initialControlUrl
-$controlGroup.Controls.Add($script:controlUrlBox)
-$healthButton = New-Button "检查健康" 785 22 100
-$healthButton.Add_Click({ [void](Test-ControlHealth) })
-$controlGroup.Controls.Add($healthButton)
-$controlGroup.Controls.Add((New-Label "本机 IPv6：" 15 62 105 25))
-$script:ipv6AddressBox = New-TextBox 120 59 390
+$script:welcomePanel = New-Object System.Windows.Forms.Panel
+$script:welcomePanel.Location = New-Object System.Drawing.Point(20, 70)
+$script:welcomePanel.Size = New-Object System.Drawing.Size(1080, 570)
+$script:form.Controls.Add($script:welcomePanel)
+$script:welcomePanel.Controls.Add((New-Label "你想做什么？" 20 20 500 40 22))
+$script:welcomePanel.Controls.Add((New-Label "选择一种方式开始 IPv6Mesh 房间流程。" 22 70 600 28))
+$createButton = New-Button "创建网络" 180 150 260 70
+$createButton.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 12)
+$createButton.Add_Click({ Show-HostPage })
+$script:welcomePanel.Controls.Add($createButton)
+$joinButton = New-Button "加入网络" 540 150 260 70
+$joinButton.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 12)
+$joinButton.Add_Click({ Show-MemberPage })
+$script:welcomePanel.Controls.Add($joinButton)
+
+$script:hostPanel = New-Object System.Windows.Forms.Panel
+$script:hostPanel.Location = New-Object System.Drawing.Point(20, 70)
+$script:hostPanel.Size = New-Object System.Drawing.Size(1080, 570)
+$script:hostPanel.Visible = $false
+$script:form.Controls.Add($script:hostPanel)
+$hostBackButton = New-Button "返回" 20 15 90
+$hostBackButton.Add_Click({ Show-WelcomePage })
+$script:backButtons += $hostBackButton
+$script:hostPanel.Controls.Add($hostBackButton)
+$script:hostPanel.Controls.Add((New-Label "创建网络" 135 15 300 32 18))
+$script:hostPanel.Controls.Add((New-Label "房主 IPv6：" 40 85 130 28))
+$script:ipv6AddressBox = New-TextBox 170 82 540
 $script:ipv6AddressBox.Text = $initialIPv6
-$controlGroup.Controls.Add($script:ipv6AddressBox)
-$detectIPv6Button = New-Button "自动检测" 520 56 100
-$detectIPv6Button.Add_Click({ Refresh-LocalIPv6 })
-$controlGroup.Controls.Add($detectIPv6Button)
-$controlGroup.Controls.Add((New-Label "端口：" 635 62 45 25))
-$script:portBox = New-TextBox 680 59 80
-$script:portBox.Text = [string]$initialPort
-$controlGroup.Controls.Add($script:portBox)
-$controlGroup.Controls.Add((New-Label "监听地址：" 15 97 105 25))
-$script:listenAddressBox = New-TextBox 120 94 230 -ReadOnly
-$script:listenAddressBox.Text = "[::]:$initialPort"
-$controlGroup.Controls.Add($script:listenAddressBox)
-$controlGroup.Controls.Add((New-Label "管理员令牌：" 370 97 105 25))
-$script:adminTokenBox = New-TextBox 475 94 230 -Password
-$controlGroup.Controls.Add($script:adminTokenBox)
-$randomAdminButton = New-Button "随机生成" 710 92 95
-$randomAdminButton.Add_Click({ Generate-AdminToken })
-$controlGroup.Controls.Add($randomAdminButton)
-$copyAdminButton = New-Button "复制管理员令牌" 810 92 115
-$copyAdminButton.Add_Click({ Copy-UiField $script:adminTokenBox "管理员令牌" })
-$controlGroup.Controls.Add($copyAdminButton)
-$startControlButton = New-Button "启动控制面" 930 92 90
-$startControlButton.Add_Click({ Start-ControlPlane })
-$controlGroup.Controls.Add($startControlButton)
-$stopControlButton = New-Button "停止控制面" 1025 92 90
-$stopControlButton.Add_Click({ Stop-ControlPlane; Set-UiStatus "控制面已停止" ([System.Drawing.Color]::DarkOrange) })
-$controlGroup.Controls.Add($stopControlButton)
-$controlGroup.Controls.Add((New-Label "网络名称：" 15 132 105 25))
-$script:networkNameBox = New-TextBox 120 129 220
-$script:networkNameBox.Text = "friends-steam"
-$controlGroup.Controls.Add($script:networkNameBox)
-$controlGroup.Controls.Add((New-Label "IPv4 地址池：" 360 132 100 25))
-$script:poolBox = New-TextBox 460 129 170
-$script:poolBox.Text = "10.42.0.0/24"
-$controlGroup.Controls.Add($script:poolBox)
-$controlGroup.Controls.Add((New-Label "邀请有效期：" 650 132 100 25))
-$script:expiryBox = New-TextBox 750 129 90
-$script:expiryBox.Text = "24h"
-$controlGroup.Controls.Add($script:expiryBox)
-$createNetworkButton = New-Button "创建网络" 860 126 110
-$createNetworkButton.Add_Click({ Create-Network })
-$controlGroup.Controls.Add($createNetworkButton)
-$controlGroup.Controls.Add((New-Label "Network ID：" 15 167 105 25))
-$script:networkIdBox = New-TextBox 120 164 600
-$script:networkIdBox.Text = $Network
-$controlGroup.Controls.Add($script:networkIdBox)
-$randomNetworkButton = New-Button "随机生成" 730 164 100
-$randomNetworkButton.Add_Click({ Generate-NetworkId })
-$controlGroup.Controls.Add($randomNetworkButton)
-$copyNetworkButton = New-Button "复制 Network ID" 840 164 115
-$copyNetworkButton.Add_Click({ Copy-UiField $script:networkIdBox "Network ID" })
-$controlGroup.Controls.Add($copyNetworkButton)
-$controlGroup.Controls.Add((New-Label "虚拟 IPv4 由控制面随机分配并保持不变。" 965 167 150 38))
-$controlGroup.Controls.Add((New-Label "房主邀请：" 15 202 105 25))
-$script:hostInviteBox = New-TextBox 120 199 650 -Password -ReadOnly
-$controlGroup.Controls.Add($script:hostInviteBox)
-$hostInviteButton = New-Button "随机生成房主邀请" 785 196 145
-$hostInviteButton.Add_Click({ Create-Invite "房主" })
-$controlGroup.Controls.Add($hostInviteButton)
-$copyHostButton = New-Button "复制房主令牌" 940 196 125
-$copyHostButton.Add_Click({ Copy-UiField $script:hostInviteBox "房主邀请令牌" })
-$controlGroup.Controls.Add($copyHostButton)
-$controlGroup.Controls.Add((New-Label "成员邀请：" 15 237 105 25))
-$script:memberInviteBox = New-TextBox 120 234 650 -Password -ReadOnly
-$controlGroup.Controls.Add($script:memberInviteBox)
-$memberInviteButton = New-Button "随机生成成员邀请" 785 231 145
-$memberInviteButton.Add_Click({ Create-Invite "成员" })
-$controlGroup.Controls.Add($memberInviteButton)
-$copyMemberButton = New-Button "复制成员令牌" 940 231 125
-$copyMemberButton.Add_Click({ Copy-UiField $script:memberInviteBox "成员邀请令牌" })
-$controlGroup.Controls.Add($copyMemberButton)
+$script:hostPanel.Controls.Add($script:ipv6AddressBox)
+$detectButton = New-Button "重新检测" 730 80 120
+$detectButton.Add_Click({ $null = Refresh-LocalIPv6 })
+$script:hostPanel.Controls.Add($detectButton)
+$script:hostPanel.Controls.Add((New-Label "房主 IPv6 仅接受首选、非 SkipAsSource 的 2000::/3 全局地址。" 170 115 700 25))
+$script:hostPanel.Controls.Add((New-Label "控制面地址：" 40 160 130 28))
+$script:controlUrlBox = New-TextBox 170 157 540 -ReadOnly
+$script:hostPanel.Controls.Add($script:controlUrlBox)
+$copyHostIPv6Button = New-Button "复制房主 IPv6" 730 155 140
+$copyHostIPv6Button.Add_Click({ Copy-UiField $script:ipv6AddressBox "房主 IPv6" })
+$script:hostPanel.Controls.Add($copyHostIPv6Button)
+$script:hostVirtualIPv4Label = New-Label "房主虚拟 IPv4：未加入" 40 220 650 30 12
+$script:hostPanel.Controls.Add($script:hostVirtualIPv4Label)
+$script:hostStartButton = New-Button "创建并连接" 40 275 190 44
+$script:hostStartButton.Add_Click({ Start-HostRoom })
+$script:hostPanel.Controls.Add($script:hostStartButton)
+$hostDiagnosticsButton = New-Button "显示诊断与日志" 250 275 170 44
+$hostDiagnosticsButton.Add_Click({ Toggle-Diagnostics })
+$script:hostPanel.Controls.Add($hostDiagnosticsButton)
 
-$nodeGroup = New-Object System.Windows.Forms.GroupBox
-$nodeGroup.Text = "二、房主/成员节点操作"
-$nodeGroup.Location = New-Object System.Drawing.Point(10, 360)
-$nodeGroup.Size = New-Object System.Drawing.Size(1140, 165)
-$script:form.Controls.Add($nodeGroup)
-$nodeGroup.Controls.Add((New-Label "当前角色邀请：" 15 27 105 25))
-$script:nodeInviteBox = New-TextBox 120 24 650 -Password
-$script:nodeInviteBox.Text = $Invite
-$nodeGroup.Controls.Add($script:nodeInviteBox)
-$nodeGroup.Controls.Add((New-Label "设备名：" 15 62 105 25))
-$script:deviceNameBox = New-TextBox 120 59 300
-$script:deviceNameBox.Text = if ([string]::IsNullOrWhiteSpace($DeviceName)) { $env:COMPUTERNAME } else { $DeviceName }
-$nodeGroup.Controls.Add($script:deviceNameBox)
-$script:nodeActionButton = New-Button "安装并加入 VPN" 445 56 145
-$script:nodeActionButton.Add_Click({ Join-And-ConnectNode })
-$nodeGroup.Controls.Add($script:nodeActionButton)
-$refreshButton = New-Button "刷新状态" 605 56 100
-$refreshButton.Add_Click({ [void](Get-NodeStatus) })
-$nodeGroup.Controls.Add($refreshButton)
-$connectButton = New-Button "连接" 720 56 80
+$script:memberPanel = New-Object System.Windows.Forms.Panel
+$script:memberPanel.Location = New-Object System.Drawing.Point(20, 70)
+$script:memberPanel.Size = New-Object System.Drawing.Size(1080, 570)
+$script:memberPanel.Visible = $false
+$script:form.Controls.Add($script:memberPanel)
+$memberBackButton = New-Button "返回" 20 15 90
+$memberBackButton.Add_Click({ Show-WelcomePage })
+$script:backButtons += $memberBackButton
+$script:memberPanel.Controls.Add($memberBackButton)
+$script:memberPanel.Controls.Add((New-Label "加入网络" 135 15 300 32 18))
+$script:memberPanel.Controls.Add((New-Label "房主 IPv6：" 40 85 130 28))
+$script:memberHostIPv6Box = New-TextBox 170 82 680
+$script:memberPanel.Controls.Add($script:memberHostIPv6Box)
+$script:memberPanel.Controls.Add((New-Label "成员只需输入房主 IPv6；地址必须是 2000::/3 全局 IPv6。" 170 115 700 25))
+$script:memberPanel.Controls.Add((New-Label "本机名称：" 40 160 130 28))
+$script:memberNameLabel = New-Label ([string]$env:COMPUTERNAME) 170 160 500 28
+$script:memberPanel.Controls.Add($script:memberNameLabel)
+$script:memberVirtualIPv4Label = New-Label "本机虚拟 IPv4：未加入" 40 220 650 30 12
+$script:memberPanel.Controls.Add($script:memberVirtualIPv4Label)
+$script:memberJoinButton = New-Button "加入并连接" 40 275 190 44
+$script:memberJoinButton.Add_Click({ Join-MemberRoom })
+$script:memberPanel.Controls.Add($script:memberJoinButton)
+$memberDiagnosticsButton = New-Button "显示诊断与日志" 250 275 170 44
+$memberDiagnosticsButton.Add_Click({ Toggle-Diagnostics })
+$script:memberPanel.Controls.Add($memberDiagnosticsButton)
+
+$script:diagnosticsPanel = New-Object System.Windows.Forms.GroupBox
+$script:diagnosticsPanel.Text = "诊断与日志"
+$script:diagnosticsPanel.Location = New-Object System.Drawing.Point(40, 350)
+$script:diagnosticsPanel.Size = New-Object System.Drawing.Size(1040, 290)
+$script:diagnosticsPanel.Visible = $false
+$script:form.Controls.Add($script:diagnosticsPanel)
+$script:nodeStatusLabel = New-Label "节点服务未检查状态" 20 25 980 28
+$script:diagnosticsPanel.Controls.Add($script:nodeStatusLabel)
+$refreshStatusButton = New-Button "刷新状态" 20 60 100
+$refreshStatusButton.Add_Click({ $null = Get-NodeStatus })
+$script:diagnosticsPanel.Controls.Add($refreshStatusButton)
+$connectButton = New-Button "连接" 130 60 90
 $connectButton.Add_Click({ Connect-Node })
-$nodeGroup.Controls.Add($connectButton)
-$disconnectButton = New-Button "断开" 815 56 80
+$script:diagnosticsPanel.Controls.Add($connectButton)
+$disconnectButton = New-Button "断开" 230 60 90
 $disconnectButton.Add_Click({ Disconnect-Node })
-$nodeGroup.Controls.Add($disconnectButton)
-$leaveButton = New-Button "离开网络" 910 56 100
+$script:diagnosticsPanel.Controls.Add($disconnectButton)
+$leaveButton = New-Button "离开房间" 330 60 110
 $leaveButton.Add_Click({ Leave-Node })
-$nodeGroup.Controls.Add($leaveButton)
-$script:nodeStatusLabel = New-Label "节点尚未检查状态" 15 97 1080 25
-$script:nodeStatusLabel.ForeColor = [System.Drawing.Color]::DimGray
-$nodeGroup.Controls.Add($script:nodeStatusLabel)
-
-$logGroup = New-Object System.Windows.Forms.GroupBox
-$logGroup.Text = "三、实时调试日志（邀请令牌不会写入日志）"
-$logGroup.Location = New-Object System.Drawing.Point(10, 535)
-$logGroup.Size = New-Object System.Drawing.Size(1140, 300)
-$script:form.Controls.Add($logGroup)
+$script:diagnosticsPanel.Controls.Add($leaveButton)
 $script:logBox = New-Object System.Windows.Forms.TextBox
 $script:logBox.Multiline = $true
 $script:logBox.ReadOnly = $true
 $script:logBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
 $script:logBox.WordWrap = $false
-$script:logBox.Location = New-Object System.Drawing.Point(15, 25)
-$script:logBox.Size = New-Object System.Drawing.Size(1110, 220)
+$script:logBox.Location = New-Object System.Drawing.Point(20, 100)
+$script:logBox.Size = New-Object System.Drawing.Size(1000, 145)
 $script:logBox.Font = New-Object System.Drawing.Font("Consolas", 9)
-$logGroup.Controls.Add($script:logBox)
-$clearLogButton = New-Button "清空日志" 15 255 100
-$clearLogButton.Add_Click({ $script:logLines.Clear(); $script:logBox.Clear(); Add-UiLog "日志已清空。" })
-$logGroup.Controls.Add($clearLogButton)
-$copyLogButton = New-Button "复制日志" 130 255 100
-$copyLogButton.Add_Click({ [System.Windows.Forms.Clipboard]::SetText(($script:logLines -join [Environment]::NewLine)); Add-UiLog "日志已复制到剪贴板。" })
-$logGroup.Controls.Add($copyLogButton)
-$exportLogButton = New-Button "导出日志" 245 255 100
+$script:diagnosticsPanel.Controls.Add($script:logBox)
+$clearLogButton = New-Button "清空日志" 20 250 100
+$clearLogButton.Add_Click({ $script:logLines.Clear(); $script:logBox.Clear() })
+$script:diagnosticsPanel.Controls.Add($clearLogButton)
+$copyLogButton = New-Button "复制日志" 130 250 100
+$copyLogButton.Add_Click({ [System.Windows.Forms.Clipboard]::SetText(($script:logLines -join [Environment]::NewLine)) })
+$script:diagnosticsPanel.Controls.Add($copyLogButton)
+$exportLogButton = New-Button "导出日志" 240 250 100
 $exportLogButton.Add_Click({ Export-UiLog })
-$logGroup.Controls.Add($exportLogButton)
-$logGroup.Controls.Add((New-Label "提交 debug 信息前，请检查日志和导出文件中没有不应公开的主机信息。" 370 258 700 24))
+$script:diagnosticsPanel.Controls.Add($exportLogButton)
 
 $script:ipv6AddressBox.Add_TextChanged({
     if ($script:updatingEndpoint) { return }
-    try { Update-ControlEndpoint } catch {}
-})
-$script:portBox.Add_TextChanged({
-    if ($script:updatingEndpoint) { return }
-    try { Update-ControlEndpoint } catch {}
+    try { Update-ControlEndpoint } catch { $script:hostStartButton.Enabled = $false }
 })
 
-$script:roleBox.Add_SelectedIndexChanged({
-    switch ([string]$script:roleBox.SelectedItem) {
-        "控制面管理员" {
-            $script:roleHintLabel.Text = "管理员可启动控制面、创建网络并生成房主/成员一次性邀请；需要管理员令牌。"
-            $script:nodeInviteBox.Enabled = $false
-            $script:nodeActionButton.Enabled = $false
-        }
-        "游戏房主" {
-            $script:roleHintLabel.Text = "房主使用房主专属邀请加入，并在游戏中创建房间；不要使用成员邀请或管理员令牌。"
-            $script:nodeInviteBox.Enabled = $true
-            $script:nodeActionButton.Enabled = $true
-            if ($script:hostInviteBox.Text -ne "") { $script:nodeInviteBox.Text = $script:hostInviteBox.Text }
-        }
-        "游戏成员" {
-            $script:roleHintLabel.Text = "成员使用成员专属邀请加入，然后使用房主显示的虚拟 IPv4 或游戏邀请进入房间。"
-            $script:nodeInviteBox.Enabled = $true
-            $script:nodeActionButton.Enabled = $true
-            if ($script:memberInviteBox.Text -ne "") { $script:nodeInviteBox.Text = $script:memberInviteBox.Text }
-        }
-    }
-})
-$script:nodeInviteBox.Enabled = $false
-$script:nodeActionButton.Enabled = $false
 $script:form.Add_FormClosing({ Stop-AllResources })
-
 Add-UiLog "IPv6Mesh 中文 UI $Version 已启动。"
-Add-UiLog "请先选择角色；管理员先启动控制面并创建网络，房主/成员再安装并加入。"
-Add-UiLog "管理员操作顺序：点击“启动控制面” → 等待健康检查通过 → 点击“创建网络” → 再生成房主/成员邀请。"
-Add-UiLog "当前 UI 不会把管理员令牌和一次性邀请令牌写入日志。"
-if ($initialIPv6 -ne '') {
-    Add-UiLog "已检测本机 IPv6：$initialIPv6；默认控制面 URL：$initialControlUrl"
+Add-UiLog "欢迎页提供创建网络和加入网络两条流程。"
+Add-UiLog "关闭窗口时只清理本窗口启动的节点服务和控制面资源。"
+if ($initialIPv6 -ne "") {
+    Add-UiLog "已检测到可用的房主 IPv6。"
 } else {
-    Add-UiLog "未检测到可用的全局 IPv6；请点击“自动检测”或手动填写 IPv6。" "警告"
+    Add-UiLog "未检测到可用的全局 IPv6；房主可在页面中重新检测。" "警告"
 }
-Add-UiLog "手动关闭窗口时会停止本机 IPv6Mesh 服务、清理虚拟网卡/地址/路由，并停止本窗口启动的控制面。"
-Set-UiStatus "等待操作" ([System.Drawing.Color]::MidnightBlue)
+Set-PrimaryBusy $false ""
+Show-WelcomePage
 try {
     [void][System.Windows.Forms.Application]::Run($script:form)
 } finally {

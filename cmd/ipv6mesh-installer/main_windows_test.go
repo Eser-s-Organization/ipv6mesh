@@ -142,26 +142,46 @@ func TestWindowsPackageIncludesChineseUI(t *testing.T) {
 	contents := string(uiScript)
 	for _, required := range []string{
 		"System.Windows.Forms",
-		"控制面管理员",
-		"游戏房主",
-		"游戏成员",
+		"你想做什么？",
+		"创建网络",
+		"加入网络",
+		"Show-WelcomePage",
+		"Show-HostPage",
+		"Show-MemberPage",
+		"Start-HostRoom",
+		"Join-MemberRoom",
+		"重新检测",
+		"复制房主 IPv6",
+		"房主虚拟 IPv4",
+		"本机虚拟 IPv4",
+		"Set-PrimaryBusy",
+		"Stop-AllResources",
 		"Get-NetIPAddress -AddressFamily IPv6",
 		"Update-ControlEndpoint",
-		"虚拟 IPv4 由控制面随机分配并保持不变",
-		"Stop-AllResources",
 		"Stop-NodeService",
-		"network",
-		"invite",
-		"复制日志",
-		"导出日志",
 	} {
 		if !strings.Contains(contents, required) {
 			t.Fatalf("UI script missing %q", required)
 		}
 	}
+	for _, forbidden := range []string{
+		"控制面管理员",
+		"游戏房主",
+		"游戏成员",
+		"管理员令牌：",
+		"房主邀请：",
+		"成员邀请：",
+		"复制 Network ID",
+		"随机生成房主邀请",
+		"随机生成成员邀请",
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Fatalf("normal room UI still exposes %q", forbidden)
+		}
+	}
 }
 
-func TestWindowsUIUsesRandomTokensAndActionableHealthCheck(t *testing.T) {
+func TestWindowsUIUsesRoomWorkflowAndActionableHealthCheck(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed")
@@ -174,25 +194,31 @@ func TestWindowsUIUsesRandomTokensAndActionableHealthCheck(t *testing.T) {
 	contents := string(uiScript)
 	for _, required := range []string{
 		"New-RandomToken",
-		"随机生成管理员令牌",
-		"随机生成房主邀请",
-		"随机生成成员邀请",
-		"密码学随机数",
+		"CONTROL_BOOTSTRAP_TOKEN",
+		"CONTROL_ROOM_MODE",
+		"CONTROL_REPOSITORY_MODE",
 		"Wait-ControlPlaneReady",
-		"请先点击\"启动控制面\"",
-		"Network ID 不存在",
-		"管理员令牌无效或与控制面启动令牌不一致",
-		"健康检查只验证连接，不验证管理员身份",
 		"Get-WebException",
-		"随机生成 Network ID",
-		"复制管理员令牌",
-		"复制 Network ID",
-		"复制房主令牌",
-		"复制成员令牌",
-		"--id",
+		"Stop-ControlPlane",
+		"Stop-AllResources",
 	} {
 		if !strings.Contains(contents, required) {
 			t.Fatalf("UI script missing %q", required)
+		}
+		for _, forbidden := range []string{
+			"控制面管理员",
+			"游戏房主",
+			"游戏成员",
+			"管理员令牌：",
+			"房主邀请：",
+			"成员邀请：",
+			"复制 Network ID",
+			"随机生成房主邀请",
+			"随机生成成员邀请",
+		} {
+			if strings.Contains(contents, forbidden) {
+				t.Fatalf("normal room UI still exposes %q", forbidden)
+			}
 		}
 	}
 	packagedIndex := strings.Index(contents, "$packaged = Join-Path $PackageDirectory $Name")
