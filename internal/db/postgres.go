@@ -648,6 +648,50 @@ func (repository *PostgresRepository) CreateInvite(ctx context.Context, invite c
 	})
 }
 
+// RevokeInvite makes an unused invitation unavailable within one transaction.
+// The follow-up read distinguishes an already-consumed invite from a missing
+// or otherwise conflicting row after the conditional update misses.
+func (repository *PostgresRepository) RevokeInvite(ctx context.Context, inviteID string, revokedAt time.Time) error {
+	if inviteID == "" || revokedAt.IsZero() {
+		return control.ErrValidation
+	}
+	return repository.withTransaction(ctx, func(executor SQLExecutor) error {
+		result, err := executor.ExecContext(ctx, `
+			UPDATE invites
+			SET revoked_at = $2
+			WHERE id = $1 AND consumed_at IS NULL AND revoked_at IS NULL`,
+			inviteID, revokedAt.UTC())
+		if err != nil {
+			return err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if count == 1 {
+			return nil
+		}
+		var consumedAt, existingRevokedAt sql.NullTime
+		err = executor.QueryRowContext(ctx,
+			`SELECT consumed_at, revoked_at FROM invites WHERE id = $1`,
+			inviteID,
+		).Scan(&consumedAt, &existingRevokedAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if consumedAt.Valid {
+			return ErrInviteConsumed
+		}
+		if existingRevokedAt.Valid {
+			return nil
+		}
+		return ErrConflict
+	})
+}
+
 // ConsumeInvite is the compatibility wrapper for consumers that do not yet
 // identify the enrolling node.
 func (repository *PostgresRepository) ConsumeInvite(ctx context.Context, inviteOrNetworkID, tokenHash string, consumedAt time.Time) (control.Invite, error) {

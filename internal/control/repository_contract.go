@@ -31,6 +31,7 @@ type Repository interface {
 	AddMembership(context.Context, Membership) error
 	RemoveMembership(context.Context, string, string) error
 	CreateInvite(context.Context, Invite) error
+	RevokeInvite(context.Context, string, time.Time) error
 	ConsumeInvite(context.Context, string, string, time.Time) (Invite, error)
 	ConsumeInviteForNode(context.Context, string, string, time.Time, string) (Invite, error)
 	ReplaceEndpoints(context.Context, string, []EndpointCandidate) error

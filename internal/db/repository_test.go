@@ -648,6 +648,31 @@ func TestMemoryRepositoryRejectsExpiredInvite(t *testing.T) {
 	}
 }
 
+func TestMemoryRepositoryRevokesUnusedInvite(t *testing.T) {
+	repository := NewMemoryRepository()
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	network := control.Network{
+		ID: "room-1", Name: "room", IPv4Pool: "10.42.0.0/24",
+		OwnerID: "owner", ConfigVersion: 1, CreatedAt: now,
+	}
+	if err := repository.CreateNetwork(context.Background(), network); err != nil {
+		t.Fatal(err)
+	}
+	invite := control.Invite{
+		ID: "invite-1", NetworkID: network.ID, TokenHash: "hash",
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}
+	if err := repository.CreateInvite(context.Background(), invite); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.RevokeInvite(context.Background(), invite.ID, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.ConsumeInvite(context.Background(), invite.ID, invite.TokenHash, now.Add(2*time.Minute)); !errors.Is(err, control.ErrInviteRevoked) {
+		t.Fatalf("consume revoked invite error = %v, want ErrInviteRevoked", err)
+	}
+}
+
 func TestMemoryRepositoryUsesCurrentTimeWhenConsumptionTimeIsZero(t *testing.T) {
 	repository := NewMemoryRepository()
 	addRepositoryTestNetwork(t, repository)
@@ -1334,6 +1359,52 @@ func TestPostgresCreateInviteBindsInsertParameters(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unexpected PostgreSQL calls: %v", err)
+	}
+}
+
+func TestPostgresRepositoryRevokesUnusedInvite(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	revokedAt := time.Date(2026, 8, 16, 12, 1, 0, 0, time.UTC)
+
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE invites").
+		WithArgs("invite-1", revokedAt).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := repository.RevokeInvite(context.Background(), "invite-1", revokedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostgresRepositoryRejectsRevokingConsumedInvite(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repository := NewPostgresRepository(database)
+	revokedAt := time.Date(2026, 8, 16, 12, 1, 0, 0, time.UTC)
+
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE invites").
+		WithArgs("invite-1", revokedAt).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT consumed_at, revoked_at FROM invites").
+		WithArgs("invite-1").
+		WillReturnRows(sqlmock.NewRows([]string{"consumed_at", "revoked_at"}).AddRow(revokedAt, nil))
+	mock.ExpectRollback()
+
+	if err := repository.RevokeInvite(context.Background(), "invite-1", revokedAt); !errors.Is(err, control.ErrInviteConsumed) {
+		t.Fatalf("error = %v, want ErrInviteConsumed", err)
 	}
 }
 

@@ -583,6 +583,34 @@ func (repository *MemoryRepository) CreateInvite(ctx context.Context, invite con
 	return nil
 }
 
+// RevokeInvite marks an unused invitation as unavailable without exposing or
+// retaining its secret. Repeated revocation is idempotent, while consumed
+// invitations remain immutable.
+func (repository *MemoryRepository) RevokeInvite(ctx context.Context, inviteID string, revokedAt time.Time) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if inviteID == "" || revokedAt.IsZero() {
+		return control.ErrValidation
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	invite, ok := repository.invites[inviteID]
+	if !ok {
+		return ErrNotFound
+	}
+	if invite.ConsumedAt != nil {
+		return ErrInviteConsumed
+	}
+	if invite.RevokedAt != nil {
+		return nil
+	}
+	value := revokedAt.UTC()
+	invite.RevokedAt = &value
+	repository.invites[inviteID] = cloneInvite(invite)
+	return nil
+}
+
 // ConsumeInvite is the compatibility wrapper for consumers that do not yet
 // identify the enrolling node.
 func (repository *MemoryRepository) ConsumeInvite(ctx context.Context, inviteOrNetworkID, tokenHash string, consumedAt time.Time) (control.Invite, error) {
