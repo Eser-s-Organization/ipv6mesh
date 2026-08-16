@@ -261,6 +261,7 @@ func (handler *Handler) createNetwork(writer http.ResponseWriter, request *http.
 		return
 	}
 	var body struct {
+		ID   string `json:"id"`
 		Name string `json:"name"`
 		Pool string `json:"pool"`
 	}
@@ -276,8 +277,15 @@ func (handler *Handler) createNetwork(writer http.ResponseWriter, request *http.
 		writeAPIError(writer, http.StatusUnprocessableEntity, err)
 		return
 	}
+	networkID := strings.TrimSpace(body.ID)
+	if networkID == "" {
+		networkID = handler.newID()
+	} else if !validRequestID(networkID) {
+		writeAPIError(writer, http.StatusUnprocessableEntity, invalid("network", "id", "must contain only letters, digits, '-', '_', '.', or ':' and be at most 128 characters"))
+		return
+	}
 	network := Network{
-		ID:            handler.newID(),
+		ID:            networkID,
 		Name:          body.Name,
 		IPv4Pool:      body.Pool,
 		OwnerID:       principal.session.Subject,

@@ -71,6 +71,7 @@ func runServiceRequest(request ipc.Request, output io.Writer, client caller) err
 
 type controlAdminClient interface {
 	CreateNetwork(context.Context, string, string, string) (control.Network, error)
+	CreateNetworkWithID(context.Context, string, string, string, string) (control.Network, error)
 	CreateInvite(context.Context, string, string, string) (control.InviteResult, error)
 }
 
@@ -80,7 +81,13 @@ func runControlCommand(ctx context.Context, parsed command, output io.Writer, cl
 	}
 	switch {
 	case parsed.NetworkName != "":
-		network, err := client.CreateNetwork(ctx, parsed.NetworkName, parsed.Pool, "")
+		var network control.Network
+		var err error
+		if parsed.NetworkID != "" {
+			network, err = client.CreateNetworkWithID(ctx, parsed.NetworkName, parsed.Pool, parsed.NetworkID, "")
+		} else {
+			network, err = client.CreateNetwork(ctx, parsed.NetworkName, parsed.Pool, "")
+		}
 		if err != nil {
 			return err
 		}
