@@ -20,7 +20,7 @@ The v0.1 scope is virtual IPv4 node-to-node access, IPv6 Direct connectivity, an
 - **游戏房主**：启动游戏并作为第一台 VPN 节点加入网络
 - **成员**：使用自己的邀请令牌加入同一个 VPN 网络
 
-最简单的情况是：第一台电脑同时担任控制面管理员和游戏房主；第二台电脑是成员。新版 `v0.1.0-debug.7` 将三种角色统一放在一个中文可视化界面中，普通成员只需要双击 `.exe`，不需要打开 PowerShell，也不需要使用 `vpnctl`。
+最简单的情况是：第一台电脑同时担任控制面管理员和游戏房主；第二台电脑是成员。新版 `v0.1.0-debug.8` 将三种角色统一放在一个中文可视化界面中，普通成员只需要双击 `.exe`，不需要打开 PowerShell，也不需要使用 `vpnctl`。
 
 > ⚠️ 控制面必须先运行，节点安装器不会自动创建控制面。控制面可以运行在房主电脑、另一台服务器或具有全球 IPv6 的 VPS 上。
 
@@ -63,9 +63,9 @@ flowchart LR
 
 ### 1. 首选：使用统一中文 UI
 
-下载 [v0.1.0-debug.7 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.7/ipv6mesh-installer-0.1.0-debug.7.exe)。双击后在 UAC 对话框中点击“是”。程序会打开“IPv6Mesh 远程组网”窗口，顶部可以切换三种角色。SHA-256：`E78B3BC3A011CF036BB5927CDDBBF2A1163C7BBFC029AF58E2DED0BA9EF6C21B`。
+下载 [v0.1.0-debug.8 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.8/ipv6mesh-installer-0.1.0-debug.8.exe)。双击后在 UAC 对话框中点击“是”。程序会打开“IPv6Mesh 远程组网”窗口，顶部可以切换三种角色。SHA-256：`543E3F19C55D1C9CA06D59367F3689BE1597E98F57297813591C4A73A035B6B6`。
 
-如果旧版 `.5` 或 `.6` 弹出 `run Chinese IPv6Mesh UI: exit status 1`，请改用 `.7`；`.7` 保留 UTF-8 with BOM 修复，并加入了端点自动生成和退出清理。
+如果旧版 `.5`、`.6` 或 `.7` 弹出 `run Chinese IPv6Mesh UI: exit status 1`，请改用 `.8`；`.8` 还会在退出时删除本次创建的 WireGuard 虚拟适配器。
 
 | UI 角色 | 主要按钮和操作 |
 | --- | --- |
@@ -204,7 +204,7 @@ Member invite: <member-one-time-token>
 
 以第一台 Windows 11 作为游戏房主为例：
 
-1. 下载 [v0.1.0-debug.7 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.7/ipv6mesh-installer-0.1.0-debug.7.exe)
+1. 下载 [v0.1.0-debug.8 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.8/ipv6mesh-installer-0.1.0-debug.8.exe)
 2. 双击运行，Windows UAC 弹出后点击“是”，选择角色“游戏房主”
 3. 在 UI 中输入：
 
@@ -300,8 +300,8 @@ UI 日志会记录安装脚本、`control-server.exe`、`vpnctl`、健康检查�
 
 - **控制面连接失败**：确认控制面进程仍在运行、TCP 8080 已放行、IPv6 地址可达，并且 URL 使用 `http://[IPv6]:8080` 格式
 - **`invite already used`**：令牌已经被成功使用或已经过期，管理员需要为该设备生成新令牌
-- **`open \\.\pipe\ipv6mesh`**：服务没有成功安装或没有运行，重新双击 `.7` 并确认 UAC 已授权；可在 UI 中点击“刷新状态”查看日志
-- **旧版本提示文件正在使用**：使用 `.7`；安装脚本会先停止旧服务并等待文件解锁，UI 关闭时也会停止服务并清理虚拟网络资源
+- **`open \\.\pipe\ipv6mesh`**：服务没有成功安装或没有运行，重新双击 `.8` 并确认 UAC 已授权；可在 UI 中点击“刷新状态”查看日志
+- **旧版本提示文件正在使用**：使用 `.8`；安装脚本会先停止旧服务并等待文件解锁，UI 关闭时也会停止服务并清理虚拟网络资源
 - **控制面重启后网络消失**：当前示例使用内存仓库，测试数据随控制面进程退出而丢失；需要长期使用时应部署 PostgreSQL
 - **两台都显示已连接但游戏找不到房间**：先用虚拟 IPv4 和游戏端口测试，再检查游戏的 LAN 发现机制和 Windows 防火墙
 - **虚拟 IPv4 与本地 IPv4 不同**：这是预期行为；游戏应在支持的情况下使用 `Virtual IPv4`，不要使用 `10.20.x.x` 等物理局域网地址
