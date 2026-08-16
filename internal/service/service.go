@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -38,6 +39,10 @@ type ControlClient interface {
 	Leave(context.Context, string) error
 }
 
+type RoomControlClient interface {
+	JoinRoom(context.Context, JoinRequest) (JoinResult, error)
+}
+
 type SnapshotClient interface {
 	Snapshot(context.Context, string) (control.NetworkSnapshot, error)
 }
@@ -67,6 +72,7 @@ type Authorizer interface {
 type Options struct {
 	Identity   IdentityStore
 	Control    ControlClient
+	ControlURL string
 	Adapter    Adapter
 	Reconciler SnapshotApplier
 }
@@ -192,6 +198,8 @@ func (service *Service) Handle(ctx context.Context, request ipc.Request) ipc.Res
 	switch request.Type {
 	case ipc.CommandJoin:
 		return service.join(ctx, request)
+	case ipc.CommandJoinRoom:
+		return service.joinRoom(ctx, request)
 	case ipc.CommandLeave:
 		return service.leave(ctx, request.NetworkID)
 	case ipc.CommandConnect:
@@ -210,13 +218,50 @@ func (service *Service) join(ctx context.Context, request ipc.Request) ipc.Respo
 	}
 	publicKey := service.identity.PublicKeyValue()
 	controlClient := service.options.Control
-	reconciler := service.options.Reconciler
 	service.mu.RUnlock()
 	if strings.TrimSpace(request.Invite) == "" || strings.TrimSpace(request.DisplayName) == "" || controlClient == nil {
 		return ipc.ErrorResponse(ipc.CodeInvalidRequest)
 	}
 	result, err := controlClient.Join(ctx, JoinRequest{Invite: request.Invite, DisplayName: request.DisplayName, PublicKey: publicKey})
-	if err != nil || result.NetworkID == "" || result.VirtualIPv4 == "" {
+	if err != nil {
+		return ipc.ErrorResponse(CodeControlFailed)
+	}
+	return service.finishJoin(ctx, result)
+}
+
+func (service *Service) joinRoom(ctx context.Context, request ipc.Request) ipc.Response {
+	service.mu.RLock()
+	if service.joined != nil {
+		service.mu.RUnlock()
+		return ipc.ErrorResponse(CodeAlreadyJoined)
+	}
+	configuredURL := service.options.ControlURL
+	publicKey := service.identity.PublicKeyValue()
+	controlClient := service.options.Control
+	service.mu.RUnlock()
+
+	requestedURL, requestedOK := canonicalControlURL(request.ControlURL)
+	configuredCanonical, configuredOK := canonicalControlURL(configuredURL)
+	if !requestedOK || !configuredOK || requestedURL != configuredCanonical || strings.TrimSpace(request.DisplayName) == "" || controlClient == nil {
+		return ipc.ErrorResponse(ipc.CodeInvalidRequest)
+	}
+	roomClient, ok := controlClient.(RoomControlClient)
+	if !ok {
+		return ipc.ErrorResponse(CodeControlFailed)
+	}
+	result, err := roomClient.JoinRoom(ctx, JoinRequest{DisplayName: request.DisplayName, PublicKey: publicKey})
+	if err != nil {
+		return ipc.ErrorResponse(CodeControlFailed)
+	}
+	return service.finishJoin(ctx, result)
+}
+
+func (service *Service) finishJoin(ctx context.Context, result JoinResult) ipc.Response {
+	service.mu.RLock()
+	controlClient := service.options.Control
+	reconciler := service.options.Reconciler
+	service.mu.RUnlock()
+	if strings.TrimSpace(result.NetworkID) == "" || strings.TrimSpace(result.VirtualIPv4) == "" || controlClient == nil {
 		return ipc.ErrorResponse(CodeControlFailed)
 	}
 	if reconciler != nil {
@@ -238,6 +283,18 @@ func (service *Service) join(ctx context.Context, request ipc.Request) ipc.Respo
 	service.joined = &result
 	service.status = ipc.Status{NetworkID: result.NetworkID, VirtualIPv4: result.VirtualIPv4, PathState: ipc.PathStateDisconnected, ConfigGeneration: result.ConfigGeneration}
 	return ipc.SuccessResponse(service.status)
+}
+
+func canonicalControlURL(value string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", false
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	parsed.RawPath = ""
+	return parsed.String(), true
 }
 
 func (service *Service) leave(ctx context.Context, networkID string) ipc.Response {

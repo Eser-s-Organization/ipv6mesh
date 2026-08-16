@@ -55,6 +55,41 @@ func TestHTTPControlClientBridgesEnrollmentAndLeave(t *testing.T) {
 	}
 }
 
+func TestHTTPControlClientBridgesRoomJoinWithoutInvite(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/room/join" || request.Header.Get("Authorization") != "" {
+			t.Fatalf("room join request = %s %s auth=%q", request.Method, request.URL.Path, request.Header.Get("Authorization"))
+		}
+		var body map[string]string
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["public_key"] != "public-key" || body["display_name"] != "MEMBER-PC" || body["platform"] != "windows" || body["client_version"] != "0.1.0" || len(body) != 4 {
+			t.Fatalf("room join body = %#v", body)
+		}
+		writeServiceJSON(writer, http.StatusCreated, map[string]any{
+			"node":          map[string]any{"id": "node-1", "display_name": "MEMBER-PC", "public_key": "public-key", "platform": "windows", "client_version": "0.1.0"},
+			"membership":    map[string]any{"network_id": "room-1", "node_id": "node-1", "virtual_ipv4": "10.42.0.9", "role": "member", "status": "active"},
+			"network":       map[string]any{"id": "room-1", "name": "room", "ipv4_pool": "10.42.0.0/24", "config_version": 2, "created_at": "2026-08-16T12:00:00Z"},
+			"session":       map[string]any{"token": "session-token", "subject": "node-1", "network_id": "room-1", "expires_at": "2026-08-16T13:00:00Z"},
+			"session_token": "session-token",
+		})
+	}))
+	defer server.Close()
+	client, err := control.NewClient(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge := NewHTTPControlClient(client, "", "windows", "0.1.0")
+	joined, err := bridge.JoinRoom(context.Background(), JoinRequest{DisplayName: "MEMBER-PC", PublicKey: "public-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if joined.NetworkID != "room-1" || joined.VirtualIPv4 != "10.42.0.9" || joined.ConfigGeneration != 2 {
+		t.Fatalf("unexpected room join result: %#v", joined)
+	}
+}
+
 func writeServiceJSON(writer http.ResponseWriter, status int, value any) {
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(status)

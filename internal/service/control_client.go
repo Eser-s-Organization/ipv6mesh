@@ -46,6 +46,26 @@ func (client *HTTPControlClient) Join(ctx context.Context, request JoinRequest) 
 	if err != nil {
 		return JoinResult{}, err
 	}
+	return client.rememberEnrollment(result)
+}
+
+func (client *HTTPControlClient) JoinRoom(ctx context.Context, request JoinRequest) (JoinResult, error) {
+	if client == nil || client.client == nil {
+		return JoinResult{}, ErrControlClient
+	}
+	result, err := client.client.JoinRoom(ctx, control.RoomJoinRequest{
+		DisplayName:   request.DisplayName,
+		PublicKey:     request.PublicKey,
+		Platform:      client.platform,
+		ClientVersion: client.clientVersion,
+	})
+	if err != nil {
+		return JoinResult{}, err
+	}
+	return client.rememberEnrollment(result)
+}
+
+func (client *HTTPControlClient) rememberEnrollment(result control.EnrollmentResult) (JoinResult, error) {
 	joined := JoinResult{NetworkID: result.Network.ID, VirtualIPv4: result.Membership.VirtualIPv4.String(), ConfigGeneration: result.Network.ConfigVersion}
 	client.mu.Lock()
 	client.nodeID = result.Node.ID

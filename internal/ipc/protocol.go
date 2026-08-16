@@ -29,6 +29,7 @@ type Command string
 const (
 	CommandStatus     Command = "status"
 	CommandJoin       Command = "join"
+	CommandJoinRoom   Command = "join_room"
 	CommandLeave      Command = "leave"
 	CommandConnect    Command = "connect"
 	CommandDisconnect Command = "disconnect"
@@ -58,6 +59,7 @@ type Request struct {
 	Type        Command
 	Invite      string
 	DisplayName string
+	ControlURL  string
 	NetworkID   string
 }
 
@@ -104,6 +106,9 @@ func MarshalRequest(request Request) ([]byte, error) {
 	case CommandJoin:
 		fields["invite"] = request.Invite
 		fields["display_name"] = request.DisplayName
+	case CommandJoinRoom:
+		fields["control_url"] = request.ControlURL
+		fields["display_name"] = request.DisplayName
 	case CommandLeave, CommandConnect, CommandDisconnect:
 		fields["network_id"] = request.NetworkID
 	}
@@ -127,6 +132,14 @@ func DecodeRequest(data []byte) (Request, error) {
 	case CommandJoin:
 		allowed["invite"], allowed["display_name"] = true, true
 		if err := decodeStringField(fields, "invite", &request.Invite); err != nil {
+			return Request{}, errors.Join(ErrInvalidRequest, err)
+		}
+		if err := decodeStringField(fields, "display_name", &request.DisplayName); err != nil {
+			return Request{}, errors.Join(ErrInvalidRequest, err)
+		}
+	case CommandJoinRoom:
+		allowed["control_url"], allowed["display_name"] = true, true
+		if err := decodeStringField(fields, "control_url", &request.ControlURL); err != nil {
 			return Request{}, errors.Join(ErrInvalidRequest, err)
 		}
 		if err := decodeStringField(fields, "display_name", &request.DisplayName); err != nil {
@@ -269,12 +282,19 @@ func DecodeResponse(data []byte) (Response, error) {
 func validateRequest(request Request) error {
 	switch request.Type {
 	case CommandStatus:
-		if request.Invite != "" || request.DisplayName != "" || request.NetworkID != "" {
+		if request.Invite != "" || request.DisplayName != "" || request.ControlURL != "" || request.NetworkID != "" {
 			return errors.New("status has no arguments")
 		}
 	case CommandJoin:
 		if strings.TrimSpace(request.Invite) == "" || strings.TrimSpace(request.DisplayName) == "" {
 			return errors.New("join requires invite and display_name")
+		}
+	case CommandJoinRoom:
+		if strings.TrimSpace(request.ControlURL) == "" || strings.TrimSpace(request.DisplayName) == "" {
+			return errors.New("join_room requires control_url and display_name")
+		}
+		if request.Invite != "" || request.NetworkID != "" {
+			return errors.New("join_room has no invite or network_id")
 		}
 	case CommandLeave, CommandConnect, CommandDisconnect:
 		if strings.TrimSpace(request.NetworkID) == "" {

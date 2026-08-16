@@ -22,18 +22,25 @@ func (store *fakeIdentityStore) LoadOrCreate() (identity.Identity, error) {
 }
 
 type fakeControlClient struct {
-	joinCalls   int
-	leaveCalls  int
-	joinResult  JoinResult
-	joinErr     error
-	leaveErr    error
-	snapshot    control.NetworkSnapshot
-	snapshotErr error
+	joinCalls      int
+	roomJoinCalls  int
+	leaveCalls     int
+	joinResult     JoinResult
+	roomJoinResult JoinResult
+	joinErr        error
+	leaveErr       error
+	snapshot       control.NetworkSnapshot
+	snapshotErr    error
 }
 
 func (client *fakeControlClient) Join(context.Context, JoinRequest) (JoinResult, error) {
 	client.joinCalls++
 	return client.joinResult, client.joinErr
+}
+
+func (client *fakeControlClient) JoinRoom(context.Context, JoinRequest) (JoinResult, error) {
+	client.roomJoinCalls++
+	return client.roomJoinResult, client.joinErr
 }
 
 func (client *fakeControlClient) Leave(context.Context, string) error {
@@ -70,12 +77,13 @@ type fakeSnapshotApplier struct {
 	applyCalls   int
 	clearCalls   int
 	lastSnapshot control.NetworkSnapshot
+	applyErr     error
 }
 
 func (applier *fakeSnapshotApplier) Apply(_ context.Context, snapshot control.NetworkSnapshot) error {
 	applier.applyCalls++
 	applier.lastSnapshot = snapshot
-	return nil
+	return applier.applyErr
 }
 
 func (applier *fakeSnapshotApplier) Clear(context.Context) error {
@@ -114,6 +122,71 @@ func TestServiceLoadsIdentityAndRejectsDuplicateJoin(t *testing.T) {
 	}
 	if controlClient.joinCalls != 1 {
 		t.Fatalf("control Join calls = %d, want 1", controlClient.joinCalls)
+	}
+}
+
+func TestServiceJoinsRoomWithoutInvite(t *testing.T) {
+	controlClient := &fakeControlClient{
+		roomJoinResult: JoinResult{NetworkID: "room-1", VirtualIPv4: "10.42.0.9", ConfigGeneration: 2},
+	}
+	service := New(Options{
+		Identity:   &fakeIdentityStore{identity: identity.Identity{PublicKey: "public-key"}},
+		Control:    controlClient,
+		ControlURL: "http://[2001:db8::1]:8080",
+		Adapter:    &fakeAdapter{},
+	})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	response := service.Handle(context.Background(), ipc.Request{
+		Type:        ipc.CommandJoinRoom,
+		ControlURL:  "http://[2001:db8::1]:8080",
+		DisplayName: "MEMBER-PC",
+	})
+	if !response.OK || response.NetworkID != "room-1" || controlClient.roomJoinCalls != 1 {
+		t.Fatalf("room join response=%#v calls=%d", response, controlClient.roomJoinCalls)
+	}
+}
+
+func TestServiceRejectsRoomURLMismatchBeforeControlCall(t *testing.T) {
+	controlClient := &fakeControlClient{roomJoinResult: JoinResult{NetworkID: "room-1", VirtualIPv4: "10.42.0.9"}}
+	service := New(Options{
+		Identity:   &fakeIdentityStore{identity: identity.Identity{PublicKey: "public-key"}},
+		Control:    controlClient,
+		ControlURL: "http://[2001:db8::1]:8080",
+		Adapter:    &fakeAdapter{},
+	})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	response := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandJoinRoom, ControlURL: "http://[2001:db8::2]:8080", DisplayName: "MEMBER-PC"})
+	if response.OK || response.Error == nil || response.Error.Code != ipc.CodeInvalidRequest || controlClient.roomJoinCalls != 0 {
+		t.Fatalf("mismatch response=%#v calls=%d", response, controlClient.roomJoinCalls)
+	}
+}
+
+func TestServiceRoomJoinRollsBackAfterSnapshotFailure(t *testing.T) {
+	controlClient := &fakeControlClient{
+		roomJoinResult: JoinResult{NetworkID: "room-1", VirtualIPv4: "10.42.0.9", ConfigGeneration: 2},
+		snapshot:       control.NetworkSnapshot{NetworkID: "room-1", Generation: 2, LocalNodeID: "node-1", LocalVirtualIPv4: net.ParseIP("10.42.0.9")},
+	}
+	reconciler := &fakeSnapshotApplier{applyErr: errors.New("apply failed")}
+	service := New(Options{
+		Identity:   &fakeIdentityStore{identity: identity.Identity{PublicKey: "public-key"}},
+		Control:    controlClient,
+		ControlURL: "http://[2001:db8::1]:8080",
+		Reconciler: reconciler,
+	})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	response := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandJoinRoom, ControlURL: "http://[2001:db8::1]:8080", DisplayName: "MEMBER-PC"})
+	if response.OK || response.Error == nil || response.Error.Code != CodeAdapterFailed || controlClient.leaveCalls != 1 {
+		t.Fatalf("rollback response=%#v leaves=%d", response, controlClient.leaveCalls)
+	}
+	status := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandStatus})
+	if status.OK && status.NetworkID != "" {
+		t.Fatalf("room state retained after rollback: %#v", status)
 	}
 }
 

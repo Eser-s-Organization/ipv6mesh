@@ -70,11 +70,21 @@ func runService(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	localService := service.New(service.Options{Identity: identityStore, Control: controlBridge, Adapter: dataPlane, Reconciler: dataPlane.Applier})
+	localService := service.New(localServiceOptions(identityStore, controlBridge, dataPlane, dataPlane.Applier, controlURL))
 	if err := service.ServeWindows(ctx, localService, `\\.\pipe\ipv6mesh`, localPipeAuthorizer{}); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
 	return nil
+}
+
+func localServiceOptions(identityStore service.IdentityStore, controlBridge service.ControlClient, adapter service.Adapter, reconciler service.SnapshotApplier, controlURL string) service.Options {
+	return service.Options{
+		Identity:   identityStore,
+		Control:    controlBridge,
+		ControlURL: controlURL,
+		Adapter:    adapter,
+		Reconciler: reconciler,
+	}
 }
 
 func serviceDataDirectory() string {

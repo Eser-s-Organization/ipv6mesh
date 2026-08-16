@@ -5,6 +5,8 @@ package main
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/Eser-s-Organization/ipv6mesh/internal/service"
 )
 
 func TestServiceDataDirectoryUsesExplicitEnvironmentValue(t *testing.T) {
@@ -22,4 +24,13 @@ func TestServiceDataDirectoryUsesProgramDataFallback(t *testing.T) {
 	if got := serviceDataDirectory(); got != want {
 		t.Fatalf("service data directory = %q, want %q", got, want)
 	}
+}
+
+func TestLocalServiceOptionsCarryRoomControlURL(t *testing.T) {
+	const controlURL = "http://[2001:db8::1]:8080"
+	options := localServiceOptions(nil, nil, nil, nil, controlURL)
+	if options.ControlURL != controlURL {
+		t.Fatalf("service control URL = %q, want %q", options.ControlURL, controlURL)
+	}
+	var _ service.Options = options
 }

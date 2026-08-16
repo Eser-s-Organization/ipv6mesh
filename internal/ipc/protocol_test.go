@@ -1,6 +1,7 @@
 package ipc
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -28,6 +29,37 @@ func TestDecodeRequestAcceptsSupportedCommands(t *testing.T) {
 				t.Fatalf("request type = %q, want %q", request.Type, test.type_)
 			}
 		})
+	}
+}
+
+func TestJoinRoomRequestRoundTrip(t *testing.T) {
+	request := Request{
+		Type:        CommandJoinRoom,
+		ControlURL:  "http://[2001:db8::1]:8080",
+		DisplayName: "MEMBER-PC",
+	}
+	encoded, err := MarshalRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeRequest(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded != request {
+		t.Fatalf("decoded = %#v, want %#v", decoded, request)
+	}
+}
+
+func TestJoinRoomRejectsMissingAndUnknownFields(t *testing.T) {
+	for _, value := range []string{
+		`{"type":"join_room","display_name":"MEMBER-PC"}`,
+		`{"type":"join_room","control_url":"http://[2001:db8::1]:8080"}`,
+		`{"type":"join_room","control_url":"http://[2001:db8::1]:8080","display_name":"MEMBER-PC","invite":"secret"}`,
+	} {
+		if _, err := DecodeRequest([]byte(value)); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("DecodeRequest(%s) error = %v", value, err)
+		}
 	}
 }
 
