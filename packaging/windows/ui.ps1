@@ -293,6 +293,10 @@ function Convert-ResultToJson {
     param([Parameter(Mandatory = $true)]$Result, [Parameter(Mandatory = $true)][string]$Operation)
     if ($Result.ExitCode -ne 0) {
         $stderr = [string]$Result.Stderr
+        if ($stderr -match 'HTTP status 401\s*\(unauthorized\)') {
+            $hint = '管理员令牌无效或与控制面启动令牌不一致。健康检查只验证连接，不验证管理员身份。请填入启动该控制面时使用的令牌；如果控制面是本机旧进程，请先停止旧 control-server.exe，再用当前令牌点击“启动控制面”。'
+            throw ("{0} 失败：{1}" -f $Operation, $hint)
+        }
         if ($stderr -match 'HTTP status 404\s*\(not_found\)') {
             $hint = 'Network ID 不存在。请先点击“创建网络”；如果使用已有网络，请确认 Network ID 和控制面 URL。'
             throw ("{0} 失败：{1}" -f $Operation, $hint)

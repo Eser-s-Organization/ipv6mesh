@@ -20,7 +20,7 @@ The v0.1 scope is virtual IPv4 node-to-node access, IPv6 Direct connectivity, an
 - **游戏房主**：启动游戏并作为第一台 VPN 节点加入网络
 - **成员**：使用自己的邀请令牌加入同一个 VPN 网络
 
-最简单的情况是：第一台电脑同时担任控制面管理员和游戏房主；第二台电脑是成员。新版 `v0.1.0-debug.11` 将三种角色统一放在一个中文可视化界面中，普通成员只需要双击 `.exe`，不需要打开 PowerShell，也不需要使用 `vpnctl`。
+最简单的情况是：第一台电脑同时担任控制面管理员和游戏房主；第二台电脑是成员。新版 `v0.1.0-debug.12` 将三种角色统一放在一个中文可视化界面中，普通成员只需要双击 `.exe`，不需要打开 PowerShell，也不需要使用 `vpnctl`。
 
 > ⚠️ 控制面必须先运行，节点安装器不会自动创建控制面。控制面可以运行在房主电脑、另一台服务器或具有全球 IPv6 的 VPS 上。
 
@@ -63,9 +63,9 @@ flowchart LR
 
 ### 1. 首选：使用统一中文 UI
 
-下载 [v0.1.0-debug.11 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.11/ipv6mesh-installer-0.1.0-debug.11.exe)。双击后在 UAC 对话框中点击“是”。程序会打开“IPv6Mesh 远程组网”窗口，顶部可以切换三种角色。SHA-256 以发布页中的 `.sha256` 文件为准。
+下载 [v0.1.0-debug.12 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.12/ipv6mesh-installer-0.1.0-debug.12.exe)。双击后在 UAC 对话框中点击“是”。程序会打开“IPv6Mesh 远程组网”窗口，顶部可以切换三种角色。SHA-256 以发布页中的 `.sha256` 文件为准。
 
-如果旧版 `.5`、`.6`、`.7`、`.8`、`.9` 或 `.10` 弹出 `run Chinese IPv6Mesh UI: exit status 1`，请改用 `.11`；`.11` 还会在控制面尚未启动或刚启动时给出明确提示，明确区分“随机生成 Network ID”和“创建网络”，并提供 Network ID、管理员令牌和邀请令牌的随机生成/一键复制按钮。`.11` 启动控制面和 `vpnctl` 时优先使用本次安装器携带的当前载荷，避免旧安装文件覆盖新版本。
+如果旧版 `.5`、`.6`、`.7`、`.8`、`.9`、`.10` 或 `.11` 弹出 `run Chinese IPv6Mesh UI: exit status 1`，请改用 `.12`；`.12` 还会在控制面尚未启动或刚启动时给出明确提示，明确区分“随机生成 Network ID”和“创建网络”，并提供 Network ID、管理员令牌和邀请令牌的随机生成/一键复制按钮。`.12` 启动控制面和 `vpnctl` 时优先使用本次安装器携带的当前载荷，避免旧安装文件覆盖新版本；管理员令牌错误时会明确提示“健康检查只验证连接，不验证管理员身份”。
 
 | UI 角色 | 主要按钮和操作 |
 | --- | --- |
@@ -204,7 +204,7 @@ Member invite: <member-one-time-token>
 
 以第一台 Windows 11 作为游戏房主为例：
 
-1. 下载 [v0.1.0-debug.11 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.11/ipv6mesh-installer-0.1.0-debug.11.exe)
+1. 下载 [v0.1.0-debug.12 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.12/ipv6mesh-installer-0.1.0-debug.12.exe)
 2. 双击运行，Windows UAC 弹出后点击“是”，选择角色“游戏房主”
 3. 在 UI 中输入：
 
@@ -300,9 +300,10 @@ UI 日志会记录安装脚本、`control-server.exe`、`vpnctl`、健康检查�
 
 - **控制面连接失败**：管理员应先点击“启动控制面”，等待 UI 提示健康检查通过；再确认控制面进程仍在运行、TCP 端口已放行、IPv6 地址可达，并且 URL 使用 `http://[IPv6]:8080` 格式。控制面刚启动时请等待几秒再检查。
 - **`HTTP status 404 (not_found)` 或“Network ID 不存在”**：只点击“随机生成”不会创建网络。管理员必须先点击“创建网络”，确认日志出现“网络已创建”，再生成房主/成员邀请；如果使用已有网络，请确认 Network ID 和控制面 URL 属于同一个控制面。
+- **`HTTP status 401 (unauthorized)` 或“管理员令牌无效或与控制面启动令牌不一致”**：`/healthz` 返回 200 只表示控制面端口可达，不表示管理员令牌正确。请使用启动该控制面时设置的同一个管理员令牌。如果控制面是本机上一次运行遗留的旧 `control-server.exe`，先停止旧进程，再在当前 UI 中使用当前令牌点击“启动控制面”；看到“控制面已就绪，健康检查通过”后再点击“创建网络”。不要仅点击“检查健康”后直接创建网络，也不要在控制面启动后重新生成令牌。
 - **`invite already used`**：令牌已经被成功使用或已经过期，管理员需要为该设备生成新令牌
-- **`open \\.\pipe\ipv6mesh`**：服务没有成功安装或没有运行，重新双击 `.11` 并确认 UAC 已授权；可在 UI 中点击“刷新状态”查看日志
-- **旧版本提示文件正在使用**：使用 `.11`；安装脚本会先停止旧服务并等待文件解锁，UI 关闭时也会停止服务并清理虚拟网络资源
+- **`open \\.\pipe\ipv6mesh`**：服务没有成功安装或没有运行，重新双击 `.12` 并确认 UAC 已授权；可在 UI 中点击“刷新状态”查看日志
+- **旧版本提示文件正在使用**：使用 `.12`；安装脚本会先停止旧服务并等待文件解锁，UI 关闭时也会停止服务并清理虚拟网络资源
 - **控制面重启后网络消失**：当前示例使用内存仓库，测试数据随控制面进程退出而丢失；需要长期使用时应部署 PostgreSQL
 - **两台都显示已连接但游戏找不到房间**：先用虚拟 IPv4 和游戏端口测试，再检查游戏的 LAN 发现机制和 Windows 防火墙
 - **虚拟 IPv4 与本地 IPv4 不同**：这是预期行为；游戏应在支持的情况下使用 `Virtual IPv4`，不要使用 `10.20.x.x` 等物理局域网地址
