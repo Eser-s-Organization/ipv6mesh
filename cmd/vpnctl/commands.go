@@ -66,13 +66,13 @@ func parseCommand(args []string) (command, error) {
 		return command{Kind: serviceCommand, Service: request}, nil
 	case "network":
 		if len(args) < 2 || args[1] != "create" {
-			return command{}, errors.New("usage: vpnctl network create --name <name> --pool <cidr>")
+			return command{}, errors.New("usage: vpnctl network create --name <name> --pool <cidr> [--id <network-id>]")
 		}
-		values, err := parseOptions(args[2:], map[string]struct{}{"--name": {}, "--pool": {}})
+		values, err := parseOptions(args[2:], map[string]struct{}{"--name": {}, "--pool": {}, "--id": {}}, "--name", "--pool")
 		if err != nil {
 			return command{}, err
 		}
-		return command{Kind: controlCommand, NetworkName: values["--name"], Pool: values["--pool"]}, nil
+		return command{Kind: controlCommand, NetworkName: values["--name"], Pool: values["--pool"], NetworkID: values["--id"]}, nil
 	case "invite":
 		if len(args) < 2 || args[1] != "create" {
 			return command{}, errors.New("usage: vpnctl invite create --network <id> --expires <duration>")
@@ -98,7 +98,7 @@ func parseArgs(args []string) (ipc.Request, error) {
 	return parsed.Service, nil
 }
 
-func parseOptions(args []string, allowed map[string]struct{}) (map[string]string, error) {
+func parseOptions(args []string, allowed map[string]struct{}, required ...string) (map[string]string, error) {
 	values := make(map[string]string, len(allowed))
 	for index := 0; index < len(args); index++ {
 		name := args[index]
@@ -117,7 +117,16 @@ func parseOptions(args []string, allowed map[string]struct{}) (map[string]string
 		values[name] = args[index+1]
 		index++
 	}
-	for name := range allowed {
+	if len(required) == 0 {
+		required = make([]string, 0, len(allowed))
+		for name := range allowed {
+			required = append(required, name)
+		}
+	}
+	for _, name := range required {
+		if _, ok := allowed[name]; !ok {
+			return nil, fmt.Errorf("option %q is not allowed", name)
+		}
 		if strings.TrimSpace(values[name]) == "" {
 			return nil, fmt.Errorf("option %q is required", name)
 		}

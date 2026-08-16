@@ -93,6 +93,17 @@ function Generate-AdminToken {
     }
 }
 
+function Generate-NetworkId {
+    try {
+        $script:networkIdBox.Text = New-RandomToken -ByteCount 16
+        Add-UiLog "已在本机用密码学随机数生成 Network ID；创建网络时会使用该 ID。"
+        Set-UiStatus "Network ID 已随机生成" ([System.Drawing.Color]::ForestGreen)
+    } catch {
+        Add-UiLog "随机生成 Network ID 失败：$($_.Exception.Message)" "错误"
+        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("随机生成 Network ID 失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    }
+}
+
 function Get-DetectedIPv6Address {
     try {
         $addresses = @(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction Stop)
@@ -307,7 +318,7 @@ function Test-ControlHealth {
         $url = Assert-ControlUrl
         $request = [System.Net.HttpWebRequest]::Create($url + "/healthz")
         $request.Proxy = $null
-        $request.Timeout = 15000
+        $request.Timeout = 5000
         $response = $request.GetResponse()
         try {
             $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
@@ -320,7 +331,7 @@ function Test-ControlHealth {
         return $true
     } catch {
         if (!$Quiet) {
-            $webException = $_.Exception -as [System.Net.WebException]
+            $webException = Get-WebException $_.Exception
             if ($null -ne $webException -and $script:controlProcess -and !$script:controlProcess.HasExited) {
                 Add-UiLog "控制面进程已启动，但监听端口尚未就绪；请等待片刻后再次检查。" "警告"
             } elseif ($null -ne $webException) {
@@ -332,6 +343,15 @@ function Test-ControlHealth {
         }
         return $false
     }
+}
+
+function Get-WebException {
+    param([AllowNull()][object]$Exception)
+    while ($null -ne $Exception) {
+        if ($Exception -is [System.Net.WebException]) { return $Exception }
+        $Exception = $Exception.InnerException
+    }
+    return $null
 }
 
 function Wait-ControlPlaneReady {
@@ -483,10 +503,16 @@ function Create-Network {
     try {
         $null = Assert-ControlUrl
         if ((Get-BoxText $script:adminTokenBox) -eq "") { throw "请先填写管理员令牌。" }
+        if (!(Test-ControlHealth)) { throw "控制面不可访问，请先点击启动控制面按钮，等待健康检查通过后再创建网络。" }
         $name = Get-BoxText $script:networkNameBox
         $pool = Get-BoxText $script:poolBox
         if ($name -eq "" -or $pool -eq "") { throw "网络名称和 IPv4 地址池不能为空。" }
-        $result = Invoke-VpnCtl -Arguments @("network", "create", "--name", $name, "--pool", $pool)
+        $networkId = Get-BoxText $script:networkIdBox
+        if ($networkId -eq "") {
+            Generate-NetworkId
+            $networkId = Get-BoxText $script:networkIdBox
+        }
+        $result = Invoke-VpnCtl -Arguments @("network", "create", "--name", $name, "--pool", $pool, "--id", $networkId)
         $network = Convert-ResultToJson $result "创建网络"
         $script:networkIdBox.Text = [string]$network.id
         Add-UiLog "网络已创建：$($network.name)，Network ID：$($network.id)；成员加入时将从 $pool 随机分配虚拟 IPv4。"
@@ -502,6 +528,7 @@ function Create-Invite {
     try {
         $null = Assert-ControlUrl
         if ((Get-BoxText $script:adminTokenBox) -eq "") { throw "请先填写管理员令牌。" }
+        if (!(Test-ControlHealth)) { throw "控制面不可访问，请先点击启动控制面按钮，等待健康检查通过后再生成邀请。" }
         $networkId = Get-BoxText $script:networkIdBox
         $expiry = Get-BoxText $script:expiryBox
         if ($networkId -eq "") { throw "请先创建网络，或填写已有 Network ID。" }
@@ -633,8 +660,13 @@ function Copy-UiField {
         [void][System.Windows.Forms.MessageBox]::Show($script:form, "$Description 为空。", "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
         return
     }
-    [System.Windows.Forms.Clipboard]::SetText($value)
-    Add-UiLog "已复制 $Description；日志不会记录其正文。"
+    try {
+        [System.Windows.Forms.Clipboard]::SetText($value)
+        Add-UiLog "已复制 $Description；日志不会记录其正文。"
+    } catch {
+        Add-UiLog "复制 $Description 失败：$($_.Exception.Message)" "错误"
+        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("复制" + $Description + "失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    }
 }
 
 function Export-UiLog {
@@ -742,15 +774,18 @@ $script:listenAddressBox = New-TextBox 120 94 230 -ReadOnly
 $script:listenAddressBox.Text = "[::]:$initialPort"
 $controlGroup.Controls.Add($script:listenAddressBox)
 $controlGroup.Controls.Add((New-Label "管理员令牌：" 370 97 105 25))
-$script:adminTokenBox = New-TextBox 475 94 300 -Password
+$script:adminTokenBox = New-TextBox 475 94 230 -Password
 $controlGroup.Controls.Add($script:adminTokenBox)
-$randomAdminButton = New-Button "随机生成" 785 92 100
+$randomAdminButton = New-Button "随机生成" 710 92 95
 $randomAdminButton.Add_Click({ Generate-AdminToken })
 $controlGroup.Controls.Add($randomAdminButton)
-$startControlButton = New-Button "启动控制面" 895 92 105
+$copyAdminButton = New-Button "复制管理员令牌" 810 92 115
+$copyAdminButton.Add_Click({ Copy-UiField $script:adminTokenBox "管理员令牌" })
+$controlGroup.Controls.Add($copyAdminButton)
+$startControlButton = New-Button "启动控制面" 930 92 90
 $startControlButton.Add_Click({ Start-ControlPlane })
 $controlGroup.Controls.Add($startControlButton)
-$stopControlButton = New-Button "停止控制面" 1010 92 105
+$stopControlButton = New-Button "停止控制面" 1025 92 90
 $stopControlButton.Add_Click({ Stop-ControlPlane; Set-UiStatus "控制面已停止" ([System.Drawing.Color]::DarkOrange) })
 $controlGroup.Controls.Add($stopControlButton)
 $controlGroup.Controls.Add((New-Label "网络名称：" 15 132 105 25))
@@ -769,10 +804,16 @@ $createNetworkButton = New-Button "创建网络" 860 126 110
 $createNetworkButton.Add_Click({ Create-Network })
 $controlGroup.Controls.Add($createNetworkButton)
 $controlGroup.Controls.Add((New-Label "Network ID：" 15 167 105 25))
-$script:networkIdBox = New-TextBox 120 164 650
+$script:networkIdBox = New-TextBox 120 164 600
 $script:networkIdBox.Text = $Network
 $controlGroup.Controls.Add($script:networkIdBox)
-$controlGroup.Controls.Add((New-Label "加入时由控制面随机分配虚拟 IPv4，分配后保持不变。" 785 167 330 38))
+$randomNetworkButton = New-Button "随机生成" 730 164 100
+$randomNetworkButton.Add_Click({ Generate-NetworkId })
+$controlGroup.Controls.Add($randomNetworkButton)
+$copyNetworkButton = New-Button "复制 Network ID" 840 164 115
+$copyNetworkButton.Add_Click({ Copy-UiField $script:networkIdBox "Network ID" })
+$controlGroup.Controls.Add($copyNetworkButton)
+$controlGroup.Controls.Add((New-Label "虚拟 IPv4 由控制面随机分配并保持不变。" 965 167 150 38))
 $controlGroup.Controls.Add((New-Label "房主邀请：" 15 202 105 25))
 $script:hostInviteBox = New-TextBox 120 199 650 -Password -ReadOnly
 $controlGroup.Controls.Add($script:hostInviteBox)

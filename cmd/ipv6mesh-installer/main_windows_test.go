@@ -147,7 +147,7 @@ func TestWindowsPackageIncludesChineseUI(t *testing.T) {
 		"游戏成员",
 		"Get-NetIPAddress -AddressFamily IPv6",
 		"Update-ControlEndpoint",
-		"加入时由控制面随机分配虚拟 IPv4",
+		"虚拟 IPv4 由控制面随机分配并保持不变",
 		"Stop-AllResources",
 		"Stop-NodeService",
 		"network",
@@ -180,6 +180,13 @@ func TestWindowsUIUsesRandomTokensAndActionableHealthCheck(t *testing.T) {
 		"密码学随机数",
 		"Wait-ControlPlaneReady",
 		"请先点击\"启动控制面\"",
+		"Get-WebException",
+		"随机生成 Network ID",
+		"复制管理员令牌",
+		"复制 Network ID",
+		"复制房主令牌",
+		"复制成员令牌",
+		"--id",
 	} {
 		if !strings.Contains(contents, required) {
 			t.Fatalf("UI script missing %q", required)

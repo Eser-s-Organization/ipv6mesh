@@ -21,6 +21,9 @@ func TestAdminClientCreatesNetworkAndInviteWithBearerToken(t *testing.T) {
 			if body["name"] != "mesh" || body["pool"] != "10.42.0.0/24" {
 				t.Errorf("network body = %#v", body)
 			}
+			if body["id"] != "" && body["id"] != "requested-network-id" {
+				t.Errorf("network id = %#v", body["id"])
+			}
 			writeTestJSON(writer, http.StatusCreated, map[string]any{"id": "network-1", "name": "mesh", "pool": "10.42.0.0/24", "ipv4_pool": "10.42.0.0/24", "owner_id": "owner", "config_version": 1, "created_at": "2026-08-11T12:00:00Z"})
 			return
 		}
@@ -49,6 +52,13 @@ func TestAdminClientCreatesNetworkAndInviteWithBearerToken(t *testing.T) {
 	}
 	if network.ID != "network-1" || network.IPv4Pool != "10.42.0.0/24" {
 		t.Fatalf("unexpected network result: %#v", network)
+	}
+	requested, err := client.CreateNetworkWithID(context.Background(), "mesh", "10.42.0.0/24", "requested-network-id", "admin-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requested.ID != "network-1" {
+		t.Fatalf("unexpected requested network result: %#v", requested)
 	}
 	invite, err := client.CreateInvite(context.Background(), network.ID, "1h", "admin-token")
 	if err != nil {

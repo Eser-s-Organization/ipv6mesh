@@ -238,6 +238,27 @@ func TestHTTPMilestoneCreatesInvitesEnrollsSnapshotsAndDeletesNode(t *testing.T)
 	}
 }
 
+func TestHTTPCreateNetworkAcceptsValidRequestedID(t *testing.T) {
+	repository := db.NewMemoryRepository()
+	ids := &testIDSource{values: []string{"fallback-id"}}
+	handler := control.NewHandler(repository, control.HandlerOptions{
+		BootstrapToken: "bootstrap-token",
+		NewID:          ids.Next,
+		Clock:          func() time.Time { return httpTestNow },
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/networks", strings.NewReader(`{"id":"ui-generated-id","name":"mesh","pool":"10.42.0.0/29"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer bootstrap-token")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create network status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if got := objectString(t, responseObject(t, httpResponse{StatusCode: response.Code, Body: response.Body.String()}), "id"); got != "ui-generated-id" {
+		t.Fatalf("network id = %q, want ui-generated-id", got)
+	}
+}
+
 func TestHTTPMapsCredentialResourceAndJSONErrors(t *testing.T) {
 	fixture := newHTTPFixture(t, "10.42.0.0/29")
 	tests := []struct {

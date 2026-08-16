@@ -21,6 +21,7 @@ func TestParseCommandCoversServiceAndControlCommands(t *testing.T) {
 		{name: "status", args: []string{"status"}, kind: serviceCommand, want: ipc.CommandStatus},
 		{name: "join", args: []string{"join", "--invite", "invite-token", "--name", "Alice"}, kind: serviceCommand, want: ipc.CommandJoin},
 		{name: "network create", args: []string{"network", "create", "--name", "mesh", "--pool", "10.42.0.0/24"}, kind: controlCommand},
+		{name: "network create with id", args: []string{"network", "create", "--name", "mesh", "--pool", "10.42.0.0/24", "--id", "mesh-id"}, kind: controlCommand},
 		{name: "invite create", args: []string{"invite", "create", "--network", "network-1", "--expires", "1h"}, kind: controlCommand},
 	}
 	for _, test := range tests {
@@ -92,10 +93,31 @@ func TestRunControlCommandFormatsAdminResults(t *testing.T) {
 	}
 }
 
-type fakeAdminClient struct{}
+func TestRunControlCommandPassesRequestedNetworkID(t *testing.T) {
+	admin := &fakeAdminClient{}
+	parsed, err := parseCommand([]string{"network", "create", "--name", "mesh", "--pool", "10.42.0.0/24", "--id", "mesh-id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runControlCommand(context.Background(), parsed, &bytes.Buffer{}, admin); err != nil {
+		t.Fatal(err)
+	}
+	if admin.requestedNetworkID != "mesh-id" {
+		t.Fatalf("requested network ID = %q, want mesh-id", admin.requestedNetworkID)
+	}
+}
+
+type fakeAdminClient struct {
+	requestedNetworkID string
+}
 
 func (fakeAdminClient) CreateNetwork(context.Context, string, string, string) (control.Network, error) {
 	return control.Network{ID: "network-1", Name: "mesh", IPv4Pool: "10.42.0.0/24", CreatedAt: time.Now(), OwnerID: "owner"}, nil
+}
+
+func (client *fakeAdminClient) CreateNetworkWithID(_ context.Context, _, _, networkID, _ string) (control.Network, error) {
+	client.requestedNetworkID = networkID
+	return control.Network{ID: networkID, Name: "mesh", IPv4Pool: "10.42.0.0/24", CreatedAt: time.Now(), OwnerID: "owner"}, nil
 }
 
 func (fakeAdminClient) CreateInvite(context.Context, string, string, string) (control.InviteResult, error) {
