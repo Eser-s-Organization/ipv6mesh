@@ -181,6 +181,8 @@ func TestWindowsUIUsesRandomTokensAndActionableHealthCheck(t *testing.T) {
 		"Wait-ControlPlaneReady",
 		"请先点击\"启动控制面\"",
 		"Network ID 不存在",
+		"管理员令牌无效或与控制面启动令牌不一致",
+		"健康检查只验证连接，不验证管理员身份",
 		"Get-WebException",
 		"随机生成 Network ID",
 		"复制管理员令牌",
