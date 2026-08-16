@@ -161,6 +161,32 @@ func TestWindowsPackageIncludesChineseUI(t *testing.T) {
 	}
 }
 
+func TestWindowsUIUsesRandomTokensAndActionableHealthCheck(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	uiScript, err := os.ReadFile(uiPath)
+	if err != nil {
+		t.Fatalf("read UI script: %v", err)
+	}
+	contents := string(uiScript)
+	for _, required := range []string{
+		"New-RandomToken",
+		"随机生成管理员令牌",
+		"随机生成房主邀请",
+		"随机生成成员邀请",
+		"密码学随机数",
+		"Wait-ControlPlaneReady",
+		"请先点击\"启动控制面\"",
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("UI script missing %q", required)
+		}
+	}
+}
+
 func TestInstallScriptStopsExistingServiceBeforeCopyingFiles(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {

@@ -73,6 +73,26 @@ function Get-BoxText {
     return $Box.Text.Trim()
 }
 
+function New-RandomToken {
+    param([int]$ByteCount = 32)
+    if ($ByteCount -lt 16) { throw "随机令牌长度不能少于 16 字节。" }
+    $bytes = New-Object byte[] $ByteCount
+    $random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $random.GetBytes($bytes) } finally { $random.Dispose() }
+    return ([Convert]::ToBase64String($bytes)).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+}
+
+function Generate-AdminToken {
+    try {
+        $script:adminTokenBox.Text = New-RandomToken
+        Add-UiLog "已在本机用密码学随机数生成管理员令牌；令牌不会写入日志。"
+        Set-UiStatus "管理员令牌已随机生成" ([System.Drawing.Color]::ForestGreen)
+    } catch {
+        Add-UiLog "随机生成管理员令牌失败：$($_.Exception.Message)" "错误"
+        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("随机生成管理员令牌失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    }
+}
+
 function Get-DetectedIPv6Address {
     try {
         $addresses = @(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction Stop)
@@ -282,6 +302,7 @@ function Invoke-VpnCtl {
 }
 
 function Test-ControlHealth {
+    param([switch]$Quiet)
     try {
         $url = Assert-ControlUrl
         $request = [System.Net.HttpWebRequest]::Create($url + "/healthz")
@@ -291,15 +312,46 @@ function Test-ControlHealth {
         try {
             $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
             try { $body = $reader.ReadToEnd().Trim() } finally { $reader.Dispose() }
-            Add-UiLog "控制面健康检查：HTTP $([int]$response.StatusCode)，响应：$body"
-            Set-UiStatus "控制面可访问" ([System.Drawing.Color]::ForestGreen)
+            if (!$Quiet) {
+                Add-UiLog "控制面健康检查：HTTP $([int]$response.StatusCode)，响应：$body"
+                Set-UiStatus "控制面可访问" ([System.Drawing.Color]::ForestGreen)
+            }
         } finally { $response.Dispose() }
         return $true
     } catch {
-        Add-UiLog "控制面健康检查失败：$($_.Exception.Message)" "错误"
-        Set-UiStatus "控制面不可访问" ([System.Drawing.Color]::Firebrick)
+        if (!$Quiet) {
+            $webException = $_.Exception -as [System.Net.WebException]
+            if ($null -ne $webException -and $script:controlProcess -and !$script:controlProcess.HasExited) {
+                Add-UiLog "控制面进程已启动，但监听端口尚未就绪；请等待片刻后再次检查。" "警告"
+            } elseif ($null -ne $webException) {
+                Add-UiLog '无法连接控制面：请确认控制面已经运行；如果控制面在本机，请先点击"启动控制面"。' "警告"
+            } else {
+                Add-UiLog "控制面健康检查失败：$($_.Exception.Message)" "错误"
+            }
+            Set-UiStatus "控制面不可访问" ([System.Drawing.Color]::Firebrick)
+        }
         return $false
     }
+}
+
+function Wait-ControlPlaneReady {
+    param([int]$TimeoutSeconds = 10)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        if ($script:controlProcess -and $script:controlProcess.HasExited) {
+            Add-UiLog "控制面进程已退出，未能完成健康检查。请查看控制面日志。" "错误"
+            return $false
+        }
+        if (Test-ControlHealth -Quiet) {
+            Add-UiLog "控制面已就绪，健康检查通过。"
+            Set-UiStatus "控制面可访问" ([System.Drawing.Color]::ForestGreen)
+            return $true
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    Add-UiLog "控制面进程已启动，但 $TimeoutSeconds 秒内仍未响应 /healthz；可稍后点击“检查健康”。" "警告"
+    Set-UiStatus "控制面等待中" ([System.Drawing.Color]::DarkOrange)
+    return $false
 }
 
 function Open-ControlFirewall {
@@ -367,7 +419,8 @@ function Start-ControlPlane {
         $script:controlProcess = $process
         Add-UiLog "控制面已启动：$($psi.FileName)"
         Add-UiLog "监听地址：$listenAddress；当前使用内存仓库。"
-        Set-UiStatus "控制面运行中" ([System.Drawing.Color]::ForestGreen)
+        Set-UiStatus "控制面启动中" ([System.Drawing.Color]::DarkOrange)
+        [void](Wait-ControlPlaneReady)
     } catch {
         Add-UiLog "启动控制面失败：$($_.Exception.Message)" "错误"
         [void][System.Windows.Forms.MessageBox]::Show($script:form, ("启动控制面失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
@@ -457,7 +510,7 @@ function Create-Invite {
         $inviteResult = Convert-ResultToJson $result "生成$Role邀请"
         if ($Role -eq "房主") { $script:hostInviteBox.Text = [string]$inviteResult.token }
         else { $script:memberInviteBox.Text = [string]$inviteResult.token }
-        Add-UiLog "$Role邀请已生成，令牌已放入专用框；日志不会记录令牌正文。"
+        Add-UiLog "$Role邀请已由控制面使用密码学随机数生成，令牌已放入专用框；日志不会记录令牌正文。"
         Set-UiStatus "$Role邀请已生成" ([System.Drawing.Color]::ForestGreen)
     } catch {
         Add-UiLog "生成$Role邀请失败：$($_.Exception.Message)" "错误"
@@ -662,7 +715,7 @@ $script:roleHintLabel.ForeColor = [System.Drawing.Color]::DimGray
 $script:form.Controls.Add($script:roleHintLabel)
 
 $controlGroup = New-Object System.Windows.Forms.GroupBox
-$controlGroup.Text = "一、控制面和网络管理（管理员）"
+$controlGroup.Text = "一、控制面和网络管理（管理员；邀请令牌由控制面随机生成）"
 $controlGroup.Location = New-Object System.Drawing.Point(10, 70)
 $controlGroup.Size = New-Object System.Drawing.Size(1140, 275)
 $script:form.Controls.Add($controlGroup)
@@ -691,10 +744,13 @@ $controlGroup.Controls.Add($script:listenAddressBox)
 $controlGroup.Controls.Add((New-Label "管理员令牌：" 370 97 105 25))
 $script:adminTokenBox = New-TextBox 475 94 300 -Password
 $controlGroup.Controls.Add($script:adminTokenBox)
-$startControlButton = New-Button "启动控制面" 790 92 110
+$randomAdminButton = New-Button "随机生成" 785 92 100
+$randomAdminButton.Add_Click({ Generate-AdminToken })
+$controlGroup.Controls.Add($randomAdminButton)
+$startControlButton = New-Button "启动控制面" 895 92 105
 $startControlButton.Add_Click({ Start-ControlPlane })
 $controlGroup.Controls.Add($startControlButton)
-$stopControlButton = New-Button "停止控制面" 910 92 110
+$stopControlButton = New-Button "停止控制面" 1010 92 105
 $stopControlButton.Add_Click({ Stop-ControlPlane; Set-UiStatus "控制面已停止" ([System.Drawing.Color]::DarkOrange) })
 $controlGroup.Controls.Add($stopControlButton)
 $controlGroup.Controls.Add((New-Label "网络名称：" 15 132 105 25))
@@ -720,19 +776,19 @@ $controlGroup.Controls.Add((New-Label "加入时由控制面随机分配虚拟 I
 $controlGroup.Controls.Add((New-Label "房主邀请：" 15 202 105 25))
 $script:hostInviteBox = New-TextBox 120 199 650 -Password -ReadOnly
 $controlGroup.Controls.Add($script:hostInviteBox)
-$hostInviteButton = New-Button "生成房主邀请" 785 196 125
+$hostInviteButton = New-Button "随机生成房主邀请" 785 196 145
 $hostInviteButton.Add_Click({ Create-Invite "房主" })
 $controlGroup.Controls.Add($hostInviteButton)
-$copyHostButton = New-Button "复制房主令牌" 920 196 125
+$copyHostButton = New-Button "复制房主令牌" 940 196 125
 $copyHostButton.Add_Click({ Copy-UiField $script:hostInviteBox "房主邀请令牌" })
 $controlGroup.Controls.Add($copyHostButton)
 $controlGroup.Controls.Add((New-Label "成员邀请：" 15 237 105 25))
 $script:memberInviteBox = New-TextBox 120 234 650 -Password -ReadOnly
 $controlGroup.Controls.Add($script:memberInviteBox)
-$memberInviteButton = New-Button "生成成员邀请" 785 231 125
+$memberInviteButton = New-Button "随机生成成员邀请" 785 231 145
 $memberInviteButton.Add_Click({ Create-Invite "成员" })
 $controlGroup.Controls.Add($memberInviteButton)
-$copyMemberButton = New-Button "复制成员令牌" 920 231 125
+$copyMemberButton = New-Button "复制成员令牌" 940 231 125
 $copyMemberButton.Add_Click({ Copy-UiField $script:memberInviteBox "成员邀请令牌" })
 $controlGroup.Controls.Add($copyMemberButton)
 
@@ -829,6 +885,7 @@ $script:form.Add_FormClosing({ Stop-AllResources })
 
 Add-UiLog "IPv6Mesh 中文 UI $Version 已启动。"
 Add-UiLog "请先选择角色；管理员先启动控制面并创建网络，房主/成员再安装并加入。"
+Add-UiLog "管理员操作顺序：先点击“启动控制面”，待健康检查通过后，再创建网络并随机生成房主/成员邀请。"
 Add-UiLog "当前 UI 不会把管理员令牌和一次性邀请令牌写入日志。"
 if ($initialIPv6 -ne '') {
     Add-UiLog "已检测本机 IPv6：$initialIPv6；默认控制面 URL：$initialControlUrl"
