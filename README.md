@@ -20,7 +20,7 @@ The v0.1 scope is virtual IPv4 node-to-node access, IPv6 Direct connectivity, an
 - **游戏房主**：启动游戏并作为第一台 VPN 节点加入网络
 - **成员**：使用自己的邀请令牌加入同一个 VPN 网络
 
-最简单的情况是：第一台电脑同时担任控制面管理员和游戏房主；第二台电脑是成员。新版 `v0.1.0-debug.6` 将三种角色统一放在一个中文可视化界面中，普通成员只需要双击 `.exe`，不需要打开 PowerShell，也不需要使用 `vpnctl`。
+最简单的情况是：第一台电脑同时担任控制面管理员和游戏房主；第二台电脑是成员。新版 `v0.1.0-debug.7` 将三种角色统一放在一个中文可视化界面中，普通成员只需要双击 `.exe`，不需要打开 PowerShell，也不需要使用 `vpnctl`。
 
 > ⚠️ 控制面必须先运行，节点安装器不会自动创建控制面。控制面可以运行在房主电脑、另一台服务器或具有全球 IPv6 的 VPS 上。
 
@@ -63,9 +63,9 @@ flowchart LR
 
 ### 1. 首选：使用统一中文 UI
 
-下载 [v0.1.0-debug.6 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.6/ipv6mesh-installer-0.1.0-debug.6.exe)，SHA-256 为 `72949379B89E7C11245E32AAF5E0E1D6E59069AAE11DAE587AABC2906EBC7032`。双击后在 UAC 对话框中点击“是”。程序会打开“IPv6Mesh 远程组网”窗口，顶部可以切换三种角色：
+下载 [v0.1.0-debug.7 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.7/ipv6mesh-installer-0.1.0-debug.7.exe)。双击后在 UAC 对话框中点击“是”。程序会打开“IPv6Mesh 远程组网”窗口，顶部可以切换三种角色。SHA-256：`E78B3BC3A011CF036BB5927CDDBBF2A1163C7BBFC029AF58E2DED0BA9EF6C21B`。
 
-如果旧版 `.5` 弹出 `run Chinese IPv6Mesh UI: exit status 1`，请改用 `.6`；根因是 Windows PowerShell 5.1 读取无 BOM 的 UTF-8 中文 UI 脚本时在启动阶段解析失败，`.6` 已将 `ui.ps1` 固定为 UTF-8 with BOM。
+如果旧版 `.5` 或 `.6` 弹出 `run Chinese IPv6Mesh UI: exit status 1`，请改用 `.7`；`.7` 保留 UTF-8 with BOM 修复，并加入了端点自动生成和退出清理。
 
 | UI 角色 | 主要按钮和操作 |
 | --- | --- |
@@ -78,14 +78,18 @@ flowchart LR
 第一台具有可访问全球 IPv6 的电脑可以同时作为控制面管理员和游戏房主：
 
 1. 选择角色“控制面管理员”。
-2. 填写“控制面 URL”，例如 `http://[2408:8256:1980:119b:f2c8:40bb:1e01:4182]:8080`。
-3. “监听地址”保持 `[::]:8080`；填写只保存在管理员电脑上的长随机“管理员令牌”。
-4. 点击“启动控制面”，UI 会启动 `control-server.exe`，尝试自动放行 TCP 8080，并把控制面输出写入日志。
+2. UI 会自动检测本机可用的全局 IPv6，并填入“本机 IPv6”；输入控制面端口（默认 `8080`），程序会自动生成类似 `http://[2408:8256:1980:119b:f2c8:40bb:1e01:4182]:8080` 的 URL，同时把监听地址设置为 `[::]:8080`。如果检测结果不正确，可手动修改 IPv6 或点击“自动检测”。
+3. 填写只保存在管理员电脑上的长随机“管理员令牌”。
+4. 点击“启动控制面”，UI 会启动 `control-server.exe`，尝试自动放行所填端口的 TCP 防火墙规则，并把控制面输出写入日志。
 5. 点击“检查健康”，确认状态变为“控制面可访问”。
-6. 填写网络名称 `friends-steam`、IPv4 地址池 `10.42.0.0/24`，点击“创建网络”。
+6. 填写网络名称 `friends-steam`、IPv4 地址池 `10.42.0.0/24`，点击“创建网络”。每台设备加入时，控制面会从这个地址池随机选择一个可用虚拟 IPv4；分配结果会写入控制面数据，之后保持不变。
 7. 点击“生成房主邀请”和“生成成员邀请”，分别使用右侧按钮复制给房主和成员。邀请令牌只在专用框中显示，不写入日志。
 
-UI 默认使用内存仓库；关闭 UI 会停止由本窗口启动的控制面进程，控制面进程重启后网络和邀请会丢失。长期使用请改用 PostgreSQL 配置。控制面窗口保持运行，成员电脑才能继续连接。
+UI 默认使用内存仓库；关闭 UI 会停止本窗口启动的控制面、停止本机 IPv6Mesh 服务，并由服务清理 WireGuard 适配器、虚拟 IPv4 地址和路由。安装文件和节点身份不会被删除，但内存控制面重启后网络和邀请会丢失。长期使用请改用 PostgreSQL 配置，并让控制面进程保持运行。
+
+#### 手动退出和资源清理
+
+点击窗口右上角关闭按钮或正常退出 UI 时，会执行一次清理：停止本机节点服务、清理虚拟网卡/地址/路由、关闭本窗口启动的控制面和事件订阅。若正在调试双机互访，关闭任一台的 UI 会使该台 VPN 断开；重新使用时需要重新启动 UI 和节点服务。
 
 #### 房主和成员在 UI 中加入网络
 
@@ -93,7 +97,7 @@ UI 默认使用内存仓库；关闭 UI 会停止由本窗口启动的控制面�
 2. 两台电脑填写相同的“控制面 URL”。
 3. 房主填写房主专属邀请，成员填写成员专属邀请；不要交叉使用，也不要填写管理员令牌。
 4. 填写设备名，例如 `win11-host` 和 `win11-member`。
-5. 点击“安装并加入 VPN”。程序会停止旧服务、安装/更新节点服务、加入网络、连接虚拟适配器，并在状态和日志中显示 Network ID、虚拟 IPv4、Path。
+5. 点击“安装并加入 VPN”。程序会停止旧服务、安装/更新节点服务、加入网络、连接虚拟适配器，并在状态和日志中显示 Network ID、随机分配的虚拟 IPv4、Path。
 6. 出现错误时，点击“复制日志”或“导出日志”保存 debug 信息；分享前检查日志中没有不应公开的主机信息。
 
 管理员创建网络后，普通房主/成员只需要以上步骤，不需要运行后面的 PowerShell 或 `vpnctl` 命令。
@@ -200,7 +204,7 @@ Member invite: <member-one-time-token>
 
 以第一台 Windows 11 作为游戏房主为例：
 
-1. 下载 [v0.1.0-debug.6 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.6/ipv6mesh-installer-0.1.0-debug.6.exe)
+1. 下载 [v0.1.0-debug.7 Windows UI 安装器](https://github.com/Eser-s-Organization/ipv6mesh/releases/download/v0.1.0-debug.7/ipv6mesh-installer-0.1.0-debug.7.exe)
 2. 双击运行，Windows UAC 弹出后点击“是”，选择角色“游戏房主”
 3. 在 UI 中输入：
 
@@ -211,7 +215,7 @@ Member invite: <member-one-time-token>
 | `设备名` | `win11-host` |
 
 4. 点击“安装并加入 VPN”；程序会自动停止旧服务、安装文件、启动服务、加入网络并连接虚拟网卡
-5. 看到状态和日志中显示类似信息后，记下真实的虚拟 IPv4：
+5. 看到状态和日志中显示类似信息后，记下本机实际随机分配的虚拟 IPv4：
 
 ```text
 IPv6Mesh is connected.
@@ -220,7 +224,7 @@ Virtual IPv4: 10.42.0.2
 Path: Direct
 ```
 
-`10.42.0.2` 只是示例，必须使用 UI 实际显示的地址。如果房主电脑之前已经成功加入过网络，再次运行 `.5` 时程序会读取本机已有身份，通常不再要求新的邀请令牌。
+`10.42.0.2` 只是示例，实际地址可能是地址池中的任意可用主机地址，必须使用 UI 实际显示的地址。分配结果在控制面数据中保持不变；如果使用内存仓库并重启控制面，网络和分配记录会一起丢失。
 
 ### 5. 成员电脑加入 VPN（命令行兼容流程）
 
@@ -237,13 +241,13 @@ Path: Direct
 | `设备名` | `win11-member` |
 
 4. 点击“安装并加入 VPN”，等待状态显示节点已连接
-5. 记下成员自己的虚拟 IPv4，例如 `10.42.0.3`
+5. 记下成员自己的虚拟 IPv4；它可能不是 `.3`，以 UI 实际显示值为准。
 
 成员不需要输入房主的虚拟 IPv4、`Network ID`、管理员令牌或物理局域网 IPv4。成员只需要自己的邀请令牌。
 
 ### 6. 验证两台电脑互访
 
-假设两台电脑实际显示：
+下面只是一个示例；随机分配后两台设备实际显示的地址可能不同：
 
 | 设备 | 虚拟 IPv4 |
 | --- | --- |
@@ -296,8 +300,8 @@ UI 日志会记录安装脚本、`control-server.exe`、`vpnctl`、健康检查�
 
 - **控制面连接失败**：确认控制面进程仍在运行、TCP 8080 已放行、IPv6 地址可达，并且 URL 使用 `http://[IPv6]:8080` 格式
 - **`invite already used`**：令牌已经被成功使用或已经过期，管理员需要为该设备生成新令牌
-- **`open \\.\pipe\ipv6mesh`**：服务没有成功安装或没有运行，重新双击 `.5` 并确认 UAC 已授权；可在 UI 中点击“刷新状态”查看日志
-- **旧版本提示文件正在使用**：不要继续使用 `.2`、`.3` 或 `.4`，使用 `.5`；`.5` 会先停止旧服务并等待文件解锁
+- **`open \\.\pipe\ipv6mesh`**：服务没有成功安装或没有运行，重新双击 `.7` 并确认 UAC 已授权；可在 UI 中点击“刷新状态”查看日志
+- **旧版本提示文件正在使用**：使用 `.7`；安装脚本会先停止旧服务并等待文件解锁，UI 关闭时也会停止服务并清理虚拟网络资源
 - **控制面重启后网络消失**：当前示例使用内存仓库，测试数据随控制面进程退出而丢失；需要长期使用时应部署 PostgreSQL
 - **两台都显示已连接但游戏找不到房间**：先用虚拟 IPv4 和游戏端口测试，再检查游戏的 LAN 发现机制和 Windows 防火墙
 - **虚拟 IPv4 与本地 IPv4 不同**：这是预期行为；游戏应在支持的情况下使用 `Virtual IPv4`，不要使用 `10.20.x.x` 等物理局域网地址
@@ -317,7 +321,7 @@ Remove-Item -LiteralPath 'C:\Program Files\IPv6Mesh' -Recurse -Force
 
 ## 📋 Implemented milestones
 
-- Control-plane enrollment, stable virtual IPv4 allocation, scoped authorization, and versioned snapshots.
+- Control-plane enrollment, random-then-stable virtual IPv4 allocation, scoped authorization, and versioned snapshots.
 - Windows service boundary with protected identity storage and strict Named Pipe IPC.
 - WireGuardNT ABI adapter and Windows IP Helper route reconciler with host-only overlay routes. The official `wireguard.dll` is intentionally not committed; see [runtime provenance](third_party/wireguardnt/README.md).
 - Windows IPv6 candidate discovery, authenticated control-plane heartbeats, strict HTTPS/WebSocket client decoding with bounded reconnect, and generation-safe WireGuard/IPv4 snapshot reconciliation.

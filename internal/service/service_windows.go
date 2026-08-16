@@ -79,13 +79,18 @@ func (dataPlane *WindowsDataPlane) Discover(ctx context.Context, port uint16) ([
 // ServeWindows starts the local Named Pipe boundary for an already-created
 // service. Data-plane adapters are intentionally injected by the caller and
 // remain outside this Task 4 boundary.
-func ServeWindows(ctx context.Context, service *Service, path string, authorizer ipc.CallerAuthorizer) error {
+func ServeWindows(ctx context.Context, service *Service, path string, authorizer ipc.CallerAuthorizer) (serveErr error) {
 	if service == nil || authorizer == nil {
 		return errors.New("Windows service requires service and caller authorizer")
 	}
 	if err := service.Start(ctx); err != nil {
 		return err
 	}
+	defer func() {
+		cleanupContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		serveErr = errors.Join(serveErr, service.Shutdown(cleanupContext))
+	}()
 	heartbeatContext, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
 	if source, ok := service.options.Adapter.(EndpointSource); ok {

@@ -118,6 +118,48 @@ func (service *Service) Start(ctx context.Context) error {
 	return nil
 }
 
+// Shutdown releases local data-plane resources owned by the service without
+// removing the node's control-plane membership. It is used when the Windows
+// service receives Stop/Shutdown so WireGuard state, overlay addresses, and
+// routes do not survive the process that created them.
+func (service *Service) Shutdown(ctx context.Context) error {
+	if service == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	service.operationMu.Lock()
+	defer service.operationMu.Unlock()
+
+	service.mu.RLock()
+	started := service.started
+	joined := service.joined
+	pathState := service.status.PathState
+	adapter := service.options.Adapter
+	reconciler := service.options.Reconciler
+	service.mu.RUnlock()
+	if !started {
+		return nil
+	}
+
+	var cleanupErr error
+	if reconciler != nil {
+		// A snapshot is applied during Join, before the status changes to
+		// connected, so Clear must run even when pathState is disconnected.
+		cleanupErr = reconciler.Clear(ctx)
+	} else if joined != nil && pathState != ipc.PathStateDisconnected && adapter != nil {
+		cleanupErr = adapter.Disconnect(ctx, joined.NetworkID)
+	}
+
+	service.mu.Lock()
+	service.started = false
+	service.joined = nil
+	service.status = ipc.Status{PathState: ipc.PathStateDisconnected}
+	service.mu.Unlock()
+	return cleanupErr
+}
+
 func (service *Service) PublicKey() string {
 	service.mu.RLock()
 	defer service.mu.RUnlock()

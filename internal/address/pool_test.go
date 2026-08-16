@@ -1,6 +1,7 @@
 package address_test
 
 import (
+	"bytes"
 	"errors"
 	"net"
 	"testing"
@@ -41,6 +42,23 @@ func TestPoolNextReturnsTheFirstUnoccupiedHost(t *testing.T) {
 	}
 	if next.String() != "10.42.0.2" {
 		t.Fatalf("next address = %s, want 10.42.0.2", next)
+	}
+}
+
+func TestPoolRandomNextUsesRandomOffsetAndSkipsOccupiedHost(t *testing.T) {
+	pool, err := address.NewPool("10.42.0.0/29")
+	if err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	// A /29 has six usable addresses. The single byte below makes crypto/rand.Int
+	// choose offset 3, which is 10.42.0.4; that address is occupied, so the
+	// allocator wraps to the next free address.
+	next, err := pool.RandomNext(bytes.NewReader([]byte{3}), "10.42.0.4")
+	if err != nil {
+		t.Fatalf("random next address: %v", err)
+	}
+	if next.String() != "10.42.0.5" {
+		t.Fatalf("random next address = %s, want 10.42.0.5", next)
 	}
 }
 

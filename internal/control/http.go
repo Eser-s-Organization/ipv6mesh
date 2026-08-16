@@ -460,18 +460,26 @@ func (handler *Handler) enrollControl(ctx context.Context, request enrollmentReq
 		}
 		membership := Membership{NetworkID: network.ID, NodeID: node.ID, Role: RoleMember, Status: MembershipActive}
 		allocated := false
-		allocationErr := pool.ForEachCandidate(func(candidate net.IP) error {
+		var allocationErr error
+		occupied := make([]net.IP, 0)
+		for attempts := uint64(0); attempts < pool.Size(); attempts++ {
+			candidate, err := pool.RandomNext(nil, occupied)
+			if err != nil {
+				allocationErr = err
+				break
+			}
 			membership.VirtualIPv4 = candidate
 			if err := transaction.AddMembership(transactionContext, membership); err == nil {
 				allocated = true
-				return stopHTTPAllocation
+				break
 			} else if errors.Is(err, ErrConflict) {
-				return nil
+				occupied = append(occupied, candidate)
 			} else {
-				return err
+				allocationErr = err
+				break
 			}
-		})
-		if !errors.Is(allocationErr, stopHTTPAllocation) && allocationErr != nil {
+		}
+		if allocationErr != nil && !errors.Is(allocationErr, address.ErrPoolExhausted) {
 			return allocationErr
 		}
 		if !allocated {
@@ -536,8 +544,6 @@ func (handler *Handler) recoverEnrollmentCommit(result enrollmentResult, transac
 	handler.sessions.RevokeSession(result.SessionToken)
 	return enrollmentResult{}, transactionErr
 }
-
-var stopHTTPAllocation = errors.New("allocation completed")
 
 func (handler *Handler) snapshot(writer http.ResponseWriter, request *http.Request) {
 	principal, err := handler.authenticate(request)
