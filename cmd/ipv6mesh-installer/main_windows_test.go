@@ -155,6 +155,8 @@ func TestWindowsPackageIncludesChineseUI(t *testing.T) {
 		"复制房主 IPv6",
 		"房主虚拟 IPv4",
 		"本机虚拟 IPv4",
+		"诊断与日志",
+		"节点状态读取已恢复",
 		"Set-PrimaryBusy",
 		"Stop-AllResources",
 		"Get-NetIPAddress -AddressFamily IPv6",
@@ -178,6 +180,26 @@ func TestWindowsPackageIncludesChineseUI(t *testing.T) {
 	} {
 		if strings.Contains(contents, forbidden) {
 			t.Fatalf("normal room UI still exposes %q", forbidden)
+		}
+	}
+}
+
+func TestWindowsDocumentationDescribesPersistentLiveDiagnostics(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	repositoryRoot := filepath.Join(filepath.Dir(sourceFile), "..", "..")
+	for _, name := range []string{"README.md", filepath.Join("packaging", "windows", "README.md")} {
+		contents, err := os.ReadFile(filepath.Join(repositoryRoot, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		text := strings.Join(strings.Fields(string(contents)), " ")
+		for _, required := range []string{"always visible", "every two seconds", "does not repeat unchanged status"} {
+			if !strings.Contains(text, required) {
+				t.Errorf("%s missing diagnostics statement %q", name, required)
+			}
 		}
 	}
 }
@@ -313,6 +335,133 @@ if ($result -ne $false) {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("PowerShell empty-IPv6 regression check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWindowsUIKeepsDiagnosticsVisibleOnOperationPages(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	uiScript, err := os.ReadFile(uiPath)
+	if err != nil {
+		t.Fatalf("read UI script: %v", err)
+	}
+	contents := string(uiScript)
+
+	for _, forbidden := range []string{
+		`function Toggle-Diagnostics`,
+		`New-Button "显示诊断与日志"`,
+		`$script:diagnosticsPanel.Visible = !$script:diagnosticsPanel.Visible`,
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Fatalf("UI still contains collapsible diagnostics behavior %q", forbidden)
+		}
+	}
+
+	for _, required := range []string{
+		`$script:activePage = $Name`,
+		`$script:diagnosticsPanel.Visible = ($Name -ne "Welcome")`,
+		`$script:diagnosticsPanel.BringToFront()`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("UI missing persistent diagnostics behavior %q", required)
+		}
+	}
+}
+
+func TestWindowsUIStatusLogDecision(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) {
+    $parseErrors | ForEach-Object { Write-Error $_.Message }
+    exit 1
+}
+$function = $ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-StatusLogDecision'
+}, $true) | Select-Object -First 1
+if ($null -eq $function) {
+    Write-Error 'Get-StatusLogDecision function not found'
+    exit 1
+}
+. ([scriptblock]::Create($function.Extent.Text))
+$cases = @(
+    @{ Name = 'first success'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = '10.42.0.1|Direct|'; HasPrevious = $false; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'Changed' },
+    @{ Name = 'unchanged success'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = '10.42.0.1|Direct|'; HasPrevious = $true; PreviousSucceeded = $true; PreviousFingerprint = '10.42.0.1|Direct|' }; Want = 'None' },
+    @{ Name = 'changed success'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = '10.42.0.1|Relay|'; HasPrevious = $true; PreviousSucceeded = $true; PreviousFingerprint = '10.42.0.1|Direct|' }; Want = 'Changed' },
+    @{ Name = 'first failure'; Parameters = @{ Automatic = $true; Succeeded = $false; Fingerprint = ''; HasPrevious = $false; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'Failed' },
+    @{ Name = 'failure after success'; Parameters = @{ Automatic = $true; Succeeded = $false; Fingerprint = ''; HasPrevious = $true; PreviousSucceeded = $true; PreviousFingerprint = '10.42.0.1|Direct|' }; Want = 'Failed' },
+    @{ Name = 'repeated failure'; Parameters = @{ Automatic = $true; Succeeded = $false; Fingerprint = ''; HasPrevious = $true; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'None' },
+    @{ Name = 'recovery'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = '10.42.0.1|Direct|'; HasPrevious = $true; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'Recovered' },
+    @{ Name = 'manual unchanged'; Parameters = @{ Automatic = $false; Succeeded = $true; Fingerprint = '10.42.0.1|Direct|'; HasPrevious = $true; PreviousSucceeded = $true; PreviousFingerprint = '10.42.0.1|Direct|' }; Want = 'Manual' }
+)
+foreach ($case in $cases) {
+    $parameters = $case.Parameters
+    $got = Get-StatusLogDecision @parameters
+    if ($got -ne $case.Want) {
+        Write-Error ($case.Name + ': got ' + $got + ', want ' + $case.Want)
+        exit 1
+    }
+}
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell status-log decision check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWindowsUILiveStatusTimerUsesQuietDeduplicatedPolling(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	uiScript, err := os.ReadFile(uiPath)
+	if err != nil {
+		t.Fatalf("read UI script: %v", err)
+	}
+	contents := string(uiScript)
+	for _, required := range []string{
+		`$script:statusRefreshTimer = New-Object System.Windows.Forms.Timer`,
+		`$script:statusRefreshTimer.Interval = 2000`,
+		`$script:statusRefreshTimer.Add_Tick({ Invoke-AutomaticStatusRefresh })`,
+		`function Start-StatusRefresh`,
+		`function Stop-StatusRefresh`,
+		`function Dispose-StatusRefreshTimer`,
+		`function Invoke-AutomaticStatusRefresh`,
+		`$script:primaryBusy -or $script:cleanupStarted`,
+		`$script:activePage -eq "Welcome" -or $script:statusRefreshInProgress`,
+		`Get-NodeStatus -Automatic`,
+		`Invoke-VpnCtl -Arguments @("status") -SuppressStandardOutput -Quiet:$Automatic`,
+		`Convert-ResultToJson $result "读取节点状态" -Quiet:$Automatic`,
+		`Get-StatusLogDecision`,
+		`Dispose-StatusRefreshTimer`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("UI missing live status behavior %q", required)
+		}
+	}
+
+	cleanupIndex := strings.Index(contents, "function Stop-AllResources")
+	if cleanupIndex < 0 {
+		t.Fatal("Stop-AllResources function not found")
+	}
+	disposeIndex := strings.Index(contents[cleanupIndex:], "Dispose-StatusRefreshTimer")
+	resourceIndex := strings.Index(contents[cleanupIndex:], "Stop-StartedResources")
+	if disposeIndex < 0 || resourceIndex < 0 || disposeIndex > resourceIndex {
+		t.Fatalf("status timer must be disposed before resources stop (cleanup=%d dispose=%d resources=%d)", cleanupIndex, disposeIndex, resourceIndex)
 	}
 }
 
