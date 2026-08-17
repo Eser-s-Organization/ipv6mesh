@@ -29,6 +29,10 @@ and does not require an administrator token, a Network ID, or an invitation toke
 4. The create and join pages keep diagnostics and logs always visible. Node status
    refreshes every two seconds, while the log updates immediately and does not
    repeat unchanged status.
+   The Windows room window can be resized. On the create and join pages, drag the
+   horizontal diagnostics divider to allocate more space to room settings or logs.
+   On a constrained display or with larger system text, the operation area scrolls
+   instead of covering diagnostics or other controls.
 5. Closing the host ends the in-memory room. Reopening the installer creates a new
    room and a new set of assignments.
 6. Knowing the host IPv6 grants join access while the room is open. Treat the host

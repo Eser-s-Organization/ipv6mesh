@@ -196,7 +196,14 @@ func TestWindowsDocumentationDescribesPersistentLiveDiagnostics(t *testing.T) {
 			t.Fatalf("read %s: %v", name, err)
 		}
 		text := strings.Join(strings.Fields(string(contents)), " ")
-		for _, required := range []string{"always visible", "every two seconds", "does not repeat unchanged status"} {
+		for _, required := range []string{
+			"always visible",
+			"every two seconds",
+			"does not repeat unchanged status",
+			"window can be resized",
+			"drag the horizontal diagnostics divider",
+			"operation area scrolls",
+		} {
 			if !strings.Contains(text, required) {
 				t.Errorf("%s missing diagnostics statement %q", name, required)
 			}
