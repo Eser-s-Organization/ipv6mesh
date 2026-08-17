@@ -56,6 +56,17 @@ $script:statusRefreshInProgress = $false
 $script:hasStatusRefreshResult = $false
 $script:lastStatusRefreshSucceeded = $false
 $script:lastStatusFingerprint = ""
+$script:uiMutex = $null
+$script:ownsUiMutex = $false
+$script:uiInstanceActive = $false
+$script:uiFlowState = "Idle"
+$script:uiFlowStates = @("Idle", "HostSetup", "MemberSetup", "PreparingHost", "PreparingMember", "Hosting", "JoinedMember", "Cleaning")
+$script:welcomeCreateButton = $null
+$script:welcomeJoinButton = $null
+$script:refreshStatusButton = $null
+$script:connectButton = $null
+$script:disconnectButton = $null
+$script:leaveButton = $null
 
 function Redact-Secret {
     param([AllowNull()][string]$Value)
@@ -107,6 +118,96 @@ function Get-StatusLogDecision {
     if (!$PreviousSucceeded) { return "Recovered" }
     if ($Fingerprint -ne $PreviousFingerprint) { return "Changed" }
     return "None"
+}
+
+function Test-UiFlowTransition {
+    param([Parameter(Mandatory = $true)][string]$From, [Parameter(Mandatory = $true)][string]$To)
+    $allowed = @{
+        "Idle->HostSetup" = $true
+        "Idle->MemberSetup" = $true
+        "HostSetup->Idle" = $true
+        "HostSetup->PreparingHost" = $true
+        "MemberSetup->Idle" = $true
+        "MemberSetup->PreparingMember" = $true
+        "PreparingHost->Hosting" = $true
+        "PreparingHost->Cleaning" = $true
+        "PreparingMember->JoinedMember" = $true
+        "PreparingMember->Cleaning" = $true
+        "Hosting->Cleaning" = $true
+        "JoinedMember->Cleaning" = $true
+        "Cleaning->Idle" = $true
+        "Cleaning->HostSetup" = $true
+        "Cleaning->MemberSetup" = $true
+    }
+    return $allowed.ContainsKey("$From->$To")
+}
+
+function Update-UiFlowControls {
+    $state = [string]$script:uiFlowState
+    $setupHost = $state -eq "HostSetup"
+    $setupMember = $state -eq "MemberSetup"
+    $preparing = $state -in @("PreparingHost", "PreparingMember", "Cleaning")
+    $active = $state -in @("Hosting", "JoinedMember")
+    if ($null -ne $script:hostStartButton -and !$script:hostStartButton.IsDisposed) {
+        $hostReady = $false
+        if ($null -ne $script:ipv6AddressBox) { $hostReady = Test-GlobalIPv6 (Get-BoxText $script:ipv6AddressBox) }
+        $script:hostStartButton.Enabled = $setupHost -and !$script:primaryBusy -and $hostReady
+    }
+    if ($null -ne $script:memberJoinButton -and !$script:memberJoinButton.IsDisposed) {
+        $script:memberJoinButton.Enabled = $setupMember -and !$script:primaryBusy
+    }
+    foreach ($button in $script:backButtons) {
+        if ($null -ne $button -and !$button.IsDisposed) { $button.Enabled = ($setupHost -or $setupMember) -and !$script:primaryBusy }
+    }
+    if ($null -ne $script:leaveButton -and !$script:leaveButton.IsDisposed) {
+        $script:leaveButton.Text = if ($state -eq "Hosting") { "结束房间" } else { "离开房间" }
+        $script:leaveButton.Enabled = $active -and !$script:primaryBusy
+    }
+    foreach ($button in @($script:refreshStatusButton, $script:connectButton, $script:disconnectButton)) {
+        if ($null -ne $button -and !$button.IsDisposed) { $button.Enabled = $active -and !$preparing }
+    }
+    if ($null -ne $script:welcomeCreateButton -and !$script:welcomeCreateButton.IsDisposed) { $script:welcomeCreateButton.Enabled = !$preparing -and $state -eq "Idle" }
+    if ($null -ne $script:welcomeJoinButton -and !$script:welcomeJoinButton.IsDisposed) { $script:welcomeJoinButton.Enabled = !$preparing -and $state -eq "Idle" }
+}
+
+function Set-UiFlowState {
+    param([Parameter(Mandatory = $true)][string]$To)
+    if ($script:uiFlowState -eq $To) {
+        Update-UiFlowControls
+        return $true
+    }
+    if (!(Test-UiFlowTransition -From $script:uiFlowState -To $To)) {
+        Add-UiLog "已拒绝非法界面模式切换。" "警告"
+        return $false
+    }
+    $script:uiFlowState = $To
+    Update-UiFlowControls
+    return $true
+}
+
+function Enter-UiInstance {
+    $createdNew = $false
+    try {
+        $script:uiMutex = New-Object System.Threading.Mutex($true, "Global\IPv6Mesh.WindowsUI", [ref]$createdNew)
+        if (!$createdNew) {
+            try { $script:ownsUiMutex = $script:uiMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $script:ownsUiMutex = $true }
+        } else {
+            $script:ownsUiMutex = $true
+        }
+        return $script:ownsUiMutex
+    } catch {
+        if ($null -ne $script:uiMutex) { $script:uiMutex.Dispose(); $script:uiMutex = $null }
+        $script:ownsUiMutex = $false
+        return $false
+    }
+}
+
+function Exit-UiInstance {
+    if ($script:ownsUiMutex -and $null -ne $script:uiMutex) {
+        try { $script:uiMutex.ReleaseMutex() } catch {}
+    }
+    $script:ownsUiMutex = $false
+    if ($null -ne $script:uiMutex) { $script:uiMutex.Dispose(); $script:uiMutex = $null }
 }
 
 function Get-SplitLayoutDecision {
@@ -234,12 +335,12 @@ function Refresh-LocalIPv6 {
         }
         $script:ipv6AddressBox.Text = $address
         $null = Update-ControlEndpoint
-        $script:hostStartButton.Enabled = !$script:primaryBusy
+        Update-UiFlowControls
         Add-UiLog "已检测本机全局 IPv6；房主控制面地址已准备。"
         Set-UiStatus "房主 IPv6 已就绪" ([System.Drawing.Color]::ForestGreen)
         return $true
     } catch {
-        $script:hostStartButton.Enabled = $false
+        Update-UiFlowControls
         Add-UiLog "检测房主 IPv6 失败：$($_.Exception.Message)" "警告"
         Set-UiStatus "需要可访问的全局 IPv6" ([System.Drawing.Color]::Firebrick)
         return $false
@@ -358,7 +459,7 @@ function Convert-ResultToJson {
     if ($Result.ExitCode -ne 0) {
         $stderr = [string]$Result.Stderr
         $code = ""
-        if ($stderr -match '(room_not_ready|room_mode_disabled|node_already_joined|room_full|join_rate_limited|enrollment_recovery_pending|invalid_node|request_too_large|unauthorized)') {
+        if ($stderr -match '(room_not_ready|room_mode_disabled|node_already_joined|room_full|join_rate_limited|enrollment_recovery_pending|invalid_node|request_too_large|unauthorized|control_unreachable|operation_timeout)') {
             $code = [string]$Matches[1]
         }
         $messages = @{
@@ -371,6 +472,8 @@ function Convert-ResultToJson {
             invalid_node = "节点信息无效，请检查本机服务。"
             request_too_large = "请求内容超出允许大小。"
             unauthorized = "控制面拒绝了当前操作。"
+            control_unreachable = "房主控制面不可访问，请确认房主窗口仍在运行且 TCP 8080 可达。"
+            operation_timeout = "操作等待超时，请检查网络后重试。"
         }
         if ($code -ne "" -and $messages.ContainsKey($code)) {
             if (!$Quiet) { Add-UiLog "$Operation 失败，错误码：$code" "警告" }
@@ -421,6 +524,12 @@ function Test-ControlHealth {
             Set-UiStatus "控制面不可访问" ([System.Drawing.Color]::Firebrick)
         }
         return $false
+    }
+}
+
+function Assert-MemberControlReady {
+    if (!(Test-ControlHealth -Quiet)) {
+        throw '房主控制面不可访问，请确认房主窗口仍在运行且 TCP 8080 可达。'
     }
 }
 
@@ -551,11 +660,65 @@ function Stop-StartedResources {
     }
 }
 
+function Clear-ActiveRoomState {
+    $script:activeNetworkId = ""
+    if ($null -ne $script:hostVirtualIPv4Label -and !$script:hostVirtualIPv4Label.IsDisposed) { $script:hostVirtualIPv4Label.Text = "房主虚拟 IPv4：未加入" }
+    if ($null -ne $script:memberVirtualIPv4Label -and !$script:memberVirtualIPv4Label.IsDisposed) { $script:memberVirtualIPv4Label.Text = "本机虚拟 IPv4：未加入" }
+    if ($null -ne $script:nodeStatusLabel -and !$script:nodeStatusLabel.IsDisposed) { $script:nodeStatusLabel.Text = "本机尚未加入房间" }
+    Set-UiStatus "节点未加入房间" ([System.Drawing.Color]::DarkOrange)
+}
+
+function Stop-FailedPreparation {
+    param([Parameter(Mandatory = $true)][ValidateSet("HostSetup", "MemberSetup")][string]$ReturnState)
+    if (![string]::IsNullOrWhiteSpace($script:activeNetworkId)) {
+        try {
+            $result = Invoke-VpnCtl -Arguments @("leave", "--network", $script:activeNetworkId) -SuppressStandardOutput -Quiet
+            if ($result.ExitCode -ne 0) { Add-UiLog "准备失败后的房间清理未完成。" "警告" }
+        } catch {
+            Add-UiLog "准备失败后的房间清理未完成。" "警告"
+        }
+    }
+    Clear-ActiveRoomState
+    Stop-StartedResources
+    if ($script:uiFlowState -in @("PreparingHost", "PreparingMember")) {
+        [void](Set-UiFlowState "Cleaning")
+        [void](Set-UiFlowState $ReturnState)
+    }
+}
+
+function Exit-ActiveRoom {
+    param([switch]$ShuttingDown)
+    if ($script:uiFlowState -notin @("Hosting", "JoinedMember")) { return $false }
+    if (!(Set-UiFlowState "Cleaning")) { return $false }
+    $success = $true
+    try {
+        if (![string]::IsNullOrWhiteSpace($script:activeNetworkId)) {
+            try {
+                $result = Invoke-VpnCtl -Arguments @("leave", "--network", $script:activeNetworkId) -SuppressStandardOutput -Quiet
+                if ($result.ExitCode -ne 0) { throw "leave failed" }
+                $null = Convert-ResultToJson $result "离开房间" -Quiet
+            } catch {
+                $success = $false
+                Add-UiLog "离开房间失败，已继续释放本机资源。" "错误"
+            }
+        }
+    } finally {
+        Clear-ActiveRoomState
+        Stop-StartedResources
+    }
+    if (!$ShuttingDown) {
+        [void](Set-UiFlowState "Idle")
+        Show-WelcomePage
+    }
+    return $success
+}
+
 function Stop-AllResources {
     if ($script:cleanupStarted) { return }
     $script:cleanupStarted = $true
     Add-UiLog "正在执行退出清理。"
     Dispose-StatusRefreshTimer
+    $null = Exit-ActiveRoom -ShuttingDown
     Stop-StartedResources
     Add-UiLog "退出清理完成。"
 }
@@ -632,6 +795,8 @@ function Set-ActiveVirtualIPv4 {
 }
 
 function Start-HostRoom {
+    if ($script:uiFlowState -ne "HostSetup") { Add-UiLog "创建房间操作已被忽略。" "警告"; return }
+    if (!(Set-UiFlowState 'PreparingHost')) { return }
     Set-PrimaryBusy $true "正在创建房间并连接本机……"
     try {
         if (!(Refresh-LocalIPv6)) { throw "没有可用的房主全局 IPv6。" }
@@ -647,19 +812,22 @@ function Start-HostRoom {
         $script:activeNetworkId = [string]$joined.network_id
         Set-ActiveVirtualIPv4 $joined "Host"
         $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("connect", "--network", $script:activeNetworkId) -SuppressStandardOutput) "连接虚拟网络"
+        [void](Set-UiFlowState 'Hosting')
         $null = Get-NodeStatus
         Set-UiStatus "房主已连接" ([System.Drawing.Color]::ForestGreen)
         Add-UiLog "房间创建完成；可将房主 IPv6 提供给成员。"
     } catch {
         Add-UiLog "创建房间失败，正在清理本次启动的资源。" "错误"
-        Stop-StartedResources
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("创建房间失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        Stop-FailedPreparation "HostSetup"
+        [void][System.Windows.Forms.MessageBox]::Show($script:form, "创建房间失败，请查看诊断日志。", "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     } finally {
         Set-PrimaryBusy $false ""
     }
 }
 
 function Join-MemberRoom {
+    if ($script:uiFlowState -ne "MemberSetup") { Add-UiLog "加入房间操作已被忽略。" "警告"; return }
+    if (!(Set-UiFlowState 'PreparingMember')) { return }
     Set-PrimaryBusy $true "正在加入房间并连接本机……"
     try {
         $hostIPv6 = Get-BoxText $script:memberHostIPv6Box
@@ -667,18 +835,20 @@ function Join-MemberRoom {
         $endpoint = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("room", "endpoint", "--host-ipv6", $hostIPv6) -SuppressStandardOutput) "验证房主 IPv6"
         $script:controlUrl = [string]$endpoint.control_url
         $script:controlUrlBox.Text = $script:controlUrl
+        Assert-MemberControlReady
         if (!(Install-NodeService -ControlUrl $script:controlUrl)) { throw "节点服务安装失败。" }
         $joined = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("room", "join", "--host-ipv6", $hostIPv6, "--name", $env:COMPUTERNAME) -SuppressStandardOutput) "加入房间"
         $script:activeNetworkId = [string]$joined.network_id
         Set-ActiveVirtualIPv4 $joined "Member"
         $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("connect", "--network", $script:activeNetworkId) -SuppressStandardOutput) "连接虚拟网络"
+        [void](Set-UiFlowState 'JoinedMember')
         $null = Get-NodeStatus
         Set-UiStatus "成员已连接" ([System.Drawing.Color]::ForestGreen)
         Add-UiLog "已加入房间并连接本机。"
     } catch {
         Add-UiLog "加入房间失败，正在清理本次启动的资源。" "错误"
-        Stop-StartedResources
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("加入房间失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        Stop-FailedPreparation "MemberSetup"
+        [void][System.Windows.Forms.MessageBox]::Show($script:form, "加入房间失败，请查看诊断日志。", "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     } finally {
         Set-PrimaryBusy $false ""
     }
@@ -699,14 +869,6 @@ function Disconnect-Node {
     $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("disconnect", "--network", $script:activeNetworkId) -SuppressStandardOutput) "断开虚拟网络"
     $null = Get-NodeStatus
     Set-UiStatus "节点已断开" ([System.Drawing.Color]::DarkOrange)
-}
-
-function Leave-Node {
-    if ([string]::IsNullOrWhiteSpace($script:activeNetworkId)) { return }
-    $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("leave", "--network", $script:activeNetworkId) -SuppressStandardOutput) "离开房间"
-    $script:activeNetworkId = ""
-    if ($null -ne $script:nodeStatusLabel) { $script:nodeStatusLabel.Text = "本机尚未加入房间" }
-    Set-UiStatus "节点未加入房间" ([System.Drawing.Color]::DarkOrange)
 }
 
 function Copy-UiField {
@@ -749,6 +911,7 @@ function Set-PrimaryBusy {
     if (![string]::IsNullOrWhiteSpace($Status)) {
         Set-UiStatus $Status ([System.Drawing.Color]::DarkOrange)
     }
+    Update-UiFlowControls
 }
 
 function Invoke-AutomaticStatusRefresh {
@@ -842,18 +1005,34 @@ function Show-Page {
 }
 
 function Show-WelcomePage {
+    if ($script:uiFlowState -in @("Hosting", "JoinedMember", "Cleaning")) { return $false }
+    if ($script:uiFlowState -in @("HostSetup", "MemberSetup")) {
+        if (!(Set-UiFlowState "Idle")) { return $false }
+    }
     Show-Page "Welcome"
     Set-UiStatus "等待选择" ([System.Drawing.Color]::MidnightBlue)
+    return $true
 }
 
 function Show-HostPage {
+    if ($script:uiFlowState -ne "Idle") { Add-UiLog "当前房间模式未结束，不能切换到创建网络。" "警告"; return $false }
+    if (!(Set-UiFlowState "HostSetup")) { return $false }
     Show-Page "Host"
     $null = Refresh-LocalIPv6
+    return $true
 }
 
 function Show-MemberPage {
+    if ($script:uiFlowState -ne "Idle") { Add-UiLog "当前房间模式未结束，不能切换到加入网络。" "警告"; return $false }
+    if (!(Set-UiFlowState "MemberSetup")) { return $false }
     Show-Page "Member"
     Set-UiStatus "请输入房主 IPv6" ([System.Drawing.Color]::MidnightBlue)
+    return $true
+}
+
+function Return-ToWelcome {
+    if ($script:uiFlowState -notin @("HostSetup", "MemberSetup")) { return $false }
+    return Show-WelcomePage
 }
 
 function New-LayoutLabel {
@@ -1080,6 +1259,15 @@ function Invoke-ResponsiveLayoutAudit {
     }
 }
 
+if (!$LayoutAudit) {
+    if (!(Enter-UiInstance)) {
+        [void][System.Windows.Forms.MessageBox]::Show("IPv6Mesh 已在运行。请使用现有窗口。", "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        return
+    }
+    $script:uiInstanceActive = $true
+}
+
+try {
 $initialIPv6 = Get-DetectedIPv6Address
 if ([string]::IsNullOrWhiteSpace($initialIPv6) -and ![string]::IsNullOrWhiteSpace($ControlUrl)) {
     try {
@@ -1177,6 +1365,7 @@ $createButton.Dock = [System.Windows.Forms.DockStyle]::Fill
 $createButton.Margin = New-Object System.Windows.Forms.Padding(10, 15, 10, 15)
 $createButton.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 12)
 $createButton.Add_Click({ Show-HostPage })
+$script:welcomeCreateButton = $createButton
 [void]$script:welcomePanel.Controls.Add($createButton, 1, 3)
 
 $joinButton = New-Object System.Windows.Forms.Button
@@ -1186,6 +1375,7 @@ $joinButton.Dock = [System.Windows.Forms.DockStyle]::Fill
 $joinButton.Margin = New-Object System.Windows.Forms.Padding(10, 15, 10, 15)
 $joinButton.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 12)
 $joinButton.Add_Click({ Show-MemberPage })
+$script:welcomeJoinButton = $joinButton
 [void]$script:welcomePanel.Controls.Add($joinButton, 2, 3)
 
 $script:operationShell = New-Object System.Windows.Forms.Panel
@@ -1219,7 +1409,7 @@ for ($row = 0; $row -lt 6; $row++) {
 [void]$script:operationSplit.Panel1.Controls.Add($script:hostPanel)
 
 $hostBackButton = New-LayoutButton "HostBack" "返回" 90
-$hostBackButton.Add_Click({ Show-WelcomePage })
+$hostBackButton.Add_Click({ Return-ToWelcome })
 $script:backButtons += $hostBackButton
 Add-PageControl $script:hostPanel $hostBackButton 0 0
 
@@ -1261,7 +1451,7 @@ $script:memberPanel.Visible = $false
 [void]$script:operationSplit.Panel1.Controls.Add($script:memberPanel)
 
 $memberBackButton = New-LayoutButton "MemberBack" "返回" 90
-$memberBackButton.Add_Click({ Show-WelcomePage })
+$memberBackButton.Add_Click({ Return-ToWelcome })
 $script:backButtons += $memberBackButton
 Add-PageControl $script:memberPanel $memberBackButton 0 0
 
@@ -1330,15 +1520,19 @@ $statusActions.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
 
 $refreshStatusButton = New-LayoutButton "RefreshStatus" "刷新状态" 100
 $refreshStatusButton.Add_Click({ $null = Get-NodeStatus })
+$script:refreshStatusButton = $refreshStatusButton
 [void]$statusActions.Controls.Add($refreshStatusButton)
 $connectButton = New-LayoutButton "ConnectNode" "连接" 90
 $connectButton.Add_Click({ Connect-Node })
+$script:connectButton = $connectButton
 [void]$statusActions.Controls.Add($connectButton)
 $disconnectButton = New-LayoutButton "DisconnectNode" "断开" 90
 $disconnectButton.Add_Click({ Disconnect-Node })
+$script:disconnectButton = $disconnectButton
 [void]$statusActions.Controls.Add($disconnectButton)
 $leaveButton = New-LayoutButton "LeaveRoom" "离开房间" 110
-$leaveButton.Add_Click({ Leave-Node })
+$leaveButton.Add_Click({ Exit-ActiveRoom })
+$script:leaveButton = $leaveButton
 [void]$statusActions.Controls.Add($leaveButton)
 
 $script:logBox = New-Object System.Windows.Forms.TextBox
@@ -1377,7 +1571,7 @@ $script:statusRefreshTimer.Add_Tick({ Invoke-AutomaticStatusRefresh })
 
 $script:ipv6AddressBox.Add_TextChanged({
     if ($script:updatingEndpoint) { return }
-    try { Update-ControlEndpoint } catch { $script:hostStartButton.Enabled = $false }
+    try { Update-ControlEndpoint } catch { Update-UiFlowControls }
 })
 
 $script:form.Add_FormClosing({ Stop-AllResources })
@@ -1405,8 +1599,11 @@ if ($initialIPv6 -ne "") {
 }
 Set-PrimaryBusy $false ""
 Show-WelcomePage
-try {
-    [void][System.Windows.Forms.Application]::Run($script:form)
+[void][System.Windows.Forms.Application]::Run($script:form)
 } finally {
-    Stop-AllResources
+    if ($script:uiInstanceActive) {
+        Stop-AllResources
+        Exit-UiInstance
+        $script:uiInstanceActive = $false
+    }
 }

@@ -5,12 +5,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Eser-s-Organization/ipv6mesh/internal/ipc"
 )
@@ -724,5 +726,146 @@ func TestInstallScriptWaitsForNamedPipeReadinessAfterServiceStart(t *testing.T) 
 		if !strings.Contains(contents, required) {
 			t.Errorf("readiness logic missing %q", required)
 		}
+	}
+}
+
+func TestWindowsUIFlowTransitions(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+$function = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-UiFlowTransition' }, $true) | Select-Object -First 1
+if ($null -eq $function) { Write-Error 'Test-UiFlowTransition function not found'; exit 1 }
+. ([scriptblock]::Create($function.Extent.Text))
+$allowed = @(
+    @('Idle','HostSetup'), @('Idle','MemberSetup'),
+    @('HostSetup','Idle'), @('HostSetup','PreparingHost'),
+    @('MemberSetup','Idle'), @('MemberSetup','PreparingMember'),
+    @('PreparingHost','Hosting'), @('PreparingHost','Cleaning'),
+    @('PreparingMember','JoinedMember'), @('PreparingMember','Cleaning'),
+    @('Hosting','Cleaning'), @('JoinedMember','Cleaning'),
+    @('Cleaning','Idle'), @('Cleaning','HostSetup'), @('Cleaning','MemberSetup')
+)
+foreach ($pair in $allowed) { if (!(Test-UiFlowTransition -From $pair[0] -To $pair[1])) { throw ('rejected ' + ($pair -join ' -> ')) } }
+$rejected = @(
+    @('Hosting','MemberSetup'), @('Hosting','JoinedMember'),
+    @('JoinedMember','HostSetup'), @('JoinedMember','Hosting'),
+    @('PreparingHost','PreparingMember'), @('PreparingMember','PreparingHost')
+)
+foreach ($pair in $rejected) { if (Test-UiFlowTransition -From $pair[0] -To $pair[1]) { throw ('accepted ' + ($pair -join ' -> ')) } }
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell flow-transition check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWindowsUISingleInstance(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "ui.ps1")
+	for _, required := range []string{
+		`Global\IPv6Mesh.WindowsUI`,
+		"function Enter-UiInstance",
+		"function Exit-UiInstance",
+		"IPv6Mesh 已在运行。请使用现有窗口。",
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("UI missing single-instance behavior %q", required)
+		}
+	}
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	readyPath := filepath.Join(t.TempDir(), "ready")
+	releasePath := filepath.Join(filepath.Dir(readyPath), "release")
+	fileExists := func(path string) bool { _, err := os.Stat(path); return err == nil }
+	holder := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `$created = $false; $held = New-Object System.Threading.Mutex($true, 'Global\IPv6Mesh.WindowsUI', [ref]$created); if (!$created) { exit 2 }; [IO.File]::WriteAllText($env:IPV6MESH_MUTEX_READY, 'ready'); while (!(Test-Path -LiteralPath $env:IPV6MESH_MUTEX_RELEASE)) { Start-Sleep -Milliseconds 50 }; $held.ReleaseMutex(); $held.Dispose()`)
+	holder.Env = append(os.Environ(), "IPV6MESH_MUTEX_READY="+readyPath, "IPV6MESH_MUTEX_RELEASE="+releasePath)
+	if err := holder.Start(); err != nil {
+		t.Fatalf("start mutex holder: %v", err)
+	}
+	defer func() {
+		_ = os.WriteFile(releasePath, []byte("release"), 0600)
+		if holder.ProcessState == nil {
+			_ = holder.Process.Kill()
+		}
+		_ = holder.Wait()
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !fileExists(readyPath) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !fileExists(readyPath) {
+		t.Fatal("mutex holder did not become ready")
+	}
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+$function = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Enter-UiInstance' }, $true) | Select-Object -First 1
+. ([scriptblock]::Create($function.Extent.Text))
+$script:uiMutex = $null
+$script:ownsUiMutex = $false
+if (Enter-UiInstance) { throw 'second instance acquired held mutex' }
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell single-instance check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWindowsUIMemberPreflight(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "ui.ps1")
+	if !strings.Contains(contents, "function Assert-MemberControlReady") {
+		t.Fatal("Assert-MemberControlReady function not found")
+	}
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+function Get-FunctionText([string]$name) {
+    $node = $ast.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq $name }, $true) | Select-Object -First 1
+    if ($null -eq $node) { throw ($name + ' function not found') }
+    return $node.Extent.Text
+}
+$preflight = Get-FunctionText 'Assert-MemberControlReady'
+if ($preflight -notmatch 'Test-ControlHealth\s+-Quiet') { throw 'preflight is not quiet health check' }
+if ($preflight -notmatch '房主控制面不可访问，请确认房主窗口仍在运行且 TCP 8080 可达。') { throw 'preflight message is not safe' }
+if ($preflight -match 'Start-Sleep|while\s*\(|for\s*\(') { throw 'preflight contains a retry loop' }
+$member = Get-FunctionText 'Join-MemberRoom'
+$memberState = $member.IndexOf("Set-UiFlowState 'PreparingMember'")
+$endpoint = $member.IndexOf('room", "endpoint')
+$preflightCall = $member.IndexOf('Assert-MemberControlReady')
+$install = $member.IndexOf('Install-NodeService')
+if ($member.IndexOf('HostSetup') -ge 0 -or $memberState -lt 0 -or $memberState -gt $endpoint -or $endpoint -gt $preflightCall -or $preflightCall -gt $install) { throw 'member state/preflight ordering is invalid' }
+	$hostText = Get-FunctionText 'Start-HostRoom'
+	$hostState = $hostText.IndexOf("Set-UiFlowState 'PreparingHost'")
+	if ($hostText.IndexOf('HostSetup') -lt 0 -or $hostState -lt 0 -or $hostState -gt $hostText.IndexOf('Refresh-LocalIPv6') -or $hostState -gt $hostText.IndexOf('Invoke-VpnCtl')) { throw 'host state ordering is invalid' }
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell member-preflight check failed: %v\n%s", err, output)
 	}
 }
