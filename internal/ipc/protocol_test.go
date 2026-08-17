@@ -33,6 +33,19 @@ func TestDecodeRequestAcceptsSupportedCommands(t *testing.T) {
 	}
 }
 
+func TestCommandTimeoutClass(t *testing.T) {
+	for _, command := range []Command{CommandStatus, CommandConnect, CommandDisconnect} {
+		if got := commandTimeoutClass(command); got != localCommandTimeout {
+			t.Errorf("%s = %v", command, got)
+		}
+	}
+	for _, command := range []Command{CommandJoin, CommandJoinRoom, CommandLeave, CommandRoomMembers} {
+		if got := commandTimeoutClass(command); got != networkCommandTimeout {
+			t.Errorf("%s = %v", command, got)
+		}
+	}
+}
+
 func TestRoomMembersRequestRoundTripAndRejectsArguments(t *testing.T) {
 	request := Request{Type: CommandRoomMembers}
 	encoded, err := MarshalRequest(request)

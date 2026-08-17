@@ -693,3 +693,36 @@ func TestInstallScriptStopsExistingServiceBeforeCopyingFiles(t *testing.T) {
 		t.Fatalf("Stop-Service occurs after Copy-Item (stop=%d, copy=%d)", stopIndex, copyIndex)
 	}
 }
+
+func readWindowsPackagingFile(t *testing.T, name string) string {
+	t.Helper()
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	path := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", name)
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(contents)
+}
+
+func TestInstallScriptWaitsForNamedPipeReadinessAfterServiceStart(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "install.ps1")
+	start := strings.Index(contents, "Start-Service -Name $ServiceName")
+	waitOffset := strings.Index(contents[start:], "Wait-NodeServiceReady")
+	wait := -1
+	if start >= 0 && waitOffset >= 0 {
+		wait = start + waitOffset
+	}
+	success := strings.Index(contents, `Write-Host "IPv6Mesh installed`)
+	if start < 0 || wait < 0 || success < 0 || wait < start || wait > success {
+		t.Fatalf("readiness order start=%d wait=%d success=%d", start, wait, success)
+	}
+	for _, required := range []string{"vpnctl.exe", `@("status")`, "15", "ConvertFrom-Json", ".ok"} {
+		if !strings.Contains(contents, required) {
+			t.Errorf("readiness logic missing %q", required)
+		}
+	}
+}

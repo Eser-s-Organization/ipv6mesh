@@ -69,6 +69,29 @@ function Wait-FileAvailable {
     }
 }
 
+function Wait-NodeServiceReady {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$VpnCtl,
+        [int]$TimeoutSeconds = 15
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        try {
+            $output = & $VpnCtl @("status") 2>$null
+            if ($LASTEXITCODE -eq 0 -and ![string]::IsNullOrWhiteSpace(($output -join ""))) {
+                $response = ($output -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop
+                if ($response.ok -eq $true) {
+                    return
+                }
+            }
+        } catch {}
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    throw "Timed out waiting for IPv6Mesh node service IPC readiness"
+}
+
 $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($null -ne $existingService) {
     if ($existingService.Status -ne "Stopped") {
@@ -126,6 +149,7 @@ if (-not (Get-NetFirewallRule -DisplayName $firewallRule -ErrorAction SilentlyCo
 
 if ($StartService) {
     Start-Service -Name $ServiceName
+    Wait-NodeServiceReady -VpnCtl (Join-Path $InstallDirectory "vpnctl.exe") -TimeoutSeconds 15
 }
 Write-Host "IPv6Mesh installed in $InstallDirectory"
 Write-Host "Control URL: $ControlUrl"

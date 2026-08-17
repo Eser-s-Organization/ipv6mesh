@@ -14,15 +14,23 @@ import (
 var ErrUnsupported = errors.New("named-pipe IPC is unavailable")
 
 type Client struct {
-	Path    string
-	Timeout time.Duration
+	Path           string
+	Timeout        time.Duration
+	NetworkTimeout time.Duration
 }
 
 func NewClient(path string) *Client {
 	if path == "" {
 		path = DefaultPipeName
 	}
-	return &Client{Path: path, Timeout: 5 * time.Second}
+	return &Client{Path: path, Timeout: 5 * time.Second, NetworkTimeout: 45 * time.Second}
+}
+
+func (client *Client) timeoutFor(command Command) time.Duration {
+	if commandTimeoutClass(command) == networkCommandTimeout && client.NetworkTimeout > 0 {
+		return client.NetworkTimeout
+	}
+	return client.Timeout
 }
 
 func (client *Client) Call(ctx context.Context, request Request) (Response, error) {
@@ -38,8 +46,8 @@ func (client *Client) Call(ctx context.Context, request Request) (Response, erro
 		return Response{}, err
 	}
 	defer connection.Close()
-	if client.Timeout > 0 {
-		_ = connection.SetDeadline(time.Now().Add(client.Timeout))
+	if timeout := client.timeoutFor(request.Type); timeout > 0 {
+		_ = connection.SetDeadline(time.Now().Add(timeout))
 	}
 	if _, err := connection.Write(payload); err != nil {
 		return Response{}, err

@@ -27,6 +27,13 @@ var (
 
 type Command string
 
+type timeoutClass uint8
+
+const (
+	localCommandTimeout timeoutClass = iota
+	networkCommandTimeout
+)
+
 const (
 	CommandStatus      Command = "status"
 	CommandJoin        Command = "join"
@@ -36,6 +43,15 @@ const (
 	CommandDisconnect  Command = "disconnect"
 	CommandRoomMembers Command = "room_members"
 )
+
+func commandTimeoutClass(command Command) timeoutClass {
+	switch command {
+	case CommandJoin, CommandJoinRoom, CommandLeave, CommandRoomMembers:
+		return networkCommandTimeout
+	default:
+		return localCommandTimeout
+	}
+}
 
 type RoomMemberState string
 
