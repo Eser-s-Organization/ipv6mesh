@@ -310,6 +310,9 @@ func DecodeResponse(data []byte) (Response, error) {
 		if !response.OK {
 			return Response{}, errors.Join(ErrInvalidResponse, errors.New("members are only valid on success responses"))
 		}
+		if strings.TrimSpace(response.NetworkID) == "" {
+			return Response{}, errors.Join(ErrInvalidResponse, errors.New("members response requires network_id"))
+		}
 		members, err := decodeRoomMembers(raw)
 		if err != nil {
 			return Response{}, errors.Join(ErrInvalidResponse, err)

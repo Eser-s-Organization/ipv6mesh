@@ -92,6 +92,43 @@ function Wait-NodeServiceReady {
     throw "Timed out waiting for IPv6Mesh node service IPC readiness"
 }
 
+function Stop-StartedNodeService {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName
+    )
+
+    try {
+        Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+        $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($null -ne $service) {
+            $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(15))
+        }
+    } catch {}
+}
+
+function Start-NodeServiceAndWait {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName,
+        [Parameter(Mandatory = $true)]
+        [string]$VpnCtl,
+        [int]$TimeoutSeconds = 15
+    )
+
+    $startedByThisInvocation = $false
+    try {
+        Start-Service -Name $ServiceName
+        $startedByThisInvocation = $true
+        Wait-NodeServiceReady -VpnCtl $VpnCtl -TimeoutSeconds $TimeoutSeconds
+    } catch {
+        if ($startedByThisInvocation) {
+            Stop-StartedNodeService -ServiceName $ServiceName
+        }
+        throw
+    }
+}
+
 $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($null -ne $existingService) {
     if ($existingService.Status -ne "Stopped") {
@@ -148,8 +185,7 @@ if (-not (Get-NetFirewallRule -DisplayName $firewallRule -ErrorAction SilentlyCo
 }
 
 if ($StartService) {
-    Start-Service -Name $ServiceName
-    Wait-NodeServiceReady -VpnCtl (Join-Path $InstallDirectory "vpnctl.exe") -TimeoutSeconds 15
+    Start-NodeServiceAndWait -ServiceName $ServiceName -VpnCtl (Join-Path $InstallDirectory "vpnctl.exe") -TimeoutSeconds 15
 }
 Write-Host "IPv6Mesh installed in $InstallDirectory"
 Write-Host "Control URL: $ControlUrl"

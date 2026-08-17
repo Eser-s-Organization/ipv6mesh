@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Eser-s-Organization/ipv6mesh/internal/control"
 	"github.com/Eser-s-Organization/ipv6mesh/internal/identity"
@@ -296,28 +297,45 @@ func (service *Service) finishJoin(ctx context.Context, result JoinResult) ipc.R
 	controlClient := service.options.Control
 	reconciler := service.options.Reconciler
 	service.mu.RUnlock()
-	if strings.TrimSpace(result.NetworkID) == "" || strings.TrimSpace(result.VirtualIPv4) == "" || controlClient == nil {
+	if controlClient == nil {
+		return ipc.ErrorResponse(CodeControlFailed)
+	}
+	rollback := func() {
+		cleanupContext, cancel := context.WithTimeout(context.Background(), finishJoinCleanupTimeout)
+		defer cancel()
+		_ = controlClient.Leave(cleanupContext, result.NetworkID)
+	}
+	if strings.TrimSpace(result.NetworkID) == "" || strings.TrimSpace(result.VirtualIPv4) == "" {
+		rollback()
 		return ipc.ErrorResponse(CodeControlFailed)
 	}
 	if reconciler != nil {
 		snapshotClient, ok := controlClient.(SnapshotClient)
 		if !ok {
+			rollback()
 			return ipc.ErrorResponse(CodeControlFailed)
 		}
 		snapshot, snapshotErr := snapshotClient.Snapshot(ctx, result.NetworkID)
-		if snapshotErr != nil || reconciler.Apply(ctx, snapshot) != nil {
-			_ = controlClient.Leave(ctx, result.NetworkID)
+		if snapshotErr != nil {
+			rollback()
+			return ipc.ErrorResponse(safeControlErrorCode(snapshotErr))
+		}
+		if err := reconciler.Apply(ctx, snapshot); err != nil {
+			rollback()
 			return ipc.ErrorResponse(CodeAdapterFailed)
 		}
 	}
 	service.mu.Lock()
-	defer service.mu.Unlock()
 	if service.joined != nil {
+		service.mu.Unlock()
+		rollback()
 		return ipc.ErrorResponse(CodeAlreadyJoined)
 	}
 	service.joined = &result
 	service.status = ipc.Status{NetworkID: result.NetworkID, VirtualIPv4: result.VirtualIPv4, PathState: ipc.PathStateDisconnected, ConfigGeneration: result.ConfigGeneration}
-	return ipc.SuccessResponse(service.status)
+	status := service.status
+	service.mu.Unlock()
+	return ipc.SuccessResponse(status)
 }
 
 func canonicalControlURL(value string) (string, bool) {
@@ -512,10 +530,11 @@ func contextErr(ctx context.Context) error {
 }
 
 const (
-	CodeAlreadyJoined = "already_joined"
-	CodeNotJoined     = "not_joined"
-	CodeControlFailed = "control_failed"
-	CodeAdapterFailed = "adapter_failed"
+	CodeAlreadyJoined        = "already_joined"
+	CodeNotJoined            = "not_joined"
+	CodeControlFailed        = "control_failed"
+	CodeAdapterFailed        = "adapter_failed"
+	finishJoinCleanupTimeout = 5 * time.Second
 )
 
 // Handler applies authorization and translates strict JSON into service

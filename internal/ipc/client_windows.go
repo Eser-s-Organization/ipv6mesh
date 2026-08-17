@@ -33,6 +33,21 @@ func (client *Client) timeoutFor(command Command) time.Duration {
 	return client.Timeout
 }
 
+func (client *Client) callDeadline(ctx context.Context, command Command, now time.Time) (time.Time, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	if timeout := client.timeoutFor(command); timeout > 0 {
+		budgetDeadline := now.Add(timeout)
+		if !hasDeadline || budgetDeadline.Before(deadline) {
+			deadline = budgetDeadline
+			hasDeadline = true
+		}
+	}
+	return deadline, hasDeadline
+}
+
 func (client *Client) Call(ctx context.Context, request Request) (Response, error) {
 	if client == nil || client.Path == "" {
 		return Response{}, ErrUnsupported
@@ -41,13 +56,23 @@ func (client *Client) Call(ctx context.Context, request Request) (Response, erro
 	if err != nil {
 		return Response{}, err
 	}
-	connection, err := winio.DialPipeContext(ctx, client.Path)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline, hasDeadline := client.callDeadline(ctx, request.Type, time.Now())
+	callContext := ctx
+	var cancel context.CancelFunc
+	if hasDeadline {
+		callContext, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
+	connection, err := winio.DialPipeContext(callContext, client.Path)
 	if err != nil {
 		return Response{}, err
 	}
 	defer connection.Close()
-	if timeout := client.timeoutFor(request.Type); timeout > 0 {
-		_ = connection.SetDeadline(time.Now().Add(timeout))
+	if hasDeadline {
+		_ = connection.SetDeadline(deadline)
 	}
 	if _, err := connection.Write(payload); err != nil {
 		return Response{}, err

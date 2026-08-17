@@ -464,7 +464,7 @@ func TestWindowsUIOperationPagesUseResponsiveGrids(t *testing.T) {
 		`$script:hostPanel = New-ResponsivePageGrid "HostPanel"`,
 		`$script:memberPanel = New-ResponsivePageGrid "MemberPanel"`,
 		`$page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))`,
-		`$page.MinimumSize = New-Object System.Drawing.Size(620, 0)`,
+		`$page.MinimumSize = New-Object System.Drawing.Size(0, 0)`,
 		`$script:ipv6AddressBox.Dock = [System.Windows.Forms.DockStyle]::Fill`,
 		`$script:memberHostIPv6Box.Dock = [System.Windows.Forms.DockStyle]::Fill`,
 		`$script:operationSplit.Panel1.AutoScroll = $true`,
@@ -548,10 +548,81 @@ func TestWindowsUIResponsiveLayoutAudit(t *testing.T) {
 	if !strings.Contains(compact, `"Passed":true`) {
 		t.Fatalf("responsive WinForms layout audit did not report success:\n%s", output)
 	}
-	for _, required := range []string{`"Case":"preferred"`, `"Case":"minimum"`, `"Case":"large"`, `"Case":"constrained"`, `"Case":"large-font"`, `"Case":"upper-limit"`, `"Case":"lower-limit"`, `"MemberLayoutMode":"Wide"`, `"MemberLayoutMode":"Narrow"`, `"MemberPanelWidth":`, `"MemberGridWidth":`, `"SettingsMemberOverlap":0`, `"SplitterPreserved":true`} {
+	for _, required := range []string{`"Case":"preferred"`, `"Case":"minimum"`, `"Case":"large"`, `"Case":"constrained"`, `"Case":"large-font"`, `"Case":"upper-limit"`, `"Case":"lower-limit"`, `"MemberLayoutMode":"Wide"`, `"MemberLayoutMode":"Narrow"`, `"MemberPanelWidth":`, `"MemberGridWidth":`, `"SettingsMemberOverlap":0`, `"SplitterPreserved":true`, `"HostPageShellVisible":true`, `"MemberPageShellVisible":false`, `"HostPageShellArea":0`, `"MemberMinimumWidth":`, `"MemberMaximumWidth":`, `"MemberWidthWithinBounds":true`} {
 		if !strings.Contains(compact, required) {
 			t.Errorf("responsive WinForms layout audit missing sample %s", required)
 		}
+	}
+}
+
+func TestWindowsUIResponsiveMemberLayoutUsesMeasuredClientSpace(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "ui.ps1")
+	for _, required := range []string{
+		"GetPreferredSize",
+		".MinimumSize",
+		".Margin",
+		"function Get-MemberLayoutPolicy",
+		"MemberMinimumWidth",
+		"MemberMaximumWidth",
+		"MemberWidthWithinBounds",
+	} {
+		if !strings.Contains(contents, required) {
+			t.Errorf("UI missing measured member-layout behavior %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"-SettingsPreferredWidth 620",
+		"-MembersMinimumWidth 300",
+		"-Gap 16",
+		"[System.Windows.Forms.SizeType]::Absolute, 320",
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("UI retains raw member-layout constant %q", forbidden)
+		}
+	}
+}
+
+func TestWindowsUIInstallReadinessFailureStopsOnlyItsStartedService(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "install.ps1")
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	scriptPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "install.ps1")
+	quotedPath := strings.ReplaceAll(scriptPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+$node = $ast.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'Start-NodeServiceAndWait' }, $true) | Select-Object -First 1
+if ($null -eq $node) { throw 'Start-NodeServiceAndWait function not found' }
+$stopNode = $ast.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'Stop-StartedNodeService' }, $true) | Select-Object -First 1
+if ($null -eq $stopNode) { throw 'Stop-StartedNodeService function not found' }
+. ([scriptblock]::Create($stopNode.Extent.Text))
+. ([scriptblock]::Create($node.Extent.Text))
+$script:startCalls = 0
+$script:stopCalls = 0
+$script:startMode = 'success'
+function Start-Service { param([string]$Name) $script:startCalls++; if ($script:startMode -eq 'fail') { throw 'start failed' } }
+function Wait-NodeServiceReady { param([string]$VpnCtl, [int]$TimeoutSeconds) throw 'readiness failed' }
+function Stop-Service { param([string]$Name, [switch]$Force, [string]$ErrorAction) $script:stopCalls++ }
+function Get-Service { param([string]$Name, [string]$ErrorAction) return $null }
+$failed = $false
+try { Start-NodeServiceAndWait -ServiceName 'test' -VpnCtl 'vpnctl.exe' -TimeoutSeconds 15 } catch { $failed = $true }
+if (!$failed -or $script:startCalls -ne 1 -or $script:stopCalls -ne 1) { throw ('readiness rollback start=' + $script:startCalls + ' stop=' + $script:stopCalls) }
+$script:startMode = 'fail'
+$failed = $false
+try { Start-NodeServiceAndWait -ServiceName 'test' -VpnCtl 'vpnctl.exe' -TimeoutSeconds 15 } catch { $failed = $true }
+if (!$failed -or $script:startCalls -ne 2 -or $script:stopCalls -ne 1) { throw ('preexisting ownership stop=' + $script:stopCalls) }
+`
+	if !strings.Contains(contents, "Start-NodeServiceAndWait") {
+		t.Fatal("install script missing testable service-start ownership helper")
+	}
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install readiness rollback check failed: %v\n%s", err, output)
 	}
 }
 

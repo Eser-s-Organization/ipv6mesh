@@ -89,6 +89,29 @@ func TestNamedPipeSlowNetworkCommandUsesExtendedDeadline(t *testing.T) {
 	}
 }
 
+func TestNamedPipeCallHonorsEarlierCallerDeadlineAcrossRead(t *testing.T) {
+	path := fmt.Sprintf(`\\.\pipe\ipv6mesh-caller-deadline-%d`, time.Now().UnixNano())
+	server, err := newServerWithOptions(path, slowNetworkTestPipeHandler{}, testPipeAuthorizer{}, serverOptions{SecurityDescriptor: "D:P(A;;GA;;;WD)"})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer server.Close()
+	serverContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.Serve(serverContext) }()
+
+	callContext, callCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer callCancel()
+	started := time.Now()
+	_, err = NewClient(path).Call(callContext, Request{Type: CommandRoomMembers})
+	if err == nil {
+		t.Fatal("slow room-members Call unexpectedly succeeded after caller deadline")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("caller deadline was not applied to the read phase: elapsed=%s err=%v", elapsed, err)
+	}
+}
+
 func TestDefaultServerConnectionTimeoutCoversNetworkCommandBudget(t *testing.T) {
 	path := fmt.Sprintf(`\\.\pipe\ipv6mesh-budget-%d`, time.Now().UnixNano())
 	server, err := NewServer(path, testPipeHandler{}, testPipeAuthorizer{})

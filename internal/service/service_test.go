@@ -26,16 +26,19 @@ func (store *fakeIdentityStore) LoadOrCreate() (identity.Identity, error) {
 }
 
 type fakeControlClient struct {
-	joinCalls      int
-	roomJoinCalls  int
-	leaveCalls     int
-	joinResult     JoinResult
-	roomJoinResult JoinResult
-	joinErr        error
-	leaveErr       error
-	snapshot       control.NetworkSnapshot
-	snapshotErr    error
-	snapshotCalls  int
+	joinCalls        int
+	roomJoinCalls    int
+	leaveCalls       int
+	joinResult       JoinResult
+	roomJoinResult   JoinResult
+	joinErr          error
+	leaveErr         error
+	leaveContexts    []context.Context
+	leaveContextErrs []error
+	snapshot         control.NetworkSnapshot
+	snapshotErr      error
+	snapshotCalls    int
+	snapshotContexts []context.Context
 }
 
 func (client *fakeControlClient) Join(context.Context, JoinRequest) (JoinResult, error) {
@@ -48,13 +51,16 @@ func (client *fakeControlClient) JoinRoom(context.Context, JoinRequest) (JoinRes
 	return client.roomJoinResult, client.joinErr
 }
 
-func (client *fakeControlClient) Leave(context.Context, string) error {
+func (client *fakeControlClient) Leave(ctx context.Context, _ string) error {
 	client.leaveCalls++
+	client.leaveContexts = append(client.leaveContexts, ctx)
+	client.leaveContextErrs = append(client.leaveContextErrs, ctx.Err())
 	return client.leaveErr
 }
 
-func (client *fakeControlClient) Snapshot(context.Context, string) (control.NetworkSnapshot, error) {
+func (client *fakeControlClient) Snapshot(ctx context.Context, _ string) (control.NetworkSnapshot, error) {
 	client.snapshotCalls++
+	client.snapshotContexts = append(client.snapshotContexts, ctx)
 	return client.snapshot, client.snapshotErr
 }
 
@@ -384,6 +390,57 @@ func TestServiceRoomJoinRollsBackAfterSnapshotFailure(t *testing.T) {
 	status := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandStatus})
 	if status.OK && status.NetworkID != "" {
 		t.Fatalf("room state retained after rollback: %#v", status)
+	}
+}
+
+func TestServiceFinishJoinSnapshotErrorsUseSafeCodesAndFreshRollbackContext(t *testing.T) {
+	tests := []struct {
+		name        string
+		snapshotErr error
+		wantCode    string
+	}{
+		{name: "timeout", snapshotErr: context.DeadlineExceeded, wantCode: ipc.CodeOperationTimeout},
+		{name: "unreachable", snapshotErr: &url.Error{Op: "GET", URL: "http://control.invalid/", Err: errors.New("connection refused")}, wantCode: ipc.CodeControlUnreachable},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			controlClient := &fakeControlClient{snapshotErr: test.snapshotErr, leaveErr: errors.New("rollback secret should stay hidden")}
+			reconciler := &fakeSnapshotApplier{}
+			service := New(Options{Control: controlClient, Reconciler: reconciler})
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			response := service.finishJoin(ctx, JoinResult{NetworkID: "room-1", VirtualIPv4: "10.42.0.9", DisplayName: "MEMBER-PC"})
+			if response.OK || response.Error == nil || response.Error.Code != test.wantCode {
+				t.Fatalf("finishJoin response = %#v, want safe code %q", response, test.wantCode)
+			}
+			if response.Error.Message != "" {
+				t.Fatalf("finishJoin error message = %q, want empty", response.Error.Message)
+			}
+			if len(controlClient.leaveContextErrs) != 1 || controlClient.leaveContextErrs[0] != nil {
+				t.Fatalf("rollback context = %#v, want a live bounded context", controlClient.leaveContexts)
+			}
+		})
+	}
+}
+
+func TestServiceFinishJoinApplyFailureKeepsAdapterCodeAndFreshRollbackContext(t *testing.T) {
+	controlClient := &fakeControlClient{snapshot: control.NetworkSnapshot{NetworkID: "room-1", LocalVirtualIPv4: net.ParseIP("10.42.0.9")}, leaveErr: errors.New("rollback secret should stay hidden")}
+	reconciler := &fakeSnapshotApplier{applyErr: errors.New("adapter apply failed")}
+	service := New(Options{Control: controlClient, Reconciler: reconciler})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	response := service.finishJoin(ctx, JoinResult{NetworkID: "room-1", VirtualIPv4: "10.42.0.9", DisplayName: "MEMBER-PC"})
+	if response.OK || response.Error == nil || response.Error.Code != CodeAdapterFailed {
+		t.Fatalf("finishJoin apply response = %#v, want adapter_failed", response)
+	}
+	if response.Error.Message != "" {
+		t.Fatalf("finishJoin apply error message = %q, want empty", response.Error.Message)
+	}
+	if len(controlClient.leaveContextErrs) != 1 || controlClient.leaveContextErrs[0] != nil {
+		t.Fatalf("apply rollback context = %#v, want a live bounded context", controlClient.leaveContexts)
 	}
 }
 

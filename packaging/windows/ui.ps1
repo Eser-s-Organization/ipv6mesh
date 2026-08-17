@@ -1041,6 +1041,106 @@ function Set-PageLayoutState {
     if ($null -ne $script:operationShell) { $script:operationShell.Visible = ($Name -ne "Welcome") }
     if ($null -ne $script:hostPanel) { $script:hostPanel.Visible = ($Name -eq "Host") }
     if ($null -ne $script:memberPanel) { $script:memberPanel.Visible = ($Name -eq "Member") }
+    if ($null -ne $script:hostPageShell) {
+        $script:hostPageShell.Visible = ($Name -eq "Host")
+        if (!$script:hostPageShell.Visible) { $script:hostPageShell.SetBounds(0, 0, 0, 0) }
+    }
+    if ($null -ne $script:memberPageShell) {
+        $script:memberPageShell.Visible = ($Name -eq "Member")
+        if (!$script:memberPageShell.Visible) { $script:memberPageShell.SetBounds(0, 0, 0, 0) }
+    }
+    if ($null -ne $script:operationSplit) { $script:operationSplit.Panel1.PerformLayout() }
+}
+
+function Get-PreferredControlWidth {
+    param([Parameter(Mandatory = $true)][System.Windows.Forms.Control]$Control)
+    $preferred = $Control.GetPreferredSize((New-Object System.Drawing.Size(0, 0)))
+    $width = [Math]::Max([int]$Control.MinimumSize.Width, [int]$preferred.Width)
+    if ($Control -is [System.Windows.Forms.DataGridView]) {
+        $columnsWidth = 0
+        foreach ($column in $Control.Columns) {
+            $columnsWidth += $column.GetPreferredWidth([System.Windows.Forms.DataGridViewAutoSizeColumnMode]::AllCells, $true)
+        }
+        $width = [Math]::Max($width, $columnsWidth)
+    } elseif ($Control.Controls.Count -gt 0) {
+        if ($Control -is [System.Windows.Forms.TableLayoutPanel]) {
+            $columnWidths = @()
+            for ($columnIndex = 0; $columnIndex -lt $Control.ColumnCount; $columnIndex++) {
+                $styleWidth = 0
+                if ($columnIndex -lt $Control.ColumnStyles.Count -and $Control.ColumnStyles[$columnIndex].SizeType -eq [System.Windows.Forms.SizeType]::Absolute) {
+                    $styleWidth = [int]$Control.ColumnStyles[$columnIndex].Width
+                }
+                $columnWidths += $styleWidth
+            }
+            foreach ($child in $Control.Controls) {
+                $position = $Control.GetPositionFromControl($child)
+                if ($Control.GetColumnSpan($child) -eq 1 -and $position.Column -lt $columnWidths.Count) {
+                    $columnWidths[$position.Column] = [Math]::Max($columnWidths[$position.Column], (Get-PreferredControlWidth $child) + $child.Margin.Horizontal)
+                }
+            }
+            $width = [Math]::Max($width, $Control.Padding.Horizontal + (($columnWidths | Measure-Object -Sum).Sum))
+        } else {
+            foreach ($child in $Control.Controls) {
+                $width = [Math]::Max($width, (Get-PreferredControlWidth $child) + $child.Margin.Horizontal + $Control.Padding.Horizontal)
+            }
+        }
+    }
+    return $width
+}
+
+function Get-LayoutWidthMeasurement {
+    param([Parameter(Mandatory = $true)][System.Windows.Forms.Control]$Control)
+    $minimum = $Control.MinimumSize
+    $margin = $Control.Margin
+    $minimumContent = [Math]::Max(0, [int]$minimum.Width)
+    $preferredContent = [Math]::Max($minimumContent, (Get-PreferredControlWidth $Control))
+    return [pscustomobject]@{
+        MinimumContentWidth = $minimumContent
+        PreferredContentWidth = $preferredContent
+        MinimumWidth = $minimumContent + $margin.Left + $margin.Right
+        PreferredWidth = $preferredContent + $margin.Left + $margin.Right
+        MarginLeft = $margin.Left
+        MarginRight = $margin.Right
+    }
+}
+
+function Get-MemberLayoutPolicy {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Forms.TableLayoutPanel]$Shell,
+        [Parameter(Mandatory = $true)][System.Windows.Forms.Control]$Settings,
+        [Parameter(Mandatory = $true)][System.Windows.Forms.Control]$Members
+    )
+    $availableWidth = [Math]::Max(0, [int]$Shell.ClientSize.Width - $Shell.Padding.Horizontal)
+    $settingsMeasure = Get-LayoutWidthMeasurement $Settings
+    $membersMeasure = Get-LayoutWidthMeasurement $Members
+    $gap = [Math]::Max(0, [int]$settingsMeasure.MarginRight + [int]$membersMeasure.MarginLeft)
+    $wideThreshold = $settingsMeasure.PreferredWidth + $membersMeasure.MinimumWidth
+    $mode = if ($availableWidth -ge $wideThreshold) { "Wide" } else { "Narrow" }
+    $memberMinimumWidth = $membersMeasure.MinimumWidth
+    $memberMaximumWidth = [Math]::Max($memberMinimumWidth, $availableWidth - $settingsMeasure.MinimumWidth)
+    $memberWidth = 0
+    $settingsWidth = 0
+    if ($mode -eq "Wide") {
+        $preferredTotal = [Math]::Max(1, $settingsMeasure.PreferredWidth + $membersMeasure.PreferredWidth)
+        $extraWidth = [Math]::Max(0, $availableWidth - $preferredTotal)
+        $memberShare = [double]$membersMeasure.PreferredWidth / $preferredTotal
+        $memberWidth = $membersMeasure.PreferredWidth + [Math]::Round($extraWidth * $memberShare)
+        $memberWidth = [Math]::Min($memberMaximumWidth, [Math]::Max($memberMinimumWidth, $memberWidth))
+        $settingsWidth = [Math]::Max($settingsMeasure.MinimumWidth, $availableWidth - $memberWidth)
+    }
+    return [pscustomobject]@{
+        AvailableWidth = $availableWidth
+        Mode = $mode
+        Gap = $gap
+        SettingsMinimumWidth = $settingsMeasure.MinimumWidth
+        SettingsPreferredWidth = $settingsMeasure.PreferredWidth
+        MembersMinimumWidth = $membersMeasure.MinimumWidth
+        MembersPreferredWidth = $membersMeasure.PreferredWidth
+        MemberMinimumWidth = $memberMinimumWidth
+        MemberMaximumWidth = $memberMaximumWidth
+        MemberWidth = $memberWidth
+        SettingsWidth = $settingsWidth
+    }
 }
 
 function Set-ResponsiveMemberLayout {
@@ -1049,9 +1149,8 @@ function Set-ResponsiveMemberLayout {
     $settings = if ($script:activePage -eq "Host") { $script:hostPanel } elseif ($script:activePage -eq "Member") { $script:memberPanel } else { $null }
     $members = if ($script:activePage -eq "Host") { $script:hostMemberPanel } elseif ($script:activePage -eq "Member") { $script:memberMemberPanel } else { $null }
     if ($null -eq $shell -or $null -eq $settings -or $null -eq $members -or $shell.IsDisposed) { return }
-    $availableWidth = [Math]::Max(0, [int]$shell.ClientSize.Width)
-    if ($availableWidth -le 0 -and $null -ne $script:operationSplit) { $availableWidth = [Math]::Max(0, [int]$script:operationSplit.Panel1.ClientSize.Width) }
-    $mode = Get-MemberLayoutMode -AvailableWidth $availableWidth -SettingsPreferredWidth 620 -MembersMinimumWidth 300 -Gap 16
+    $policy = Get-MemberLayoutPolicy -Shell $shell -Settings $settings -Members $members
+    $mode = $policy.Mode
     $script:updatingMemberLayout = $true
     try {
         $shell.SuspendLayout()
@@ -1061,8 +1160,8 @@ function Set-ResponsiveMemberLayout {
             if ($mode -eq "Wide") {
                 $shell.ColumnCount = 2
                 $shell.RowCount = 1
-                [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-                [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 320)))
+                [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, $policy.SettingsWidth)))
+                [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, $policy.MemberWidth)))
                 [void]$shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
                 $shell.SetColumn($settings, 0)
                 $shell.SetRow($settings, 0)
@@ -1080,6 +1179,7 @@ function Set-ResponsiveMemberLayout {
                 $shell.SetRow($members, 1)
             }
             $shell.Tag = $mode
+            $shell.AccessibleDescription = ($policy | ConvertTo-Json -Compress)
             $shell.PerformLayout()
         } finally {
             $shell.ResumeLayout($true)
@@ -1219,7 +1319,7 @@ function New-RoomMembersPanel {
     $panel.Name = $Name
     $panel.Text = "房间成员（0）"
     $panel.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $panel.MinimumSize = New-Object System.Drawing.Size(300, 150)
+    $panel.MinimumSize = New-Object System.Drawing.Size(0, 0)
     $panel.Padding = New-Object System.Windows.Forms.Padding(10, 8, 10, 10)
 
     $layout = New-Object System.Windows.Forms.TableLayoutPanel
@@ -1245,7 +1345,7 @@ function New-RoomMembersPanel {
     $grid = New-Object System.Windows.Forms.DataGridView
     $grid.Name = "$Name`Grid"
     $grid.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $grid.MinimumSize = New-Object System.Drawing.Size(280, 100)
+    $grid.MinimumSize = New-Object System.Drawing.Size(0, 0)
     $grid.ReadOnly = $true
     $grid.AllowUserToAddRows = $false
     $grid.AllowUserToDeleteRows = $false
@@ -1265,6 +1365,18 @@ function New-RoomMembersPanel {
         $column.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
         [void]$grid.Columns.Add($column)
     }
+    $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::AllCells
+    $grid.PerformLayout()
+    $minimumGridWidth = 0
+    foreach ($column in $grid.Columns) {
+        $minimumGridWidth += $column.GetPreferredWidth([System.Windows.Forms.DataGridViewAutoSizeColumnMode]::AllCells, $true)
+    }
+    if ($minimumGridWidth -gt 0) {
+        $minimumGridHeight = [Math]::Max(0, [int]$grid.ColumnHeadersHeight)
+        $grid.MinimumSize = New-Object System.Drawing.Size($minimumGridWidth, $minimumGridHeight)
+        $panel.MinimumSize = New-Object System.Drawing.Size(($minimumGridWidth + $panel.Padding.Horizontal), ($minimumGridHeight + $panel.Padding.Vertical))
+    }
+    $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
     [void]$layout.Controls.Add($grid, 0, 1)
     $layout.SetColumnSpan($grid, 2)
     return [pscustomobject]@{ Panel = $panel; Grid = $grid; CountLabel = $countLabel; RefreshLabel = $refreshLabel }
@@ -1324,13 +1436,13 @@ function New-RoomPageShell {
     $shell.Dock = [System.Windows.Forms.DockStyle]::Top
     $shell.AutoSize = $true
     $shell.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-    $shell.ColumnCount = 2
-    $shell.RowCount = 1
+    $shell.ColumnCount = 1
+    $shell.RowCount = 2
     [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-    [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 320)))
+    [void]$shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
     [void]$shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
     [void]$shell.Controls.Add($Settings, 0, 0)
-    [void]$shell.Controls.Add($Members, 1, 0)
+    [void]$shell.Controls.Add($Members, 0, 1)
     return $shell
 }
 
@@ -1341,7 +1453,7 @@ function New-ResponsivePageGrid {
     $page.Dock = [System.Windows.Forms.DockStyle]::Top
     $page.AutoSize = $true
     $page.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-    $page.MinimumSize = New-Object System.Drawing.Size(620, 0)
+    $page.MinimumSize = New-Object System.Drawing.Size(0, 0)
     $page.Padding = New-Object System.Windows.Forms.Padding(20, 8, 20, 20)
     $page.ColumnCount = 3
     [void]$page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 130)))
@@ -1417,7 +1529,7 @@ function Invoke-ResponsiveLayoutAudit {
         @{ Name = "minimum"; Width = 900; Height = 640; Font = 9; Distance = -1 },
         @{ Name = "large"; Width = 1440; Height = 900; Font = 9; Distance = -1 },
         @{ Name = "constrained"; Width = 760; Height = 520; Font = 9; Distance = -1 },
-        @{ Name = "large-font"; Width = 900; Height = 640; Font = 12; Distance = -1 },
+        @{ Name = "large-font"; Width = 900; Height = 640; Font = 16; Distance = -1 },
         @{ Name = "upper-limit"; Width = 1120; Height = 720; Font = 9; Distance = 0 },
         @{ Name = "lower-limit"; Width = 1120; Height = 720; Font = 9; Distance = 100000 }
     )
@@ -1462,6 +1574,17 @@ function Invoke-ResponsiveLayoutAudit {
                 [void]$errors.Add("$($case.Name)/$page diagnostics visibility mismatch")
             }
 
+            $hostPageShellVisible = $null -ne $script:hostPageShell -and $script:hostPageShell.Visible
+            $memberPageShellVisible = $null -ne $script:memberPageShell -and $script:memberPageShell.Visible
+            $hostPageShellArea = if ($null -ne $script:hostPageShell) { [int]$script:hostPageShell.Bounds.Width * [int]$script:hostPageShell.Bounds.Height } else { 0 }
+            $memberPageShellArea = if ($null -ne $script:memberPageShell) { [int]$script:memberPageShell.Bounds.Width * [int]$script:memberPageShell.Bounds.Height } else { 0 }
+            if ($hostPageShellVisible -ne ($page -eq "Host") -or $memberPageShellVisible -ne ($page -eq "Member")) {
+                [void]$errors.Add("$($case.Name)/$page page-shell visibility mismatch")
+            }
+            if ((!$hostPageShellVisible -and $hostPageShellArea -ne 0) -or (!$memberPageShellVisible -and $memberPageShellArea -ne 0)) {
+                [void]$errors.Add("$($case.Name)/$page inactive page shell occupies space")
+            }
+
             if ($wantDiagnostics) {
                 $upper = $script:operationSplit.Panel1.RectangleToScreen($script:operationSplit.Panel1.ClientRectangle)
                 $lower = $script:operationSplit.Panel2.RectangleToScreen($script:operationSplit.Panel2.ClientRectangle)
@@ -1503,12 +1626,18 @@ function Invoke-ResponsiveLayoutAudit {
             $memberGridWidth = 0
             $memberGridHeight = 0
             $settingsMemberOverlap = 0
+            $memberMinimumWidth = 0
+            $memberMaximumWidth = 0
+            $memberWidthWithinBounds = $true
             if ($wantDiagnostics) {
                 $memberShell = if ($page -eq "Host") { $script:hostPageShell } else { $script:memberPageShell }
                 $memberPanel = if ($page -eq "Host") { $script:hostMemberPanel } else { $script:memberMemberPanel }
                 $memberGrid = if ($page -eq "Host") { $script:hostMemberGrid } else { $script:memberMemberGrid }
                 $settingsPanel = if ($page -eq "Host") { $script:hostPanel } else { $script:memberPanel }
+                $policy = Get-MemberLayoutPolicy -Shell $memberShell -Settings $settingsPanel -Members $memberPanel
                 $memberMode = if ($null -ne $memberShell.Tag) { [string]$memberShell.Tag } else { "Narrow" }
+                $memberMinimumWidth = [int]$policy.MemberMinimumWidth
+                $memberMaximumWidth = [int]$policy.MemberMaximumWidth
                 $settingsRectangle = $settingsPanel.RectangleToScreen($settingsPanel.ClientRectangle)
                 $memberRectangle = $memberPanel.RectangleToScreen($memberPanel.ClientRectangle)
                 $memberGridRectangle = $memberGrid.RectangleToScreen($memberGrid.ClientRectangle)
@@ -1518,10 +1647,13 @@ function Invoke-ResponsiveLayoutAudit {
                 $memberPanelHeight = $memberRectangle.Height
                 $memberGridWidth = $memberGridRectangle.Width
                 $memberGridHeight = $memberGridRectangle.Height
-                $expectedMemberMode = if ($case.Width -ge 1120) { "Wide" } else { "Narrow" }
+                $actualMemberWidth = [int]$memberPanel.Bounds.Width + $memberPanel.Margin.Left + $memberPanel.Margin.Right
+                $memberWidthWithinBounds = $memberMode -ne "Wide" -or ($actualMemberWidth -ge $memberMinimumWidth -and $actualMemberWidth -le $memberMaximumWidth)
+                $expectedMemberMode = [string]$policy.Mode
                 if ($memberMode -ne $expectedMemberMode) { [void]$errors.Add("$($case.Name)/$page member layout mode mismatch: $memberMode") }
                 if ($memberPanelWidth -le 0 -or $memberPanelHeight -le 0 -or $memberGridWidth -le 0 -or $memberGridHeight -le 0) { [void]$errors.Add("$($case.Name)/$page member panel or grid has no usable area") }
                 if ($settingsMemberOverlap -ne 0) { [void]$errors.Add("$($case.Name)/$page settings and member panel overlap") }
+                if (!$memberWidthWithinBounds) { [void]$errors.Add("$($case.Name)/$page member width is outside measured bounds") }
             }
             [void]$samples.Add([pscustomobject]@{
                 Case = $case.Name
@@ -1536,6 +1668,13 @@ function Invoke-ResponsiveLayoutAudit {
                 MemberGridWidth = $memberGridWidth
                 MemberGridHeight = $memberGridHeight
                 SettingsMemberOverlap = $settingsMemberOverlap
+                HostPageShellVisible = $hostPageShellVisible
+                MemberPageShellVisible = $memberPageShellVisible
+                HostPageShellArea = $hostPageShellArea
+                MemberPageShellArea = $memberPageShellArea
+                MemberMinimumWidth = $memberMinimumWidth
+                MemberMaximumWidth = $memberMaximumWidth
+                MemberWidthWithinBounds = $memberWidthWithinBounds
                 SplitterPreserved = ($splitterBeforeMemberLayout -eq $script:operationSplit.SplitterDistance)
             })
         }
@@ -1547,6 +1686,14 @@ function Invoke-ResponsiveLayoutAudit {
         if ($large.InputWidth -le $minimum.InputWidth) { [void]$errors.Add("$page input did not grow") }
         if ($large.LogWidth -le $minimum.LogWidth) { [void]$errors.Add("$page log width did not grow") }
         if ($large.LogHeight -le $minimum.LogHeight) { [void]$errors.Add("$page log height did not grow") }
+    }
+
+    foreach ($page in @("Host", "Member")) {
+        $preferred = $samples | Where-Object { $_.Case -eq "preferred" -and $_.Page -eq $page } | Select-Object -First 1
+        $large = $samples | Where-Object { $_.Case -eq "large" -and $_.Page -eq $page } | Select-Object -First 1
+        if ($preferred.MemberLayoutMode -eq "Wide" -and $large.MemberLayoutMode -eq "Wide" -and $large.MemberPanelWidth -le $preferred.MemberPanelWidth) {
+            [void]$errors.Add("$page member width did not receive a share of extra wide-screen space")
+        }
     }
 
     return [pscustomobject]@{

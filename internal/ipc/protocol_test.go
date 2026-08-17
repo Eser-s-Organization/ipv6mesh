@@ -102,6 +102,9 @@ func TestRoomMembersResponseRoundTripIsSanitized(t *testing.T) {
 func TestRoomMembersResponseRejectsUnknownNullAndInvalidFields(t *testing.T) {
 	values := []string{
 		`{"ok":true,"path_state":"disconnected","config_generation":0,"network_id":"room-1","members":null}`,
+		`{"ok":true,"path_state":"disconnected","config_generation":0,"members":[]}`,
+		`{"ok":true,"path_state":"disconnected","config_generation":0,"network_id":"","members":[]}`,
+		`{"ok":true,"path_state":"disconnected","config_generation":0,"network_id":null,"members":[]}`,
 		`{"ok":true,"path_state":"disconnected","config_generation":0,"network_id":"room-1","members":[{"display_name":"A","virtual_ipv4":"10.42.0.2","is_local":true,"state":"online","token":"secret"}]}`,
 		`{"ok":true,"path_state":"disconnected","config_generation":0,"network_id":"room-1","members":[{"display_name":"","virtual_ipv4":"10.42.0.2","is_local":true,"state":"online"}]}`,
 		`{"ok":true,"path_state":"disconnected","config_generation":0,"network_id":"room-1","members":[{"display_name":"A","virtual_ipv4":"2001:db8::1","is_local":true,"state":"online"}]}`,
