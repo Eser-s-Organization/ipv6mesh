@@ -9,7 +9,9 @@ param(
     [string]$DataDirectory = (Join-Path $env:ProgramData "IPv6Mesh"),
     [string]$ServiceName = "IPv6Mesh",
     [string]$Version = "dev",
-    [switch]$LayoutAudit
+    [switch]$LayoutAudit,
+    [switch]$AsyncPollingAudit,
+    [switch]$PreparationRaceAudit
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,6 +35,16 @@ $script:memberVirtualIPv4Label = $null
 $script:welcomePanel = $null
 $script:hostPanel = $null
 $script:memberPanel = $null
+$script:hostPageShell = $null
+$script:memberPageShell = $null
+$script:hostMemberPanel = $null
+$script:memberMemberPanel = $null
+$script:hostMemberGrid = $null
+$script:memberMemberGrid = $null
+$script:hostMemberCountLabel = $null
+$script:memberMemberCountLabel = $null
+$script:hostMemberRefreshLabel = $null
+$script:memberMemberRefreshLabel = $null
 $script:diagnosticsPanel = $null
 $script:contentPanel = $null
 $script:operationShell = $null
@@ -53,9 +65,52 @@ $script:primaryBusy = $false
 $script:updatingEndpoint = $false
 $script:statusRefreshTimer = $null
 $script:statusRefreshInProgress = $false
+$script:automaticPollingOperation = $null
+$script:automaticPollingGeneration = 0
+$script:automaticPollingApplyPending = $false
+$script:automaticPollingPendingResult = $null
+$script:automaticPollingPendingGeneration = 0
+$script:asyncPollingAuditMode = [bool]($AsyncPollingAudit -or $PreparationRaceAudit)
+$script:asyncPollingAuditCounters = @{
+    WorkerStarts = 0
+    ActiveWorkers = 0
+    MaxConcurrentWorkers = 0
+    MessagePumpTicks = 0
+    SlowResultApplied = $false
+    LateResultWrites = 0
+    UiThreadApplied = $false
+    MembersRetainedOnFail = $false
+    PollingTicks = 0
+    LastOperationState = ''
+    StartFailures = 0
+    LastStartErrorType = ''
+    LastStartErrorMessage = ''
+}
+$script:asyncPollingAuditUiThreadId = 0
+$script:asyncPollingAuditOwnerThreadId = 0
+$script:asyncPollingAuditInitialMemberRows = 0
+$script:asyncPollingAuditStage = ''
+$script:asyncPollingAuditResponsiveTicks = 0
+$script:asyncPollingAuditLateQueued = $false
 $script:hasStatusRefreshResult = $false
 $script:lastStatusRefreshSucceeded = $false
 $script:lastStatusFingerprint = ""
+$script:hasMemberRefreshResult = $false
+$script:lastMemberRefreshSucceeded = $false
+$script:lastMemberFingerprint = ""
+$script:memberRefreshInProgress = $false
+$script:updatingMemberLayout = $false
+$script:uiMutex = $null
+$script:ownsUiMutex = $false
+$script:uiInstanceActive = $false
+$script:uiFlowState = "Idle"
+$script:uiFlowStates = @("Idle", "HostSetup", "MemberSetup", "PreparingHost", "PreparingMember", "Hosting", "JoinedMember", "Cleaning")
+$script:welcomeCreateButton = $null
+$script:welcomeJoinButton = $null
+$script:refreshStatusButton = $null
+$script:connectButton = $null
+$script:disconnectButton = $null
+$script:leaveButton = $null
 
 function Redact-Secret {
     param([AllowNull()][string]$Value)
@@ -71,19 +126,21 @@ function Add-UiLog {
     param([Parameter(Mandatory = $true)][string]$Message, [string]$Level = "信息")
     $safeMessage = Redact-Secret $Message
     $line = "[{0}] [{1}] {2}" -f (Get-Date).ToString("HH:mm:ss"), $Level, $safeMessage
-    [void]$script:logLines.Add($line)
-    if ($null -eq $script:logBox -or $script:logBox.IsDisposed) { return }
-    $update = [Action]{
-        if ($script:logBox.IsDisposed) { return }
+    $update = {
+        [void]$script:logLines.Add($line)
+        if ($null -eq $script:logBox -or $script:logBox.IsDisposed) { return }
         $script:logBox.AppendText($line + [Environment]::NewLine)
         $script:logBox.SelectionStart = $script:logBox.TextLength
         $script:logBox.ScrollToCaret()
+    }.GetNewClosure()
+    if ($null -ne $script:logBox -and !$script:logBox.IsDisposed -and $script:logBox.IsHandleCreated) {
+        try {
+            [void]$script:logBox.BeginInvoke([System.Windows.Forms.MethodInvoker]$update)
+            return
+        } catch {
+        }
     }
-    if ($script:logBox.InvokeRequired) {
-        [void]$script:logBox.BeginInvoke($update)
-    } else {
-        $update.Invoke()
-    }
+    $update.Invoke()
 }
 
 function Get-StatusLogDecision {
@@ -107,6 +164,131 @@ function Get-StatusLogDecision {
     if (!$PreviousSucceeded) { return "Recovered" }
     if ($Fingerprint -ne $PreviousFingerprint) { return "Changed" }
     return "None"
+}
+
+function Get-MemberLogDecision {
+    param(
+        [bool]$Automatic,
+        [bool]$Succeeded,
+        [AllowEmptyString()][string]$Fingerprint,
+        [bool]$HasPrevious,
+        [bool]$PreviousSucceeded,
+        [AllowEmptyString()][string]$PreviousFingerprint
+    )
+    if (!$Automatic) { return "Manual" }
+    if (!$HasPrevious) {
+        if ($Succeeded) { return "Changed" }
+        return "Failed"
+    }
+    if (!$Succeeded) {
+        if ($PreviousSucceeded) { return "Failed" }
+        return "None"
+    }
+    if (!$PreviousSucceeded) { return "Recovered" }
+    if ($Fingerprint -ne $PreviousFingerprint) { return "Changed" }
+    return "None"
+}
+
+function Get-MemberLayoutMode {
+    param(
+        [int]$AvailableWidth,
+        [int]$SettingsPreferredWidth,
+        [int]$MembersMinimumWidth,
+        [int]$Gap
+    )
+    $required = [Math]::Max(0, $SettingsPreferredWidth) + [Math]::Max(0, $MembersMinimumWidth) + [Math]::Max(0, $Gap)
+    if ([Math]::Max(0, $AvailableWidth) -ge $required) { return "Wide" }
+    return "Narrow"
+}
+
+function Test-UiFlowTransition {
+    param([Parameter(Mandatory = $true)][string]$From, [Parameter(Mandatory = $true)][string]$To)
+    $allowed = @{
+        "Idle->HostSetup" = $true
+        "Idle->MemberSetup" = $true
+        "HostSetup->Idle" = $true
+        "HostSetup->PreparingHost" = $true
+        "MemberSetup->Idle" = $true
+        "MemberSetup->PreparingMember" = $true
+        "PreparingHost->Hosting" = $true
+        "PreparingHost->Cleaning" = $true
+        "PreparingMember->JoinedMember" = $true
+        "PreparingMember->Cleaning" = $true
+        "Hosting->Cleaning" = $true
+        "JoinedMember->Cleaning" = $true
+        "Cleaning->Idle" = $true
+        "Cleaning->HostSetup" = $true
+        "Cleaning->MemberSetup" = $true
+    }
+    return $allowed.ContainsKey("$From->$To")
+}
+
+function Update-UiFlowControls {
+    $state = [string]$script:uiFlowState
+    $setupHost = $state -eq "HostSetup"
+    $setupMember = $state -eq "MemberSetup"
+    $preparing = $state -in @("PreparingHost", "PreparingMember", "Cleaning")
+    $active = $state -in @("Hosting", "JoinedMember")
+    if ($null -ne $script:hostStartButton -and !$script:hostStartButton.IsDisposed) {
+        $hostReady = $false
+        if ($null -ne $script:ipv6AddressBox) { $hostReady = Test-GlobalIPv6 (Get-BoxText $script:ipv6AddressBox) }
+        $script:hostStartButton.Enabled = $setupHost -and !$script:primaryBusy -and $hostReady
+    }
+    if ($null -ne $script:memberJoinButton -and !$script:memberJoinButton.IsDisposed) {
+        $script:memberJoinButton.Enabled = $setupMember -and !$script:primaryBusy
+    }
+    foreach ($button in $script:backButtons) {
+        if ($null -ne $button -and !$button.IsDisposed) { $button.Enabled = ($setupHost -or $setupMember) -and !$script:primaryBusy }
+    }
+    if ($null -ne $script:leaveButton -and !$script:leaveButton.IsDisposed) {
+        $script:leaveButton.Text = if ($state -eq "Hosting") { "结束房间" } else { "离开房间" }
+        $script:leaveButton.Enabled = $active -and !$script:primaryBusy
+    }
+    foreach ($button in @($script:refreshStatusButton, $script:connectButton, $script:disconnectButton)) {
+        if ($null -ne $button -and !$button.IsDisposed) { $button.Enabled = $active -and !$preparing }
+    }
+    if ($null -ne $script:welcomeCreateButton -and !$script:welcomeCreateButton.IsDisposed) { $script:welcomeCreateButton.Enabled = !$preparing -and $state -eq "Idle" }
+    if ($null -ne $script:welcomeJoinButton -and !$script:welcomeJoinButton.IsDisposed) { $script:welcomeJoinButton.Enabled = !$preparing -and $state -eq "Idle" }
+}
+
+function Set-UiFlowState {
+    param([Parameter(Mandatory = $true)][string]$To)
+    if ($script:uiFlowState -eq $To) {
+        Update-UiFlowControls
+        return $true
+    }
+    if (!(Test-UiFlowTransition -From $script:uiFlowState -To $To)) {
+        Add-UiLog "已拒绝非法界面模式切换。" "警告"
+        return $false
+    }
+    $script:uiFlowState = $To
+    Update-UiFlowControls
+    return $true
+}
+
+function Enter-UiInstance {
+    $createdNew = $false
+    try {
+        $script:uiMutex = New-Object System.Threading.Mutex($true, "Global\IPv6Mesh.WindowsUI", [ref]$createdNew)
+        if (!$createdNew) {
+            try { $script:ownsUiMutex = $script:uiMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $script:ownsUiMutex = $true }
+        } else {
+            $script:ownsUiMutex = $true
+        }
+        return $script:ownsUiMutex
+    } catch {
+        if ($null -ne $script:uiMutex) { $script:uiMutex.Dispose(); $script:uiMutex = $null }
+        $script:ownsUiMutex = $false
+        return $false
+    }
+}
+
+function Exit-UiInstance {
+    if ($script:ownsUiMutex -and $null -ne $script:uiMutex) {
+        try { $script:uiMutex.ReleaseMutex() } catch {}
+    }
+    $script:ownsUiMutex = $false
+    if ($null -ne $script:uiMutex) { $script:uiMutex.Dispose(); $script:uiMutex = $null }
 }
 
 function Get-SplitLayoutDecision {
@@ -234,12 +416,12 @@ function Refresh-LocalIPv6 {
         }
         $script:ipv6AddressBox.Text = $address
         $null = Update-ControlEndpoint
-        $script:hostStartButton.Enabled = !$script:primaryBusy
+        Update-UiFlowControls
         Add-UiLog "已检测本机全局 IPv6；房主控制面地址已准备。"
         Set-UiStatus "房主 IPv6 已就绪" ([System.Drawing.Color]::ForestGreen)
         return $true
     } catch {
-        $script:hostStartButton.Enabled = $false
+        Update-UiFlowControls
         Add-UiLog "检测房主 IPv6 失败：$($_.Exception.Message)" "警告"
         Set-UiStatus "需要可访问的全局 IPv6" ([System.Drawing.Color]::Firebrick)
         return $false
@@ -358,7 +540,7 @@ function Convert-ResultToJson {
     if ($Result.ExitCode -ne 0) {
         $stderr = [string]$Result.Stderr
         $code = ""
-        if ($stderr -match '(room_not_ready|room_mode_disabled|node_already_joined|room_full|join_rate_limited|enrollment_recovery_pending|invalid_node|request_too_large|unauthorized)') {
+        if ($stderr -match '(room_not_ready|room_mode_disabled|node_already_joined|room_full|join_rate_limited|enrollment_recovery_pending|invalid_node|request_too_large|unauthorized|control_unreachable|operation_timeout)') {
             $code = [string]$Matches[1]
         }
         $messages = @{
@@ -371,6 +553,8 @@ function Convert-ResultToJson {
             invalid_node = "节点信息无效，请检查本机服务。"
             request_too_large = "请求内容超出允许大小。"
             unauthorized = "控制面拒绝了当前操作。"
+            control_unreachable = "房主控制面不可访问，请确认房主窗口仍在运行且 TCP 8080 可达。"
+            operation_timeout = "操作等待超时，请检查网络后重试。"
         }
         if ($code -ne "" -and $messages.ContainsKey($code)) {
             if (!$Quiet) { Add-UiLog "$Operation 失败，错误码：$code" "警告" }
@@ -421,6 +605,12 @@ function Test-ControlHealth {
             Set-UiStatus "控制面不可访问" ([System.Drawing.Color]::Firebrick)
         }
         return $false
+    }
+}
+
+function Assert-MemberControlReady {
+    if (!(Test-ControlHealth -Quiet)) {
+        throw '房主控制面不可访问，请确认房主窗口仍在运行且 TCP 8080 可达。'
     }
 }
 
@@ -551,11 +741,66 @@ function Stop-StartedResources {
     }
 }
 
+function Clear-ActiveRoomState {
+    $script:activeNetworkId = ""
+    Clear-RoomMembers
+    if ($null -ne $script:hostVirtualIPv4Label -and !$script:hostVirtualIPv4Label.IsDisposed) { $script:hostVirtualIPv4Label.Text = "房主虚拟 IPv4：未加入" }
+    if ($null -ne $script:memberVirtualIPv4Label -and !$script:memberVirtualIPv4Label.IsDisposed) { $script:memberVirtualIPv4Label.Text = "本机虚拟 IPv4：未加入" }
+    if ($null -ne $script:nodeStatusLabel -and !$script:nodeStatusLabel.IsDisposed) { $script:nodeStatusLabel.Text = "本机尚未加入房间" }
+    Set-UiStatus "节点未加入房间" ([System.Drawing.Color]::DarkOrange)
+}
+
+function Stop-FailedPreparation {
+    param([Parameter(Mandatory = $true)][ValidateSet("HostSetup", "MemberSetup")][string]$ReturnState)
+    if (![string]::IsNullOrWhiteSpace($script:activeNetworkId)) {
+        try {
+            $result = Invoke-VpnCtl -Arguments @("leave", "--network", $script:activeNetworkId) -SuppressStandardOutput -Quiet
+            if ($result.ExitCode -ne 0) { Add-UiLog "准备失败后的房间清理未完成。" "警告" }
+        } catch {
+            Add-UiLog "准备失败后的房间清理未完成。" "警告"
+        }
+    }
+    Clear-ActiveRoomState
+    Stop-StartedResources
+    if ($script:uiFlowState -in @("PreparingHost", "PreparingMember")) {
+        [void](Set-UiFlowState "Cleaning")
+        [void](Set-UiFlowState $ReturnState)
+    }
+}
+
+function Exit-ActiveRoom {
+    param([switch]$ShuttingDown)
+    if ($script:uiFlowState -notin @("Hosting", "JoinedMember")) { return $false }
+    if (!(Set-UiFlowState "Cleaning")) { return $false }
+    $success = $true
+    try {
+        if (![string]::IsNullOrWhiteSpace($script:activeNetworkId)) {
+            try {
+                $result = Invoke-VpnCtl -Arguments @("leave", "--network", $script:activeNetworkId) -SuppressStandardOutput -Quiet
+                if ($result.ExitCode -ne 0) { throw "leave failed" }
+                $null = Convert-ResultToJson $result "离开房间" -Quiet
+            } catch {
+                $success = $false
+                Add-UiLog "离开房间失败，已继续释放本机资源。" "错误"
+            }
+        }
+    } finally {
+        Clear-ActiveRoomState
+        Stop-StartedResources
+    }
+    if (!$ShuttingDown) {
+        [void](Set-UiFlowState "Idle")
+        Show-WelcomePage
+    }
+    return $success
+}
+
 function Stop-AllResources {
     if ($script:cleanupStarted) { return }
     $script:cleanupStarted = $true
     Add-UiLog "正在执行退出清理。"
     Dispose-StatusRefreshTimer
+    $null = Exit-ActiveRoom -ShuttingDown
     Stop-StartedResources
     Add-UiLog "退出清理完成。"
 }
@@ -579,13 +824,13 @@ function Install-NodeService {
     }
 }
 
-function Get-NodeStatus {
-	param([switch]$Automatic)
-	if ($script:statusRefreshInProgress) { return $null }
-	$script:statusRefreshInProgress = $true
+function Apply-NodeStatusResult {
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        [switch]$Automatic
+    )
     try {
-        $result = Invoke-VpnCtl -Arguments @("status") -SuppressStandardOutput -Quiet:$Automatic
-        $status = Convert-ResultToJson $result "读取节点状态" -Quiet:$Automatic
+        $status = Convert-ResultToJson $Result "读取节点状态" -Quiet:$Automatic
         $script:activeNetworkId = [string]$status.network_id
         $virtualIPv4 = [string]$status.virtual_ipv4
         $path = [string]$status.path_state
@@ -616,6 +861,16 @@ function Get-NodeStatus {
         $script:lastStatusRefreshSucceeded = $false
         $script:lastStatusFingerprint = ""
         return $null
+    }
+}
+
+function Get-NodeStatus {
+	param([switch]$Automatic)
+	if ($script:statusRefreshInProgress) { return $null }
+	$script:statusRefreshInProgress = $true
+    try {
+        $result = Invoke-VpnCtl -Arguments @("status") -SuppressStandardOutput -Quiet:$Automatic
+        return Apply-NodeStatusResult $result -Automatic:$Automatic
     } finally {
         $script:statusRefreshInProgress = $false
     }
@@ -631,8 +886,58 @@ function Set-ActiveVirtualIPv4 {
     }
 }
 
+function Apply-RoomMembersResult {
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        [switch]$Automatic
+    )
+    try {
+        $response = Convert-ResultToJson $Result "读取房间成员" -Quiet:$Automatic
+        $members = @($response.members)
+        $fingerprint = (($members | ForEach-Object { "{0}|{1}|{2}|{3}" -f $_.display_name, $_.virtual_ipv4, $_.is_local, $_.state }) -join ";")
+        Set-RoomMemberRows $members
+        foreach ($label in @($script:hostMemberRefreshLabel, $script:memberMemberRefreshLabel)) {
+            if ($null -ne $label -and !$label.IsDisposed) { $label.Text = "已更新：$($members.Count) 名在线" }
+        }
+        $decision = Get-MemberLogDecision -Automatic ([bool]$Automatic) -Succeeded $true -Fingerprint $fingerprint -HasPrevious $script:hasMemberRefreshResult -PreviousSucceeded $script:lastMemberRefreshSucceeded -PreviousFingerprint $script:lastMemberFingerprint
+        if ($decision -eq "Recovered") {
+            Add-UiLog "房间成员读取已恢复：$($members.Count) 名在线。"
+        } elseif ($decision -eq "Changed" -or $decision -eq "Manual") {
+            Add-UiLog "房间成员列表已更新：$($members.Count) 名在线。"
+        }
+        $script:hasMemberRefreshResult = $true
+        $script:lastMemberRefreshSucceeded = $true
+        $script:lastMemberFingerprint = $fingerprint
+        return $members
+    } catch {
+        foreach ($label in @($script:hostMemberRefreshLabel, $script:memberMemberRefreshLabel)) {
+            if ($null -ne $label -and !$label.IsDisposed) { $label.Text = "成员读取失败，保留上次列表" }
+        }
+        $decision = Get-MemberLogDecision -Automatic ([bool]$Automatic) -Succeeded $false -Fingerprint "" -HasPrevious $script:hasMemberRefreshResult -PreviousSucceeded $script:lastMemberRefreshSucceeded -PreviousFingerprint $script:lastMemberFingerprint
+        if ($decision -eq "Failed" -or $decision -eq "Manual") { Add-UiLog "读取房间成员失败，保留上次列表。" "警告" }
+        $script:hasMemberRefreshResult = $true
+        $script:lastMemberRefreshSucceeded = $false
+        return $null
+    }
+}
+
+function Get-RoomMembers {
+    param([switch]$Automatic)
+    if ($script:memberRefreshInProgress -or [string]::IsNullOrWhiteSpace($script:activeNetworkId)) { return $null }
+    if ($script:uiFlowState -notin @("Hosting", "JoinedMember")) { return $null }
+    $script:memberRefreshInProgress = $true
+    try {
+        $result = Invoke-VpnCtl -Arguments @("room", "members") -SuppressStandardOutput -Quiet:$Automatic
+        return Apply-RoomMembersResult $result -Automatic:$Automatic
+    } finally {
+        $script:memberRefreshInProgress = $false
+    }
+}
+
 function Start-HostRoom {
-    Set-PrimaryBusy $true "正在创建房间并连接本机……"
+    if ($script:uiFlowState -ne "HostSetup") { Add-UiLog "创建房间操作已被忽略。" "警告"; return }
+    if (!(Set-UiFlowState 'PreparingHost')) { return }
+    Begin-PrimaryOperation "正在创建房间并连接本机……"
     try {
         if (!(Refresh-LocalIPv6)) { throw "没有可用的房主全局 IPv6。" }
         $hostIPv6 = Get-BoxText $script:ipv6AddressBox
@@ -647,40 +952,47 @@ function Start-HostRoom {
         $script:activeNetworkId = [string]$joined.network_id
         Set-ActiveVirtualIPv4 $joined "Host"
         $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("connect", "--network", $script:activeNetworkId) -SuppressStandardOutput) "连接虚拟网络"
+        [void](Set-UiFlowState 'Hosting')
         $null = Get-NodeStatus
+        $null = Get-RoomMembers
         Set-UiStatus "房主已连接" ([System.Drawing.Color]::ForestGreen)
         Add-UiLog "房间创建完成；可将房主 IPv6 提供给成员。"
     } catch {
         Add-UiLog "创建房间失败，正在清理本次启动的资源。" "错误"
-        Stop-StartedResources
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("创建房间失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        Stop-FailedPreparation "HostSetup"
+        [void][System.Windows.Forms.MessageBox]::Show($script:form, "创建房间失败，请查看诊断日志。", "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     } finally {
-        Set-PrimaryBusy $false ""
+        End-PrimaryOperation
     }
 }
 
 function Join-MemberRoom {
-    Set-PrimaryBusy $true "正在加入房间并连接本机……"
+    if ($script:uiFlowState -ne "MemberSetup") { Add-UiLog "加入房间操作已被忽略。" "警告"; return }
+    if (!(Set-UiFlowState 'PreparingMember')) { return }
+    Begin-PrimaryOperation "正在加入房间并连接本机……"
     try {
         $hostIPv6 = Get-BoxText $script:memberHostIPv6Box
         if ($hostIPv6 -eq "") { throw "请输入房主 IPv6。" }
         $endpoint = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("room", "endpoint", "--host-ipv6", $hostIPv6) -SuppressStandardOutput) "验证房主 IPv6"
         $script:controlUrl = [string]$endpoint.control_url
         $script:controlUrlBox.Text = $script:controlUrl
+        Assert-MemberControlReady
         if (!(Install-NodeService -ControlUrl $script:controlUrl)) { throw "节点服务安装失败。" }
         $joined = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("room", "join", "--host-ipv6", $hostIPv6, "--name", $env:COMPUTERNAME) -SuppressStandardOutput) "加入房间"
         $script:activeNetworkId = [string]$joined.network_id
         Set-ActiveVirtualIPv4 $joined "Member"
         $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("connect", "--network", $script:activeNetworkId) -SuppressStandardOutput) "连接虚拟网络"
+        [void](Set-UiFlowState 'JoinedMember')
         $null = Get-NodeStatus
+        $null = Get-RoomMembers
         Set-UiStatus "成员已连接" ([System.Drawing.Color]::ForestGreen)
         Add-UiLog "已加入房间并连接本机。"
     } catch {
         Add-UiLog "加入房间失败，正在清理本次启动的资源。" "错误"
-        Stop-StartedResources
-        [void][System.Windows.Forms.MessageBox]::Show($script:form, ("加入房间失败：" + [Environment]::NewLine + $_.Exception.Message), "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        Stop-FailedPreparation "MemberSetup"
+        [void][System.Windows.Forms.MessageBox]::Show($script:form, "加入房间失败，请查看诊断日志。", "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     } finally {
-        Set-PrimaryBusy $false ""
+        End-PrimaryOperation
     }
 }
 
@@ -699,14 +1011,6 @@ function Disconnect-Node {
     $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("disconnect", "--network", $script:activeNetworkId) -SuppressStandardOutput) "断开虚拟网络"
     $null = Get-NodeStatus
     Set-UiStatus "节点已断开" ([System.Drawing.Color]::DarkOrange)
-}
-
-function Leave-Node {
-    if ([string]::IsNullOrWhiteSpace($script:activeNetworkId)) { return }
-    $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("leave", "--network", $script:activeNetworkId) -SuppressStandardOutput) "离开房间"
-    $script:activeNetworkId = ""
-    if ($null -ne $script:nodeStatusLabel) { $script:nodeStatusLabel.Text = "本机尚未加入房间" }
-    Set-UiStatus "节点未加入房间" ([System.Drawing.Color]::DarkOrange)
 }
 
 function Copy-UiField {
@@ -749,18 +1053,270 @@ function Set-PrimaryBusy {
     if (![string]::IsNullOrWhiteSpace($Status)) {
         Set-UiStatus $Status ([System.Drawing.Color]::DarkOrange)
     }
+    Update-UiFlowControls
+}
+
+function Begin-PrimaryOperation {
+    param([string]$Status = "")
+    Stop-StatusRefresh
+    Set-PrimaryBusy $true $Status
+}
+
+function Restart-StatusRefreshIfActive {
+    if ($script:cleanupStarted -or $script:activePage -eq "Welcome") { return }
+    if ($script:uiFlowState -in @("HostSetup", "MemberSetup", "Hosting", "JoinedMember")) {
+        Start-StatusRefresh
+    }
+}
+
+function End-PrimaryOperation {
+    Set-PrimaryBusy $false ""
+    Restart-StatusRefreshIfActive
+}
+
+function Invoke-UiBeginInvoke {
+    param([Parameter(Mandatory = $true)][scriptblock]$Callback)
+    $form = $script:form
+    if ($null -eq $form -or $form.IsDisposed -or $form.Disposing -or !$form.IsHandleCreated) { return $false }
+    try {
+        [void]$form.BeginInvoke([System.Windows.Forms.MethodInvoker]$Callback)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Start-AutomaticPollingCommand {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$State,
+        [Parameter(Mandatory = $true)][ValidateSet("Status", "Members")][string]$Phase
+    )
+    if ($script:asyncPollingAuditMode) {
+        $fileName = Get-PowerShellPath
+        if ($Phase -eq "Status") {
+            $auditStatus = '{"network_id":"audit-network","virtual_ipv4":"10.42.0.2","path_state":"direct","last_error":""}'
+            $auditCommand = "Start-Sleep -Milliseconds 5200; [Console]::Out.Write('$auditStatus')"
+            $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($auditCommand))
+            $arguments = @("-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", $encodedCommand)
+        } else {
+            $auditCommand = "[Console]::Error.Write('control_unreachable'); exit 1"
+            $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($auditCommand))
+            $arguments = @("-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", $encodedCommand)
+        }
+    } else {
+        $fileName = Get-PayloadExecutable "vpnctl.exe"
+        $arguments = if ($Phase -eq "Status") { @("status") } else { @("room", "members") }
+    }
+    $environment = Get-ClientEnvironment
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $fileName
+    $psi.Arguments = (($arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join " ")
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    foreach ($key in $environment.Keys) {
+        $psi.EnvironmentVariables[$key] = [string]$environment[$key]
+    }
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    $stdoutTask = $null
+    $stderrTask = $null
+    try {
+        [void]$process.Start()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $State["${Phase}StdoutTask"] = $stdoutTask
+        $State["${Phase}StderrTask"] = $stderrTask
+        $State["Process"] = $process
+        $process.EnableRaisingEvents = $true
+    } catch {
+        try {
+            if (!$process.HasExited) { $process.Kill() }
+        } catch {}
+        try { $process.Dispose() } catch {}
+        throw
+    }
+}
+
+function Complete-AutomaticPollingCommand {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$State,
+        [Parameter(Mandatory = $true)][ValidateSet("Status", "Members")][string]$Phase
+    )
+    if ([bool]$State["Cancelled"]) { return $false }
+    $process = $State["Process"]
+    if ($null -eq $process) { return $false }
+    try { $exited = $process.HasExited } catch { $exited = $true }
+    if (!$exited) { return $false }
+    $stdoutTask = $State["${Phase}StdoutTask"]
+    $stderrTask = $State["${Phase}StderrTask"]
+    if ($null -ne $stdoutTask -and !$stdoutTask.IsCompleted) { return $false }
+    if ($null -ne $stderrTask -and !$stderrTask.IsCompleted) { return $false }
+    try {
+        $stdout = if ($null -ne $stdoutTask) { [string]$stdoutTask.Result } else { "" }
+        $stderr = if ($null -ne $stderrTask) { [string]$stderrTask.Result } else { "" }
+        $State["${Phase}Result"] = [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout; Stderr = $stderr }
+    } catch {
+        $State["${Phase}Result"] = [pscustomobject]@{ ExitCode = 1; Stdout = ""; Stderr = "" }
+    } finally {
+        try { $process.Dispose() } catch {}
+        $State["Process"] = $null
+    }
+    $State["Phase"] = "${Phase}Done"
+    return $true
+}
+
+function Start-AutomaticPollingOperation {
+    param([Parameter(Mandatory = $true)][int]$Generation)
+    $state = [hashtable]::Synchronized(@{
+        Generation = $Generation
+        IncludeMembers = ($script:uiFlowState -in @("Hosting", "JoinedMember"))
+        Phase = "StatusRunning"
+        Cancelled = $false
+        Process = $null
+    })
+    $script:asyncPollingAuditCounters.WorkerStarts++
+    $script:asyncPollingAuditCounters.ActiveWorkers++
+    if ($script:asyncPollingAuditCounters.ActiveWorkers -gt $script:asyncPollingAuditCounters.MaxConcurrentWorkers) {
+        $script:asyncPollingAuditCounters.MaxConcurrentWorkers = $script:asyncPollingAuditCounters.ActiveWorkers
+    }
+    try {
+        Start-AutomaticPollingCommand -State $state -Phase "Status"
+        return $state
+    } catch {
+        $script:asyncPollingAuditCounters.ActiveWorkers--
+        throw
+    }
+}
+
+function Process-AutomaticPollingOperation {
+    $state = $script:automaticPollingOperation
+    if ($null -eq $state) { return }
+    if ($script:asyncPollingAuditMode) {
+        $script:asyncPollingAuditCounters.PollingTicks++
+        $script:asyncPollingAuditCounters.LastOperationState = [string]$state["Phase"]
+    }
+    if ([bool]$state["Cancelled"] -or [int]$state["Generation"] -ne $script:automaticPollingGeneration) {
+        Stop-StatusRefresh
+        return
+    }
+    $phase = [string]$state["Phase"]
+    if ($phase -eq "StatusRunning") {
+        if (!(Complete-AutomaticPollingCommand -State $state -Phase "Status")) { return }
+        $phase = "StatusDone"
+    } elseif ($phase -eq "MembersRunning") {
+        if (!(Complete-AutomaticPollingCommand -State $state -Phase "Members")) { return }
+        $phase = "MembersDone"
+    }
+    if ($phase -eq "StatusDone") {
+        if ([bool]$state["IncludeMembers"]) {
+            $state["Phase"] = "MembersRunning"
+            try { Start-AutomaticPollingCommand -State $state -Phase "Members" } catch { $state["Phase"] = "MembersDone"; $state["MembersResult"] = [pscustomobject]@{ ExitCode = 1; Stdout = ""; Stderr = "" } }
+            return
+        }
+        $state["Phase"] = "Ready"
+        $phase = "Ready"
+    }
+    if ($phase -eq "MembersDone") { $state["Phase"] = "Ready"; $phase = "Ready" }
+    if ($phase -ne "Ready") { return }
+    $result = [pscustomobject]@{
+        Status = $state["StatusResult"]
+        Members = if ([bool]$state["IncludeMembers"]) { $state["MembersResult"] } else { $null }
+    }
+    $generation = [int]$state["Generation"]
+    $script:automaticPollingOperation = $null
+    $script:asyncPollingAuditCounters.ActiveWorkers = [Math]::Max(0, $script:asyncPollingAuditCounters.ActiveWorkers - 1)
+    if ($script:cleanupStarted -or $generation -ne $script:automaticPollingGeneration) {
+        $script:statusRefreshInProgress = $false
+        $script:memberRefreshInProgress = $false
+        return
+    }
+    $script:automaticPollingPendingResult = $result
+    $script:automaticPollingPendingGeneration = $generation
+    $script:automaticPollingApplyPending = $true
+    $queued = Invoke-UiBeginInvoke {
+        if ($script:cleanupStarted -or $script:automaticPollingPendingGeneration -ne $script:automaticPollingGeneration) {
+            $script:automaticPollingApplyPending = $false
+            $script:automaticPollingPendingResult = $null
+            $script:statusRefreshInProgress = $false
+            $script:memberRefreshInProgress = $false
+            return
+        }
+        try {
+            $script:asyncPollingAuditUiThreadId = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+            $resultToApply = $script:automaticPollingPendingResult
+            $null = Apply-NodeStatusResult $resultToApply.Status -Automatic
+            if ($null -ne $resultToApply.Members) { $null = Apply-RoomMembersResult $resultToApply.Members -Automatic }
+            if ($script:asyncPollingAuditMode) {
+                $script:asyncPollingAuditCounters.SlowResultApplied = $true
+                $script:asyncPollingAuditCounters.UiThreadApplied = ($script:asyncPollingAuditUiThreadId -eq $script:asyncPollingAuditOwnerThreadId)
+                if ($null -ne $script:memberMemberGrid) { $script:asyncPollingAuditCounters.MembersRetainedOnFail = ($script:memberMemberGrid.Rows.Count -eq $script:asyncPollingAuditInitialMemberRows) }
+            }
+        } finally {
+            $script:automaticPollingPendingResult = $null
+            $script:automaticPollingApplyPending = $false
+            $script:statusRefreshInProgress = $false
+            $script:memberRefreshInProgress = $false
+        }
+    }
+    if (!$queued) {
+        $script:automaticPollingPendingResult = $null
+        $script:automaticPollingApplyPending = $false
+        $script:statusRefreshInProgress = $false
+        $script:memberRefreshInProgress = $false
+    }
 }
 
 function Invoke-AutomaticStatusRefresh {
     if ($script:primaryBusy -or $script:cleanupStarted) { return }
-    if ($script:activePage -eq "Welcome" -or $script:statusRefreshInProgress) { return }
-    $null = Get-NodeStatus -Automatic
+    if ($script:activePage -eq "Welcome") { return }
+    if ($null -ne $script:automaticPollingOperation) {
+        Process-AutomaticPollingOperation
+        return
+    }
+    if ($script:statusRefreshInProgress -or $script:automaticPollingApplyPending) { return }
+    try {
+        $script:statusRefreshInProgress = $true
+        $script:memberRefreshInProgress = $script:uiFlowState -in @("Hosting", "JoinedMember")
+        $script:automaticPollingOperation = Start-AutomaticPollingOperation -Generation $script:automaticPollingGeneration
+    } catch {
+        if ($script:asyncPollingAuditMode) {
+            $script:asyncPollingAuditCounters.StartFailures++
+            $script:asyncPollingAuditCounters.LastStartErrorType = [string]$_.Exception.GetType().FullName
+            $message = [string]$_.Exception.Message
+            $message = $message -replace '[\r\n\t]+', ' '
+            if ($message.Length -gt 256) { $message = $message.Substring(0, 256) }
+            $script:asyncPollingAuditCounters.LastStartErrorMessage = $message
+        }
+        $script:statusRefreshInProgress = $false
+        $script:memberRefreshInProgress = $false
+        Add-UiLog "自动读取节点状态失败。" "警告"
+    }
 }
 
 function Stop-StatusRefresh {
     if ($null -ne $script:statusRefreshTimer) {
         $script:statusRefreshTimer.Stop()
     }
+    $script:automaticPollingGeneration++
+    $script:automaticPollingApplyPending = $false
+    $script:automaticPollingPendingResult = $null
+    if ($null -ne $script:automaticPollingOperation) {
+        $state = $script:automaticPollingOperation
+        $state["Cancelled"] = $true
+        $process = $state["Process"]
+        if ($null -ne $process) {
+            try {
+                if (!$process.HasExited) { $process.Kill() }
+            } catch {}
+            try { $process.Dispose() } catch {}
+        }
+        $script:automaticPollingOperation = $null
+        $script:asyncPollingAuditCounters.ActiveWorkers = 0
+    }
+    $script:statusRefreshInProgress = $false
+    $script:memberRefreshInProgress = $false
 }
 
 function Start-StatusRefresh {
@@ -786,6 +1342,152 @@ function Set-PageLayoutState {
     if ($null -ne $script:operationShell) { $script:operationShell.Visible = ($Name -ne "Welcome") }
     if ($null -ne $script:hostPanel) { $script:hostPanel.Visible = ($Name -eq "Host") }
     if ($null -ne $script:memberPanel) { $script:memberPanel.Visible = ($Name -eq "Member") }
+    if ($null -ne $script:hostPageShell) {
+        $script:hostPageShell.Visible = ($Name -eq "Host")
+        if (!$script:hostPageShell.Visible) { $script:hostPageShell.SetBounds(0, 0, 0, 0) }
+    }
+    if ($null -ne $script:memberPageShell) {
+        $script:memberPageShell.Visible = ($Name -eq "Member")
+        if (!$script:memberPageShell.Visible) { $script:memberPageShell.SetBounds(0, 0, 0, 0) }
+    }
+    if ($null -ne $script:operationSplit) { $script:operationSplit.Panel1.PerformLayout() }
+}
+
+function Get-PreferredControlWidth {
+    param([Parameter(Mandatory = $true)][System.Windows.Forms.Control]$Control)
+    $preferred = $Control.GetPreferredSize((New-Object System.Drawing.Size(0, 0)))
+    $width = [Math]::Max([int]$Control.MinimumSize.Width, [int]$preferred.Width)
+    if ($Control -is [System.Windows.Forms.DataGridView]) {
+        $columnsWidth = 0
+        foreach ($column in $Control.Columns) {
+            $columnsWidth += $column.GetPreferredWidth([System.Windows.Forms.DataGridViewAutoSizeColumnMode]::AllCells, $true)
+        }
+        $width = [Math]::Max($width, $columnsWidth)
+    } elseif ($Control.Controls.Count -gt 0) {
+        if ($Control -is [System.Windows.Forms.TableLayoutPanel]) {
+            $columnWidths = @()
+            for ($columnIndex = 0; $columnIndex -lt $Control.ColumnCount; $columnIndex++) {
+                $styleWidth = 0
+                if ($columnIndex -lt $Control.ColumnStyles.Count -and $Control.ColumnStyles[$columnIndex].SizeType -eq [System.Windows.Forms.SizeType]::Absolute) {
+                    $styleWidth = [int]$Control.ColumnStyles[$columnIndex].Width
+                }
+                $columnWidths += $styleWidth
+            }
+            foreach ($child in $Control.Controls) {
+                $position = $Control.GetPositionFromControl($child)
+                if ($Control.GetColumnSpan($child) -eq 1 -and $position.Column -lt $columnWidths.Count) {
+                    $columnWidths[$position.Column] = [Math]::Max($columnWidths[$position.Column], (Get-PreferredControlWidth $child) + $child.Margin.Horizontal)
+                }
+            }
+            $width = [Math]::Max($width, $Control.Padding.Horizontal + (($columnWidths | Measure-Object -Sum).Sum))
+        } else {
+            foreach ($child in $Control.Controls) {
+                $width = [Math]::Max($width, (Get-PreferredControlWidth $child) + $child.Margin.Horizontal + $Control.Padding.Horizontal)
+            }
+        }
+    }
+    return $width
+}
+
+function Get-LayoutWidthMeasurement {
+    param([Parameter(Mandatory = $true)][System.Windows.Forms.Control]$Control)
+    $minimum = $Control.MinimumSize
+    $margin = $Control.Margin
+    $minimumContent = [Math]::Max(0, [int]$minimum.Width)
+    $preferredContent = [Math]::Max($minimumContent, (Get-PreferredControlWidth $Control))
+    return [pscustomobject]@{
+        MinimumContentWidth = $minimumContent
+        PreferredContentWidth = $preferredContent
+        MinimumWidth = $minimumContent + $margin.Left + $margin.Right
+        PreferredWidth = $preferredContent + $margin.Left + $margin.Right
+        MarginLeft = $margin.Left
+        MarginRight = $margin.Right
+    }
+}
+
+function Get-MemberLayoutPolicy {
+    param(
+        [Parameter(Mandatory = $true)][System.Windows.Forms.TableLayoutPanel]$Shell,
+        [Parameter(Mandatory = $true)][System.Windows.Forms.Control]$Settings,
+        [Parameter(Mandatory = $true)][System.Windows.Forms.Control]$Members
+    )
+    $availableWidth = [Math]::Max(0, [int]$Shell.ClientSize.Width - $Shell.Padding.Horizontal)
+    $settingsMeasure = Get-LayoutWidthMeasurement $Settings
+    $membersMeasure = Get-LayoutWidthMeasurement $Members
+    $gap = [Math]::Max(0, [int]$settingsMeasure.MarginRight + [int]$membersMeasure.MarginLeft)
+    $wideThreshold = $settingsMeasure.PreferredWidth + $membersMeasure.MinimumWidth
+    $mode = if ($availableWidth -ge $wideThreshold) { "Wide" } else { "Narrow" }
+    $memberMinimumWidth = $membersMeasure.MinimumWidth
+    $memberMaximumWidth = [Math]::Max($memberMinimumWidth, $availableWidth - $settingsMeasure.MinimumWidth)
+    $memberWidth = 0
+    $settingsWidth = 0
+    if ($mode -eq "Wide") {
+        $preferredTotal = [Math]::Max(1, $settingsMeasure.PreferredWidth + $membersMeasure.PreferredWidth)
+        $extraWidth = [Math]::Max(0, $availableWidth - $preferredTotal)
+        $memberShare = [double]$membersMeasure.PreferredWidth / $preferredTotal
+        $memberWidth = $membersMeasure.PreferredWidth + [Math]::Round($extraWidth * $memberShare)
+        $memberWidth = [Math]::Min($memberMaximumWidth, [Math]::Max($memberMinimumWidth, $memberWidth))
+        $settingsWidth = [Math]::Max($settingsMeasure.MinimumWidth, $availableWidth - $memberWidth)
+    }
+    return [pscustomobject]@{
+        AvailableWidth = $availableWidth
+        Mode = $mode
+        Gap = $gap
+        SettingsMinimumWidth = $settingsMeasure.MinimumWidth
+        SettingsPreferredWidth = $settingsMeasure.PreferredWidth
+        MembersMinimumWidth = $membersMeasure.MinimumWidth
+        MembersPreferredWidth = $membersMeasure.PreferredWidth
+        MemberMinimumWidth = $memberMinimumWidth
+        MemberMaximumWidth = $memberMaximumWidth
+        MemberWidth = $memberWidth
+        SettingsWidth = $settingsWidth
+    }
+}
+
+function Set-ResponsiveMemberLayout {
+    if ($script:updatingMemberLayout) { return }
+    $shell = if ($script:activePage -eq "Host") { $script:hostPageShell } elseif ($script:activePage -eq "Member") { $script:memberPageShell } else { $null }
+    $settings = if ($script:activePage -eq "Host") { $script:hostPanel } elseif ($script:activePage -eq "Member") { $script:memberPanel } else { $null }
+    $members = if ($script:activePage -eq "Host") { $script:hostMemberPanel } elseif ($script:activePage -eq "Member") { $script:memberMemberPanel } else { $null }
+    if ($null -eq $shell -or $null -eq $settings -or $null -eq $members -or $shell.IsDisposed) { return }
+    $policy = Get-MemberLayoutPolicy -Shell $shell -Settings $settings -Members $members
+    $mode = $policy.Mode
+    $script:updatingMemberLayout = $true
+    try {
+        $shell.SuspendLayout()
+        try {
+            $shell.ColumnStyles.Clear()
+            $shell.RowStyles.Clear()
+            if ($mode -eq "Wide") {
+                $shell.ColumnCount = 2
+                $shell.RowCount = 1
+                [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, $policy.SettingsWidth)))
+                [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, $policy.MemberWidth)))
+                [void]$shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+                $shell.SetColumn($settings, 0)
+                $shell.SetRow($settings, 0)
+                $shell.SetColumn($members, 1)
+                $shell.SetRow($members, 0)
+            } else {
+                $shell.ColumnCount = 1
+                $shell.RowCount = 2
+                [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+                [void]$shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+                [void]$shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+                $shell.SetColumn($settings, 0)
+                $shell.SetRow($settings, 0)
+                $shell.SetColumn($members, 0)
+                $shell.SetRow($members, 1)
+            }
+            $shell.Tag = $mode
+            $shell.AccessibleDescription = ($policy | ConvertTo-Json -Compress)
+            $shell.PerformLayout()
+        } finally {
+            $shell.ResumeLayout($true)
+        }
+    } finally {
+        $script:updatingMemberLayout = $false
+    }
 }
 
 function Set-ResponsiveSplitLayout {
@@ -803,6 +1505,7 @@ function Set-ResponsiveSplitLayout {
             $script:operationSplit.Panel1MinSize = $decision.UpperMinimum
             $script:operationSplit.Panel2MinSize = $decision.LowerMinimum
             $script:userSplitterDistance = $decision.Distance
+            Set-ResponsiveMemberLayout
         } finally {
             $script:operationSplit.ResumeLayout($true)
         }
@@ -837,23 +1540,40 @@ function Show-Page {
         Stop-StatusRefresh
     } else {
         Set-ResponsiveSplitLayout
+        Set-ResponsiveMemberLayout
         Start-StatusRefresh
     }
 }
 
 function Show-WelcomePage {
+    if ($script:uiFlowState -in @("Hosting", "JoinedMember", "Cleaning")) { return $false }
+    if ($script:uiFlowState -in @("HostSetup", "MemberSetup")) {
+        if (!(Set-UiFlowState "Idle")) { return $false }
+    }
     Show-Page "Welcome"
     Set-UiStatus "等待选择" ([System.Drawing.Color]::MidnightBlue)
+    return $true
 }
 
 function Show-HostPage {
+    if ($script:uiFlowState -ne "Idle") { Add-UiLog "当前房间模式未结束，不能切换到创建网络。" "警告"; return $false }
+    if (!(Set-UiFlowState "HostSetup")) { return $false }
     Show-Page "Host"
     $null = Refresh-LocalIPv6
+    return $true
 }
 
 function Show-MemberPage {
+    if ($script:uiFlowState -ne "Idle") { Add-UiLog "当前房间模式未结束，不能切换到加入网络。" "警告"; return $false }
+    if (!(Set-UiFlowState "MemberSetup")) { return $false }
     Show-Page "Member"
     Set-UiStatus "请输入房主 IPv6" ([System.Drawing.Color]::MidnightBlue)
+    return $true
+}
+
+function Return-ToWelcome {
+    if ($script:uiFlowState -notin @("HostSetup", "MemberSetup")) { return $false }
+    return Show-WelcomePage
 }
 
 function New-LayoutLabel {
@@ -894,6 +1614,139 @@ function New-LayoutButton {
     return $button
 }
 
+function New-RoomMembersPanel {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $panel = New-Object System.Windows.Forms.GroupBox
+    $panel.Name = $Name
+    $panel.Text = "房间成员（0）"
+    $panel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $panel.MinimumSize = New-Object System.Drawing.Size(0, 0)
+    $panel.Padding = New-Object System.Windows.Forms.Padding(10, 8, 10, 10)
+
+    $layout = New-Object System.Windows.Forms.TableLayoutPanel
+    $layout.Name = "$Name`Layout"
+    $layout.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $layout.ColumnCount = 2
+    $layout.RowCount = 2
+    [void]$layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$panel.Controls.Add($layout)
+
+    $countLabel = New-LayoutLabel "$Name`Count" "房间成员（0）"
+    $countLabel.Margin = New-Object System.Windows.Forms.Padding(2, 2, 6, 6)
+    [void]$layout.Controls.Add($countLabel, 0, 0)
+    $refreshLabel = New-LayoutLabel "$Name`Refresh" "尚未加入房间"
+    $refreshLabel.AutoEllipsis = $true
+    $refreshLabel.Margin = New-Object System.Windows.Forms.Padding(6, 2, 2, 6)
+    $refreshLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Right
+    [void]$layout.Controls.Add($refreshLabel, 1, 0)
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Name = "$Name`Grid"
+    $grid.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $grid.MinimumSize = New-Object System.Drawing.Size(0, 0)
+    $grid.ReadOnly = $true
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToOrderColumns = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.AutoGenerateColumns = $false
+    $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+    $grid.ColumnHeadersHeightSizeMode = [System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::AutoSize
+    $grid.RowHeadersVisible = $false
+    $grid.MultiSelect = $false
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::CellSelect
+    foreach ($header in @("名称", "虚拟 IPv4", "状态")) {
+        $column = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $column.HeaderText = $header
+        $column.Name = $header
+        $column.ReadOnly = $true
+        $column.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+        [void]$grid.Columns.Add($column)
+    }
+    $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::AllCells
+    $grid.PerformLayout()
+    $minimumGridWidth = 0
+    foreach ($column in $grid.Columns) {
+        $minimumGridWidth += $column.GetPreferredWidth([System.Windows.Forms.DataGridViewAutoSizeColumnMode]::AllCells, $true)
+    }
+    if ($minimumGridWidth -gt 0) {
+        $minimumGridHeight = [Math]::Max(0, [int]$grid.ColumnHeadersHeight)
+        $grid.MinimumSize = New-Object System.Drawing.Size($minimumGridWidth, $minimumGridHeight)
+        $panel.MinimumSize = New-Object System.Drawing.Size(($minimumGridWidth + $panel.Padding.Horizontal), ($minimumGridHeight + $panel.Padding.Vertical))
+    }
+    $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+    [void]$layout.Controls.Add($grid, 0, 1)
+    $layout.SetColumnSpan($grid, 2)
+    return [pscustomobject]@{ Panel = $panel; Grid = $grid; CountLabel = $countLabel; RefreshLabel = $refreshLabel }
+}
+
+function Set-RoomMemberRows {
+    param([Parameter(Mandatory = $true)][object[]]$Members)
+    $rows = @($Members)
+    foreach ($grid in @($script:hostMemberGrid, $script:memberMemberGrid)) {
+        if ($null -eq $grid -or $grid.IsDisposed) { continue }
+        $grid.Rows.Clear()
+        foreach ($member in $rows) {
+            $displayName = [string]$member.display_name
+            if ([bool]$member.is_local) { $displayName += "（本机）" }
+            $state = if ([string]$member.state -eq "online") { "在线" } else { "在线" }
+            [void]$grid.Rows.Add($displayName, [string]$member.virtual_ipv4, $state)
+        }
+        $grid.ClearSelection()
+    }
+    foreach ($label in @($script:hostMemberCountLabel, $script:memberMemberCountLabel)) {
+        if ($null -ne $label -and !$label.IsDisposed) { $label.Text = "房间成员（$($rows.Count)）" }
+    }
+    foreach ($panel in @($script:hostMemberPanel, $script:memberMemberPanel)) {
+        if ($null -ne $panel -and !$panel.IsDisposed) { $panel.Text = "房间成员（$($rows.Count)）" }
+    }
+    foreach ($label in @($script:hostMemberRefreshLabel, $script:memberMemberRefreshLabel)) {
+        if ($null -ne $label -and !$label.IsDisposed) { $label.Text = "已更新" }
+    }
+}
+
+function Clear-RoomMembers {
+    foreach ($grid in @($script:hostMemberGrid, $script:memberMemberGrid)) {
+        if ($null -ne $grid -and !$grid.IsDisposed) { $grid.Rows.Clear() }
+    }
+    foreach ($label in @($script:hostMemberCountLabel, $script:memberMemberCountLabel)) {
+        if ($null -ne $label -and !$label.IsDisposed) { $label.Text = "房间成员（0）" }
+    }
+    foreach ($panel in @($script:hostMemberPanel, $script:memberMemberPanel)) {
+        if ($null -ne $panel -and !$panel.IsDisposed) { $panel.Text = "房间成员（0）" }
+    }
+    foreach ($label in @($script:hostMemberRefreshLabel, $script:memberMemberRefreshLabel)) {
+        if ($null -ne $label -and !$label.IsDisposed) { $label.Text = "尚未加入房间" }
+    }
+    $script:hasMemberRefreshResult = $false
+    $script:lastMemberRefreshSucceeded = $false
+    $script:lastMemberFingerprint = ""
+}
+
+function New-RoomPageShell {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][System.Windows.Forms.Control]$Settings,
+        [Parameter(Mandatory = $true)][System.Windows.Forms.Control]$Members
+    )
+    $shell = New-Object System.Windows.Forms.TableLayoutPanel
+    $shell.Name = $Name
+    $shell.Dock = [System.Windows.Forms.DockStyle]::Top
+    $shell.AutoSize = $true
+    $shell.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $shell.ColumnCount = 1
+    $shell.RowCount = 2
+    [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$shell.Controls.Add($Settings, 0, 0)
+    [void]$shell.Controls.Add($Members, 0, 1)
+    return $shell
+}
+
 function New-ResponsivePageGrid {
     param([string]$Name)
     $page = New-Object System.Windows.Forms.TableLayoutPanel
@@ -901,7 +1754,7 @@ function New-ResponsivePageGrid {
     $page.Dock = [System.Windows.Forms.DockStyle]::Top
     $page.AutoSize = $true
     $page.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-    $page.MinimumSize = New-Object System.Drawing.Size(820, 0)
+    $page.MinimumSize = New-Object System.Drawing.Size(0, 0)
     $page.Padding = New-Object System.Windows.Forms.Padding(20, 8, 20, 20)
     $page.ColumnCount = 3
     [void]$page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 130)))
@@ -977,7 +1830,7 @@ function Invoke-ResponsiveLayoutAudit {
         @{ Name = "minimum"; Width = 900; Height = 640; Font = 9; Distance = -1 },
         @{ Name = "large"; Width = 1440; Height = 900; Font = 9; Distance = -1 },
         @{ Name = "constrained"; Width = 760; Height = 520; Font = 9; Distance = -1 },
-        @{ Name = "large-font"; Width = 900; Height = 640; Font = 12; Distance = -1 },
+        @{ Name = "large-font"; Width = 900; Height = 640; Font = 16; Distance = -1 },
         @{ Name = "upper-limit"; Width = 1120; Height = 720; Font = 9; Distance = 0 },
         @{ Name = "lower-limit"; Width = 1120; Height = 720; Font = 9; Distance = 100000 }
     )
@@ -1006,6 +1859,9 @@ function Invoke-ResponsiveLayoutAudit {
             Set-PageLayoutState $page
             Set-ResponsiveSplitLayout
             Invoke-ControlLayout $script:form
+            $splitterBeforeMemberLayout = $script:operationSplit.SplitterDistance
+            Set-ResponsiveMemberLayout
+            Invoke-ControlLayout $script:form
             [System.Windows.Forms.Application]::DoEvents()
 
             if ($script:statusRefreshTimer.Enabled) {
@@ -1017,6 +1873,17 @@ function Invoke-ResponsiveLayoutAudit {
             }
             if ($script:diagnosticsPanel.Visible -ne $wantDiagnostics) {
                 [void]$errors.Add("$($case.Name)/$page diagnostics visibility mismatch")
+            }
+
+            $hostPageShellVisible = $null -ne $script:hostPageShell -and $script:hostPageShell.Visible
+            $memberPageShellVisible = $null -ne $script:memberPageShell -and $script:memberPageShell.Visible
+            $hostPageShellArea = if ($null -ne $script:hostPageShell) { [int]$script:hostPageShell.Bounds.Width * [int]$script:hostPageShell.Bounds.Height } else { 0 }
+            $memberPageShellArea = if ($null -ne $script:memberPageShell) { [int]$script:memberPageShell.Bounds.Width * [int]$script:memberPageShell.Bounds.Height } else { 0 }
+            if ($hostPageShellVisible -ne ($page -eq "Host") -or $memberPageShellVisible -ne ($page -eq "Member")) {
+                [void]$errors.Add("$($case.Name)/$page page-shell visibility mismatch")
+            }
+            if ((!$hostPageShellVisible -and $hostPageShellArea -ne 0) -or (!$memberPageShellVisible -and $memberPageShellArea -ne 0)) {
+                [void]$errors.Add("$($case.Name)/$page inactive page shell occupies space")
             }
 
             if ($wantDiagnostics) {
@@ -1054,6 +1921,41 @@ function Invoke-ResponsiveLayoutAudit {
             }
 
             $inputWidth = if ($page -eq "Host") { $script:ipv6AddressBox.ClientSize.Width } elseif ($page -eq "Member") { $script:memberHostIPv6Box.ClientSize.Width } else { 0 }
+            $memberMode = "Narrow"
+            $memberPanelWidth = 0
+            $memberPanelHeight = 0
+            $memberGridWidth = 0
+            $memberGridHeight = 0
+            $settingsMemberOverlap = 0
+            $memberMinimumWidth = 0
+            $memberMaximumWidth = 0
+            $memberWidthWithinBounds = $true
+            if ($wantDiagnostics) {
+                $memberShell = if ($page -eq "Host") { $script:hostPageShell } else { $script:memberPageShell }
+                $memberPanel = if ($page -eq "Host") { $script:hostMemberPanel } else { $script:memberMemberPanel }
+                $memberGrid = if ($page -eq "Host") { $script:hostMemberGrid } else { $script:memberMemberGrid }
+                $settingsPanel = if ($page -eq "Host") { $script:hostPanel } else { $script:memberPanel }
+                $policy = Get-MemberLayoutPolicy -Shell $memberShell -Settings $settingsPanel -Members $memberPanel
+                $memberMode = if ($null -ne $memberShell.Tag) { [string]$memberShell.Tag } else { "Narrow" }
+                $memberMinimumWidth = [int]$policy.MemberMinimumWidth
+                $memberMaximumWidth = [int]$policy.MemberMaximumWidth
+                $settingsRectangle = $settingsPanel.RectangleToScreen($settingsPanel.ClientRectangle)
+                $memberRectangle = $memberPanel.RectangleToScreen($memberPanel.ClientRectangle)
+                $memberGridRectangle = $memberGrid.RectangleToScreen($memberGrid.ClientRectangle)
+                $settingsMemberIntersection = [System.Drawing.Rectangle]::Intersect($settingsRectangle, $memberRectangle)
+                $settingsMemberOverlap = if ($settingsMemberIntersection.Width -gt 0 -and $settingsMemberIntersection.Height -gt 0) { 1 } else { 0 }
+                $memberPanelWidth = $memberRectangle.Width
+                $memberPanelHeight = $memberRectangle.Height
+                $memberGridWidth = $memberGridRectangle.Width
+                $memberGridHeight = $memberGridRectangle.Height
+                $actualMemberWidth = [int]$memberPanel.Bounds.Width + $memberPanel.Margin.Left + $memberPanel.Margin.Right
+                $memberWidthWithinBounds = $memberMode -ne "Wide" -or ($actualMemberWidth -ge $memberMinimumWidth -and $actualMemberWidth -le $memberMaximumWidth)
+                $expectedMemberMode = [string]$policy.Mode
+                if ($memberMode -ne $expectedMemberMode) { [void]$errors.Add("$($case.Name)/$page member layout mode mismatch: $memberMode") }
+                if ($memberPanelWidth -le 0 -or $memberPanelHeight -le 0 -or $memberGridWidth -le 0 -or $memberGridHeight -le 0) { [void]$errors.Add("$($case.Name)/$page member panel or grid has no usable area") }
+                if ($settingsMemberOverlap -ne 0) { [void]$errors.Add("$($case.Name)/$page settings and member panel overlap") }
+                if (!$memberWidthWithinBounds) { [void]$errors.Add("$($case.Name)/$page member width is outside measured bounds") }
+            }
             [void]$samples.Add([pscustomobject]@{
                 Case = $case.Name
                 Page = $page
@@ -1061,6 +1963,20 @@ function Invoke-ResponsiveLayoutAudit {
                 LogWidth = if ($wantDiagnostics) { $script:logBox.ClientSize.Width } else { 0 }
                 LogHeight = if ($wantDiagnostics) { $script:logBox.ClientSize.Height } else { 0 }
                 SplitterDistance = if ($wantDiagnostics) { $script:operationSplit.SplitterDistance } else { 0 }
+                MemberLayoutMode = $memberMode
+                MemberPanelWidth = $memberPanelWidth
+                MemberPanelHeight = $memberPanelHeight
+                MemberGridWidth = $memberGridWidth
+                MemberGridHeight = $memberGridHeight
+                SettingsMemberOverlap = $settingsMemberOverlap
+                HostPageShellVisible = $hostPageShellVisible
+                MemberPageShellVisible = $memberPageShellVisible
+                HostPageShellArea = $hostPageShellArea
+                MemberPageShellArea = $memberPageShellArea
+                MemberMinimumWidth = $memberMinimumWidth
+                MemberMaximumWidth = $memberMaximumWidth
+                MemberWidthWithinBounds = $memberWidthWithinBounds
+                SplitterPreserved = ($splitterBeforeMemberLayout -eq $script:operationSplit.SplitterDistance)
             })
         }
     }
@@ -1073,6 +1989,14 @@ function Invoke-ResponsiveLayoutAudit {
         if ($large.LogHeight -le $minimum.LogHeight) { [void]$errors.Add("$page log height did not grow") }
     }
 
+    foreach ($page in @("Host", "Member")) {
+        $preferred = $samples | Where-Object { $_.Case -eq "preferred" -and $_.Page -eq $page } | Select-Object -First 1
+        $large = $samples | Where-Object { $_.Case -eq "large" -and $_.Page -eq $page } | Select-Object -First 1
+        if ($preferred.MemberLayoutMode -eq "Wide" -and $large.MemberLayoutMode -eq "Wide" -and $large.MemberPanelWidth -le $preferred.MemberPanelWidth) {
+            [void]$errors.Add("$page member width did not receive a share of extra wide-screen space")
+        }
+    }
+
     return [pscustomobject]@{
         Passed = $errors.Count -eq 0
         Errors = $errors.ToArray()
@@ -1080,6 +2004,207 @@ function Invoke-ResponsiveLayoutAudit {
     }
 }
 
+function Invoke-PreparationRaceAudit {
+    $script:preparationRaceAuditState = [hashtable]::Synchronized(@{
+        Stage = "starting"
+        OldGeneration = -1
+        CurrentGeneration = -1
+        PrimaryOperationCancelled = $false
+        StaleResultQueued = $false
+        StaleResultDropped = $false
+        OldGenerationApplied = $false
+        JoinedNetworkPreserved = $false
+        FailureReturnedToSetup = $false
+        RefreshRestarted = $false
+        Deadline = (Get-Date).AddSeconds(8)
+    })
+    $script:form.ShowInTaskbar = $false
+    $script:form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $script:form.Location = New-Object System.Drawing.Point(-32000, -32000)
+    $script:form.Opacity = 0
+    $script:form.Show()
+    $script:uiFlowState = "HostSetup"
+    $script:activeNetworkId = "old-network"
+    Set-PageLayoutState "Host"
+    Set-ResponsiveSplitLayout
+    Set-ResponsiveMemberLayout
+
+    $heartbeat = New-Object System.Windows.Forms.Timer
+    $heartbeat.Interval = 25
+    $heartbeat.Add_Tick({
+        try {
+            $state = $script:preparationRaceAuditState
+            if ($state["Stage"] -eq "starting" -and $null -ne $script:automaticPollingOperation) {
+                $state["OldGeneration"] = $script:automaticPollingGeneration
+                [void](Set-UiFlowState "PreparingHost")
+                Begin-PrimaryOperation "正在测试准备操作"
+                $state["PrimaryOperationCancelled"] = ($null -eq $script:automaticPollingOperation)
+                $state["CurrentGeneration"] = $script:automaticPollingGeneration
+                $script:activeNetworkId = "joined-network"
+                [void](Set-UiFlowState "Hosting")
+                $script:preparationRaceAuditStaleGeneration = [int]$state["OldGeneration"]
+                $state["StaleResultQueued"] = Invoke-UiBeginInvoke {
+                    $state = $script:preparationRaceAuditState
+                    if ($script:preparationRaceAuditStaleGeneration -eq $script:automaticPollingGeneration) {
+                        $state["OldGenerationApplied"] = $true
+                        $script:activeNetworkId = "old-network"
+                    } else {
+                        $state["StaleResultDropped"] = $true
+                    }
+                }
+                End-PrimaryOperation
+                $state["Stage"] = "waiting-stale"
+                return
+            }
+            if ($state["Stage"] -eq "waiting-stale" -and $state["StaleResultDropped"]) {
+                $state["JoinedNetworkPreserved"] = ($script:activeNetworkId -eq "joined-network")
+                Stop-StatusRefresh
+                [void](Set-UiFlowState "Cleaning")
+                [void](Set-UiFlowState "HostSetup")
+                $script:activeNetworkId = ""
+                [void](Set-UiFlowState "PreparingHost")
+                Begin-PrimaryOperation "正在测试失败恢复"
+                Stop-FailedPreparation "HostSetup"
+                End-PrimaryOperation
+                $state["FailureReturnedToSetup"] = ($script:uiFlowState -eq "HostSetup")
+                $state["RefreshRestarted"] = ($script:statusRefreshTimer.Enabled -and $null -ne $script:automaticPollingOperation)
+                $state["Stage"] = "closing"
+                $script:form.Close()
+                return
+            }
+            if ((Get-Date) -ge $state["Deadline"]) {
+                $state["Stage"] = "closing"
+                $script:form.Close()
+            }
+        } catch {
+            $state["Stage"] = "closing"
+            try { $script:form.Close() } catch {}
+        }
+    })
+    $heartbeat.Start()
+    $script:statusRefreshTimer.Interval = 50
+    Start-StatusRefresh
+    [void][System.Windows.Forms.Application]::Run($script:form)
+    $heartbeat.Stop()
+    $heartbeat.Dispose()
+
+    $state = $script:preparationRaceAuditState
+    return [pscustomobject]@{
+        Passed = ($state["PrimaryOperationCancelled"] -and
+            $state["CurrentGeneration"] -gt $state["OldGeneration"] -and
+            $state["StaleResultQueued"] -and
+            $state["StaleResultDropped"] -and
+            !$state["OldGenerationApplied"] -and
+            $state["JoinedNetworkPreserved"] -and
+            $state["FailureReturnedToSetup"] -and
+            $state["RefreshRestarted"])
+        PrimaryOperationCancelled = [bool]$state["PrimaryOperationCancelled"]
+        OldGenerationApplied = [bool]$state["OldGenerationApplied"]
+        StaleResultDropped = [bool]$state["StaleResultDropped"]
+        JoinedNetworkPreserved = [bool]$state["JoinedNetworkPreserved"]
+        FailureReturnedToSetup = [bool]$state["FailureReturnedToSetup"]
+        RefreshRestarted = [bool]$state["RefreshRestarted"]
+        StartFailures = $script:asyncPollingAuditCounters.StartFailures
+        LastStartErrorType = $script:asyncPollingAuditCounters.LastStartErrorType
+        LastStartErrorMessage = $script:asyncPollingAuditCounters.LastStartErrorMessage
+    }
+}
+
+function Invoke-AsyncPollingAudit {
+    $script:asyncPollingAuditOwnerThreadId = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+    $script:form.ShowInTaskbar = $false
+    $script:form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $script:form.Location = New-Object System.Drawing.Point(-32000, -32000)
+    $script:form.Opacity = 0
+    $script:form.Show()
+    $script:uiFlowState = "Hosting"
+    $script:activeNetworkId = "audit-network"
+    Set-PageLayoutState "Host"
+    Set-ResponsiveSplitLayout
+    Set-ResponsiveMemberLayout
+    $initialMembers = @([pscustomobject]@{
+        display_name = "audit-host"
+        virtual_ipv4 = "10.42.0.1"
+        is_local = $true
+        state = "online"
+    })
+    Set-RoomMemberRows $initialMembers
+    $script:asyncPollingAuditInitialMemberRows = $script:memberMemberGrid.Rows.Count
+
+    $heartbeat = New-Object System.Windows.Forms.Timer
+    $heartbeat.Interval = 50
+    $script:asyncPollingAuditStage = "responsive"
+    $script:asyncPollingAuditResponsiveDeadline = (Get-Date).AddMilliseconds(1200)
+    $script:asyncPollingAuditCompletionDeadline = (Get-Date).AddSeconds(10)
+    $heartbeat.Add_Tick({
+        try {
+            $script:asyncPollingAuditCounters.MessagePumpTicks++
+            $now = Get-Date
+            if ($script:asyncPollingAuditStage -eq "responsive" -and $now -ge $script:asyncPollingAuditResponsiveDeadline) {
+                $script:asyncPollingAuditResponsiveTicks = $script:asyncPollingAuditCounters.MessagePumpTicks
+                $script:asyncPollingAuditStage = "waiting"
+            }
+            if ($script:asyncPollingAuditStage -eq "waiting" -and $script:asyncPollingAuditCounters.SlowResultApplied) {
+                Stop-StatusRefresh
+                $script:uiFlowState = "Idle"
+                $script:asyncPollingAuditLateQueued = Invoke-UiBeginInvoke {
+                    if ($null -ne $script:nodeStatusLabel -and !$script:nodeStatusLabel.IsDisposed) {
+                        $script:asyncPollingAuditCounters.LateResultWrites++
+                        $script:nodeStatusLabel.Text = "迟到结果不应写入"
+                    }
+                }
+                $script:asyncPollingAuditStage = "closing"
+                $script:form.Close()
+            } elseif ($script:asyncPollingAuditStage -eq "waiting" -and $now -ge $script:asyncPollingAuditCompletionDeadline) {
+                $script:asyncPollingAuditStage = "closing"
+                $script:form.Close()
+            }
+        } catch {
+            $script:asyncPollingAuditStage = "closing"
+            try { $script:form.Close() } catch {}
+        }
+    })
+    $heartbeat.Start()
+    $script:statusRefreshTimer.Interval = 50
+    Start-StatusRefresh
+    [void][System.Windows.Forms.Application]::Run($script:form)
+    $heartbeat.Stop()
+    $heartbeat.Dispose()
+
+    return [pscustomobject]@{
+        Passed = ($script:asyncPollingAuditResponsiveTicks -ge 10 -and
+            $script:asyncPollingAuditCounters.WorkerStarts -eq 1 -and
+            $script:asyncPollingAuditCounters.MaxConcurrentWorkers -le 1 -and
+            $script:asyncPollingAuditCounters.LateResultWrites -eq 0 -and
+            $script:asyncPollingAuditCounters.UiThreadApplied -and
+            $script:asyncPollingAuditCounters.SlowResultApplied -and
+            $script:asyncPollingAuditCounters.MembersRetainedOnFail -and
+            $script:asyncPollingAuditLateQueued)
+        MessagePumpTicks = $script:asyncPollingAuditResponsiveTicks
+        WorkerStarts = $script:asyncPollingAuditCounters.WorkerStarts
+        MaxConcurrentWorkers = $script:asyncPollingAuditCounters.MaxConcurrentWorkers
+        LateResultWrites = $script:asyncPollingAuditCounters.LateResultWrites
+        UiThreadApplied = $script:asyncPollingAuditCounters.UiThreadApplied
+        SlowResultApplied = $script:asyncPollingAuditCounters.SlowResultApplied
+        MembersRetainedOnFail = $script:asyncPollingAuditCounters.MembersRetainedOnFail
+        PollingTicks = $script:asyncPollingAuditCounters.PollingTicks
+        LastOperationState = $script:asyncPollingAuditCounters.LastOperationState
+        LateResultQueued = $script:asyncPollingAuditLateQueued
+        StartFailures = $script:asyncPollingAuditCounters.StartFailures
+        LastStartErrorType = $script:asyncPollingAuditCounters.LastStartErrorType
+        LastStartErrorMessage = $script:asyncPollingAuditCounters.LastStartErrorMessage
+    }
+}
+
+if (!$LayoutAudit -and !$AsyncPollingAudit -and !$PreparationRaceAudit) {
+    if (!(Enter-UiInstance)) {
+        [void][System.Windows.Forms.MessageBox]::Show("IPv6Mesh 已在运行。请使用现有窗口。", "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        return
+    }
+    $script:uiInstanceActive = $true
+}
+
+try {
 $initialIPv6 = Get-DetectedIPv6Address
 if ([string]::IsNullOrWhiteSpace($initialIPv6) -and ![string]::IsNullOrWhiteSpace($ControlUrl)) {
     try {
@@ -1177,6 +2302,7 @@ $createButton.Dock = [System.Windows.Forms.DockStyle]::Fill
 $createButton.Margin = New-Object System.Windows.Forms.Padding(10, 15, 10, 15)
 $createButton.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 12)
 $createButton.Add_Click({ Show-HostPage })
+$script:welcomeCreateButton = $createButton
 [void]$script:welcomePanel.Controls.Add($createButton, 1, 3)
 
 $joinButton = New-Object System.Windows.Forms.Button
@@ -1186,6 +2312,7 @@ $joinButton.Dock = [System.Windows.Forms.DockStyle]::Fill
 $joinButton.Margin = New-Object System.Windows.Forms.Padding(10, 15, 10, 15)
 $joinButton.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 12)
 $joinButton.Add_Click({ Show-MemberPage })
+$script:welcomeJoinButton = $joinButton
 [void]$script:welcomePanel.Controls.Add($joinButton, 2, 3)
 
 $script:operationShell = New-Object System.Windows.Forms.Panel
@@ -1209,6 +2336,7 @@ $script:operationSplit.Add_SplitterMoved({
     }
 })
 $script:operationSplit.Add_SizeChanged({ Set-ResponsiveSplitLayout })
+$script:operationSplit.Panel1.Add_SizeChanged({ Set-ResponsiveMemberLayout })
 $script:form.Add_Shown({ Set-ResponsiveSplitLayout })
 
 $script:hostPanel = New-ResponsivePageGrid "HostPanel"
@@ -1216,10 +2344,9 @@ $script:hostPanel.RowCount = 6
 for ($row = 0; $row -lt 6; $row++) {
     [void]$script:hostPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
 }
-[void]$script:operationSplit.Panel1.Controls.Add($script:hostPanel)
 
 $hostBackButton = New-LayoutButton "HostBack" "返回" 90
-$hostBackButton.Add_Click({ Show-WelcomePage })
+$hostBackButton.Add_Click({ Return-ToWelcome })
 $script:backButtons += $hostBackButton
 Add-PageControl $script:hostPanel $hostBackButton 0 0
 
@@ -1251,6 +2378,13 @@ Add-PageControl $script:hostPanel $script:hostVirtualIPv4Label 0 4 3
 $script:hostStartButton = New-LayoutButton "HostStart" "创建并连接" 190 44
 $script:hostStartButton.Add_Click({ Start-HostRoom })
 Add-PageControl $script:hostPanel $script:hostStartButton 0 5 3
+$hostMemberInfo = New-RoomMembersPanel "HostMembers"
+$script:hostMemberPanel = $hostMemberInfo.Panel
+$script:hostMemberGrid = $hostMemberInfo.Grid
+$script:hostMemberCountLabel = $hostMemberInfo.CountLabel
+$script:hostMemberRefreshLabel = $hostMemberInfo.RefreshLabel
+$script:hostPageShell = New-RoomPageShell "HostPageShell" $script:hostPanel $script:hostMemberPanel
+[void]$script:operationSplit.Panel1.Controls.Add($script:hostPageShell)
 
 $script:memberPanel = New-ResponsivePageGrid "MemberPanel"
 $script:memberPanel.RowCount = 6
@@ -1258,10 +2392,9 @@ for ($row = 0; $row -lt 6; $row++) {
     [void]$script:memberPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
 }
 $script:memberPanel.Visible = $false
-[void]$script:operationSplit.Panel1.Controls.Add($script:memberPanel)
 
 $memberBackButton = New-LayoutButton "MemberBack" "返回" 90
-$memberBackButton.Add_Click({ Show-WelcomePage })
+$memberBackButton.Add_Click({ Return-ToWelcome })
 $script:backButtons += $memberBackButton
 Add-PageControl $script:memberPanel $memberBackButton 0 0
 
@@ -1286,6 +2419,13 @@ Add-PageControl $script:memberPanel $script:memberVirtualIPv4Label 0 4 3
 $script:memberJoinButton = New-LayoutButton "MemberJoin" "加入并连接" 190 44
 $script:memberJoinButton.Add_Click({ Join-MemberRoom })
 Add-PageControl $script:memberPanel $script:memberJoinButton 0 5 3
+$memberMemberInfo = New-RoomMembersPanel "MemberMembers"
+$script:memberMemberPanel = $memberMemberInfo.Panel
+$script:memberMemberGrid = $memberMemberInfo.Grid
+$script:memberMemberCountLabel = $memberMemberInfo.CountLabel
+$script:memberMemberRefreshLabel = $memberMemberInfo.RefreshLabel
+$script:memberPageShell = New-RoomPageShell "MemberPageShell" $script:memberPanel $script:memberMemberPanel
+[void]$script:operationSplit.Panel1.Controls.Add($script:memberPageShell)
 
 $script:diagnosticsPanel = New-Object System.Windows.Forms.GroupBox
 $script:diagnosticsPanel.Name = "DiagnosticsPanel"
@@ -1330,15 +2470,19 @@ $statusActions.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
 
 $refreshStatusButton = New-LayoutButton "RefreshStatus" "刷新状态" 100
 $refreshStatusButton.Add_Click({ $null = Get-NodeStatus })
+$script:refreshStatusButton = $refreshStatusButton
 [void]$statusActions.Controls.Add($refreshStatusButton)
 $connectButton = New-LayoutButton "ConnectNode" "连接" 90
 $connectButton.Add_Click({ Connect-Node })
+$script:connectButton = $connectButton
 [void]$statusActions.Controls.Add($connectButton)
 $disconnectButton = New-LayoutButton "DisconnectNode" "断开" 90
 $disconnectButton.Add_Click({ Disconnect-Node })
+$script:disconnectButton = $disconnectButton
 [void]$statusActions.Controls.Add($disconnectButton)
 $leaveButton = New-LayoutButton "LeaveRoom" "离开房间" 110
-$leaveButton.Add_Click({ Leave-Node })
+$leaveButton.Add_Click({ Exit-ActiveRoom })
+$script:leaveButton = $leaveButton
 [void]$statusActions.Controls.Add($leaveButton)
 
 $script:logBox = New-Object System.Windows.Forms.TextBox
@@ -1377,13 +2521,47 @@ $script:statusRefreshTimer.Add_Tick({ Invoke-AutomaticStatusRefresh })
 
 $script:ipv6AddressBox.Add_TextChanged({
     if ($script:updatingEndpoint) { return }
-    try { Update-ControlEndpoint } catch { $script:hostStartButton.Enabled = $false }
+    try { Update-ControlEndpoint } catch { Update-UiFlowControls }
 })
 
-$script:form.Add_FormClosing({ Stop-AllResources })
+$script:form.Add_FormClosing({
+    if ($script:asyncPollingAuditMode) {
+        Dispose-StatusRefreshTimer
+        return
+    }
+    Stop-AllResources
+})
 if ($LayoutAudit) {
     try {
         $audit = Invoke-ResponsiveLayoutAudit
+        $audit | ConvertTo-Json -Depth 6 -Compress
+        if (!$audit.Passed) { exit 1 }
+    } finally {
+        Stop-StatusRefresh
+        if ($null -ne $script:form -and !$script:form.IsDisposed) {
+            $script:form.Hide()
+            $script:form.Dispose()
+        }
+    }
+    return
+}
+if ($AsyncPollingAudit) {
+    try {
+        $audit = Invoke-AsyncPollingAudit
+        $audit | ConvertTo-Json -Depth 6 -Compress
+        if (!$audit.Passed) { exit 1 }
+    } finally {
+        Stop-StatusRefresh
+        if ($null -ne $script:form -and !$script:form.IsDisposed) {
+            $script:form.Hide()
+            $script:form.Dispose()
+        }
+    }
+    return
+}
+if ($PreparationRaceAudit) {
+    try {
+        $audit = Invoke-PreparationRaceAudit
         $audit | ConvertTo-Json -Depth 6 -Compress
         if (!$audit.Passed) { exit 1 }
     } finally {
@@ -1405,8 +2583,11 @@ if ($initialIPv6 -ne "") {
 }
 Set-PrimaryBusy $false ""
 Show-WelcomePage
-try {
-    [void][System.Windows.Forms.Application]::Run($script:form)
+[void][System.Windows.Forms.Application]::Run($script:form)
 } finally {
-    Stop-AllResources
+    if ($script:uiInstanceActive) {
+        Stop-AllResources
+        Exit-UiInstance
+        $script:uiInstanceActive = $false
+    }
 }

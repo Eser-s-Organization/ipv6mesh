@@ -33,7 +33,7 @@ type command struct {
 
 func parseCommand(args []string) (command, error) {
 	if len(args) == 0 {
-		return command{}, errors.New("usage: vpnctl status|join|leave|connect|disconnect|network create|invite create|room create|room endpoint|room join")
+		return command{}, errors.New("usage: vpnctl status|join|leave|connect|disconnect|network create|invite create|room create|room endpoint|room join|room members")
 	}
 	switch args[0] {
 	case "status":
@@ -89,7 +89,7 @@ func parseCommand(args []string) (command, error) {
 		return command{Kind: controlCommand, NetworkID: values["--network"], Expires: values["--expires"]}, nil
 	case "room":
 		if len(args) < 2 {
-			return command{}, errors.New("usage: vpnctl room create|endpoint|join")
+			return command{}, errors.New("usage: vpnctl room create|endpoint|join|members")
 		}
 		switch args[1] {
 		case "create":
@@ -122,8 +122,13 @@ func parseCommand(args []string) (command, error) {
 				return command{}, err
 			}
 			return command{Kind: serviceCommand, Service: request, ControlURL: controlURL}, nil
+		case "members":
+			if len(args) != 2 {
+				return command{}, errors.New("room members takes no arguments")
+			}
+			return command{Kind: serviceCommand, Service: ipc.Request{Type: ipc.CommandRoomMembers}}, nil
 		default:
-			return command{}, errors.New("usage: vpnctl room create|endpoint|join")
+			return command{}, errors.New("usage: vpnctl room create|endpoint|join|members")
 		}
 	default:
 		return command{}, fmt.Errorf("unknown command %q", args[0])

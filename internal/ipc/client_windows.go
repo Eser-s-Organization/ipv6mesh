@@ -14,15 +14,38 @@ import (
 var ErrUnsupported = errors.New("named-pipe IPC is unavailable")
 
 type Client struct {
-	Path    string
-	Timeout time.Duration
+	Path           string
+	Timeout        time.Duration
+	NetworkTimeout time.Duration
 }
 
 func NewClient(path string) *Client {
 	if path == "" {
 		path = DefaultPipeName
 	}
-	return &Client{Path: path, Timeout: 5 * time.Second}
+	return &Client{Path: path, Timeout: 5 * time.Second, NetworkTimeout: 45 * time.Second}
+}
+
+func (client *Client) timeoutFor(command Command) time.Duration {
+	if commandTimeoutClass(command) == networkCommandTimeout && client.NetworkTimeout > 0 {
+		return client.NetworkTimeout
+	}
+	return client.Timeout
+}
+
+func (client *Client) callDeadline(ctx context.Context, command Command, now time.Time) (time.Time, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	if timeout := client.timeoutFor(command); timeout > 0 {
+		budgetDeadline := now.Add(timeout)
+		if !hasDeadline || budgetDeadline.Before(deadline) {
+			deadline = budgetDeadline
+			hasDeadline = true
+		}
+	}
+	return deadline, hasDeadline
 }
 
 func (client *Client) Call(ctx context.Context, request Request) (Response, error) {
@@ -33,13 +56,23 @@ func (client *Client) Call(ctx context.Context, request Request) (Response, erro
 	if err != nil {
 		return Response{}, err
 	}
-	connection, err := winio.DialPipeContext(ctx, client.Path)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline, hasDeadline := client.callDeadline(ctx, request.Type, time.Now())
+	callContext := ctx
+	var cancel context.CancelFunc
+	if hasDeadline {
+		callContext, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
+	connection, err := winio.DialPipeContext(callContext, client.Path)
 	if err != nil {
 		return Response{}, err
 	}
 	defer connection.Close()
-	if client.Timeout > 0 {
-		_ = connection.SetDeadline(time.Now().Add(client.Timeout))
+	if hasDeadline {
+		_ = connection.SetDeadline(deadline)
 	}
 	if _, err := connection.Write(payload); err != nil {
 		return Response{}, err

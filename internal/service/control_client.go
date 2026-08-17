@@ -66,7 +66,7 @@ func (client *HTTPControlClient) JoinRoom(ctx context.Context, request JoinReque
 }
 
 func (client *HTTPControlClient) rememberEnrollment(result control.EnrollmentResult) (JoinResult, error) {
-	joined := JoinResult{NetworkID: result.Network.ID, VirtualIPv4: result.Membership.VirtualIPv4.String(), ConfigGeneration: result.Network.ConfigVersion}
+	joined := JoinResult{DisplayName: result.Node.DisplayName, NetworkID: result.Network.ID, VirtualIPv4: result.Membership.VirtualIPv4.String(), ConfigGeneration: result.Network.ConfigVersion}
 	client.mu.Lock()
 	client.nodeID = result.Node.ID
 	client.networkID = result.Network.ID

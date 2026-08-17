@@ -47,7 +47,7 @@ func TestHTTPControlClientBridgesEnrollmentAndLeave(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if joined.NetworkID != "network-1" || joined.VirtualIPv4 != "10.42.0.2" || joined.ConfigGeneration != 7 {
+	if joined.DisplayName != "Alice" || joined.NetworkID != "network-1" || joined.VirtualIPv4 != "10.42.0.2" || joined.ConfigGeneration != 7 {
 		t.Fatalf("unexpected bridged join result: %#v", joined)
 	}
 	if err := bridge.Leave(context.Background(), "network-1"); err != nil {
@@ -85,7 +85,7 @@ func TestHTTPControlClientBridgesRoomJoinWithoutInvite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if joined.NetworkID != "room-1" || joined.VirtualIPv4 != "10.42.0.9" || joined.ConfigGeneration != 2 {
+	if joined.DisplayName != "MEMBER-PC" || joined.NetworkID != "room-1" || joined.VirtualIPv4 != "10.42.0.9" || joined.ConfigGeneration != 2 {
 		t.Fatalf("unexpected room join result: %#v", joined)
 	}
 }

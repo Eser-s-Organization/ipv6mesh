@@ -5,12 +5,16 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Eser-s-Organization/ipv6mesh/internal/ipc"
 )
@@ -211,6 +215,66 @@ func TestWindowsDocumentationDescribesPersistentLiveDiagnostics(t *testing.T) {
 	}
 }
 
+func TestWindowsDocumentationDescribesReliableRoomMembers(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	repositoryRoot := filepath.Join(filepath.Dir(sourceFile), "..", "..")
+	rootBytes, err := os.ReadFile(filepath.Join(repositoryRoot, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	windowsBytes, err := os.ReadFile(filepath.Join(repositoryRoot, "packaging", "windows", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := strings.ToLower(strings.Join(strings.Fields(string(rootBytes)), " "))
+	windows := strings.Join(strings.Fields(string(windowsBytes)), " ")
+	rootRequired := []string{
+		"room members", "display name", "virtual ipv4", "online", "wide window", "right-hand member column", "narrow window", "stacked", "cannot be active at the same time", "end the room", "leave the room", "/healthz", "control_unreachable", "operation_timeout", "does not automatically retry", "does not show an offline transition", "does not restore",
+	}
+	for _, required := range rootRequired {
+		if !strings.Contains(root, required) {
+			t.Errorf("README.md missing room reliability statement %q", required)
+		}
+	}
+	windowsRequired := []string{
+		"房间成员", "名称", "虚拟 IPv4", "在线", "宽窗口", "右侧成员栏", "窄窗口", "成员列表下移", "不能同时", "处于活动状态", "结束房间", "离开房间", "/healthz", "control_unreachable", "operation_timeout", "不会自动重试", "不显示离线", "不会自动恢复",
+	}
+	for _, required := range windowsRequired {
+		if !strings.Contains(windows, required) {
+			t.Errorf("packaging/windows/README.md missing room reliability statement %q", required)
+		}
+	}
+	rootMembersStart := strings.Index(root, "live room member list")
+	windowsLower := strings.ToLower(windows)
+	windowsMembersStart := strings.Index(windows, "房间成员列表")
+	rootMembersEnd := -1
+	if rootMembersStart >= 0 {
+		rootMembersEnd = strings.Index(root[rootMembersStart:], "opening the ui")
+	}
+	windowsMembersEnd := -1
+	if windowsMembersStart >= 0 {
+		windowsMembersEnd = strings.Index(windowsLower[windowsMembersStart:], "the room endpoint")
+	}
+	if rootMembersStart < 0 || rootMembersEnd < 0 || windowsMembersStart < 0 || windowsMembersEnd < 0 {
+		t.Fatal("member-list documentation sections not found")
+	}
+	rootMembers := root[rootMembersStart : rootMembersStart+rootMembersEnd]
+	windowsMembers := windows[windowsMembersStart : windowsMembersStart+windowsMembersEnd]
+	for _, forbidden := range []string{"token", "invite", "public key", "endpoint", "administrator"} {
+		if strings.Contains(rootMembers, forbidden) {
+			t.Errorf("README.md member list exposes forbidden field %q", forbidden)
+		}
+	}
+	for _, forbidden := range []string{"令牌", "邀请", "公钥", "endpoint", "管理员"} {
+		if strings.Contains(windowsMembers, forbidden) {
+			t.Errorf("packaging/windows/README.md member list exposes forbidden field %q", forbidden)
+		}
+	}
+}
+
 func TestWindowsUIUsesRoomWorkflowAndActionableHealthCheck(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -402,7 +466,7 @@ func TestWindowsUIOperationPagesUseResponsiveGrids(t *testing.T) {
 		`$script:hostPanel = New-ResponsivePageGrid "HostPanel"`,
 		`$script:memberPanel = New-ResponsivePageGrid "MemberPanel"`,
 		`$page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))`,
-		`$page.MinimumSize = New-Object System.Drawing.Size(820, 0)`,
+		`$page.MinimumSize = New-Object System.Drawing.Size(0, 0)`,
 		`$script:ipv6AddressBox.Dock = [System.Windows.Forms.DockStyle]::Fill`,
 		`$script:memberHostIPv6Box.Dock = [System.Windows.Forms.DockStyle]::Fill`,
 		`$script:operationSplit.Panel1.AutoScroll = $true`,
@@ -486,10 +550,301 @@ func TestWindowsUIResponsiveLayoutAudit(t *testing.T) {
 	if !strings.Contains(compact, `"Passed":true`) {
 		t.Fatalf("responsive WinForms layout audit did not report success:\n%s", output)
 	}
-	for _, required := range []string{`"Case":"preferred"`, `"Case":"minimum"`, `"Case":"large"`, `"Case":"constrained"`, `"Case":"large-font"`, `"Case":"upper-limit"`, `"Case":"lower-limit"`} {
+	for _, required := range []string{`"Case":"preferred"`, `"Case":"minimum"`, `"Case":"large"`, `"Case":"constrained"`, `"Case":"large-font"`, `"Case":"upper-limit"`, `"Case":"lower-limit"`, `"MemberLayoutMode":"Wide"`, `"MemberLayoutMode":"Narrow"`, `"MemberPanelWidth":`, `"MemberGridWidth":`, `"SettingsMemberOverlap":0`, `"SplitterPreserved":true`, `"HostPageShellVisible":true`, `"MemberPageShellVisible":false`, `"HostPageShellArea":0`, `"MemberMinimumWidth":`, `"MemberMaximumWidth":`, `"MemberWidthWithinBounds":true`} {
 		if !strings.Contains(compact, required) {
 			t.Errorf("responsive WinForms layout audit missing sample %s", required)
 		}
+	}
+}
+
+func TestWindowsUIAsyncPollingMessagePumpAudit(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(
+		ctx,
+		"powershell.exe",
+		"-NoLogo",
+		"-NoProfile",
+		"-NonInteractive",
+		"-File", uiPath,
+		"-PackageDirectory", t.TempDir(),
+		"-InstallDirectory", filepath.Join(t.TempDir(), "missing-install"),
+		"-AsyncPollingAudit",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("async WinForms polling audit failed: %v\n%s", err, output)
+	}
+	var audit struct {
+		Passed                bool `json:"Passed"`
+		MessagePumpTicks      int  `json:"MessagePumpTicks"`
+		WorkerStarts          int  `json:"WorkerStarts"`
+		MaxConcurrentWorkers  int  `json:"MaxConcurrentWorkers"`
+		LateResultWrites      int  `json:"LateResultWrites"`
+		UiThreadApplied       bool `json:"UiThreadApplied"`
+		SlowResultApplied     bool `json:"SlowResultApplied"`
+		MembersRetainedOnFail bool `json:"MembersRetainedOnFail"`
+		StartFailures         int  `json:"StartFailures"`
+	}
+	lines := strings.Split(strings.ReplaceAll(string(output), "\r", ""), "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		line := strings.TrimSpace(lines[index])
+		if strings.HasPrefix(line, "{") {
+			if err := json.Unmarshal([]byte(line), &audit); err != nil {
+				t.Fatalf("decode async polling audit JSON: %v\n%s", err, output)
+			}
+			break
+		}
+	}
+	if !audit.Passed || audit.MessagePumpTicks < 10 || audit.WorkerStarts != 1 || audit.MaxConcurrentWorkers > 1 || audit.LateResultWrites != 0 || !audit.UiThreadApplied || !audit.SlowResultApplied || !audit.MembersRetainedOnFail || audit.StartFailures != 0 {
+		t.Fatalf("async polling audit did not prove non-blocking, serialized, safe updates: %#v\n%s", audit, output)
+	}
+}
+
+func TestWindowsUIAsyncPollingAuditCapturesStartFailureDiagnostics(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "ui.ps1")
+	for _, required := range []string{
+		`LastStartErrorType`,
+		`LastStartErrorMessage`,
+		`StartFailures`,
+		`$_.Exception.GetType().FullName`,
+		`$_.Exception.Message`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("async polling audit must expose safe start-failure diagnostic %q", required)
+		}
+	}
+}
+
+func TestWindowsUIAsyncPollingAuditCanRunConcurrently(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	type result struct {
+		output []byte
+		err    error
+	}
+	results := make(chan result, 2)
+	var start sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		packageDirectory := t.TempDir()
+		cmd := exec.CommandContext(
+			ctx,
+			"powershell.exe",
+			"-NoLogo",
+			"-NoProfile",
+			"-NonInteractive",
+			"-File", uiPath,
+			"-PackageDirectory", packageDirectory,
+			"-InstallDirectory", filepath.Join(t.TempDir(), "missing-install"),
+			"-AsyncPollingAudit",
+		)
+		start.Add(1)
+		go func() {
+			start.Done()
+			output, err := cmd.CombinedOutput()
+			results <- result{output: output, err: err}
+		}()
+	}
+	start.Wait()
+	for i := 0; i < 2; i++ {
+		got := <-results
+		if got.err != nil {
+			t.Fatalf("concurrent async polling audit %d failed: %v\n%s", i+1, got.err, got.output)
+		}
+		compact := strings.ReplaceAll(strings.ReplaceAll(string(got.output), "\r", ""), "\n", "")
+		if !strings.Contains(compact, `"Passed":true`) {
+			t.Fatalf("concurrent async polling audit %d did not complete successfully:\n%s", i+1, got.output)
+		}
+	}
+}
+
+func TestWindowsUIPreparationRaceAudit(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(
+		ctx,
+		"powershell.exe",
+		"-NoLogo",
+		"-NoProfile",
+		"-NonInteractive",
+		"-File", uiPath,
+		"-PackageDirectory", t.TempDir(),
+		"-InstallDirectory", filepath.Join(t.TempDir(), "missing-install"),
+		"-PreparationRaceAudit",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("preparation race audit failed: %v\n%s", err, output)
+	}
+	var audit struct {
+		Passed                    bool `json:"Passed"`
+		PrimaryOperationCancelled bool `json:"PrimaryOperationCancelled"`
+		OldGenerationApplied      bool `json:"OldGenerationApplied"`
+		StaleResultDropped        bool `json:"StaleResultDropped"`
+		JoinedNetworkPreserved    bool `json:"JoinedNetworkPreserved"`
+		FailureReturnedToSetup    bool `json:"FailureReturnedToSetup"`
+		RefreshRestarted          bool `json:"RefreshRestarted"`
+	}
+	lines := strings.Split(strings.ReplaceAll(string(output), "\r", ""), "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		line := strings.TrimSpace(lines[index])
+		if strings.HasPrefix(line, "{") {
+			if err := json.Unmarshal([]byte(line), &audit); err != nil {
+				t.Fatalf("decode preparation race audit JSON: %v\n%s", err, output)
+			}
+			break
+		}
+	}
+	if !audit.Passed || !audit.PrimaryOperationCancelled || audit.OldGenerationApplied || !audit.StaleResultDropped || !audit.JoinedNetworkPreserved || !audit.FailureReturnedToSetup || !audit.RefreshRestarted {
+		t.Fatalf("preparation race audit did not prove cancellation, stale-result isolation, and refresh recovery: %#v\n%s", audit, output)
+	}
+}
+
+func TestWindowsUIResponsiveMemberLayoutUsesMeasuredClientSpace(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "ui.ps1")
+	for _, required := range []string{
+		"GetPreferredSize",
+		".MinimumSize",
+		".Margin",
+		"function Get-MemberLayoutPolicy",
+		"MemberMinimumWidth",
+		"MemberMaximumWidth",
+		"MemberWidthWithinBounds",
+	} {
+		if !strings.Contains(contents, required) {
+			t.Errorf("UI missing measured member-layout behavior %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"-SettingsPreferredWidth 620",
+		"-MembersMinimumWidth 300",
+		"-Gap 16",
+		"[System.Windows.Forms.SizeType]::Absolute, 320",
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("UI retains raw member-layout constant %q", forbidden)
+		}
+	}
+}
+
+func TestWindowsUIInstallReadinessFailureStopsOnlyItsStartedService(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "install.ps1")
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	scriptPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "install.ps1")
+	quotedPath := strings.ReplaceAll(scriptPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+$node = $ast.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'Start-NodeServiceAndWait' }, $true) | Select-Object -First 1
+if ($null -eq $node) { throw 'Start-NodeServiceAndWait function not found' }
+$stopNode = $ast.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'Stop-StartedNodeService' }, $true) | Select-Object -First 1
+if ($null -eq $stopNode) { throw 'Stop-StartedNodeService function not found' }
+. ([scriptblock]::Create($stopNode.Extent.Text))
+. ([scriptblock]::Create($node.Extent.Text))
+$script:startCalls = 0
+$script:stopCalls = 0
+$script:startMode = 'success'
+function Start-Service { param([string]$Name) $script:startCalls++; if ($script:startMode -eq 'fail') { throw 'start failed' } }
+function Wait-NodeServiceReady { param([string]$VpnCtl, [int]$TimeoutSeconds) throw 'readiness failed' }
+function Stop-Service { param([string]$Name, [switch]$Force, [string]$ErrorAction) $script:stopCalls++ }
+function Get-Service { param([string]$Name, [string]$ErrorAction) return $null }
+$failed = $false
+try { Start-NodeServiceAndWait -ServiceName 'test' -VpnCtl 'vpnctl.exe' -TimeoutSeconds 15 } catch { $failed = $true }
+if (!$failed -or $script:startCalls -ne 1 -or $script:stopCalls -ne 1) { throw ('readiness rollback start=' + $script:startCalls + ' stop=' + $script:stopCalls) }
+$script:startMode = 'fail'
+$failed = $false
+try { Start-NodeServiceAndWait -ServiceName 'test' -VpnCtl 'vpnctl.exe' -TimeoutSeconds 15 } catch { $failed = $true }
+if (!$failed -or $script:startCalls -ne 2 -or $script:stopCalls -ne 1) { throw ('preexisting ownership stop=' + $script:stopCalls) }
+`
+	if !strings.Contains(contents, "Start-NodeServiceAndWait") {
+		t.Fatal("install script missing testable service-start ownership helper")
+	}
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install readiness rollback check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWindowsUIMemberLogDecision(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+$function = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-MemberLogDecision' }, $true) | Select-Object -First 1
+if ($null -eq $function) { Write-Error 'Get-MemberLogDecision function not found'; exit 1 }
+. ([scriptblock]::Create($function.Extent.Text))
+$cases = @(
+    @{ Name = 'first success'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = 'HOST-PC|10.42.0.2|True|online'; HasPrevious = $false; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'Changed' },
+    @{ Name = 'unchanged success'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = 'HOST-PC|10.42.0.2|True|online'; HasPrevious = $true; PreviousSucceeded = $true; PreviousFingerprint = 'HOST-PC|10.42.0.2|True|online' }; Want = 'None' },
+    @{ Name = 'failure'; Parameters = @{ Automatic = $true; Succeeded = $false; Fingerprint = ''; HasPrevious = $true; PreviousSucceeded = $true; PreviousFingerprint = 'x' }; Want = 'Failed' },
+    @{ Name = 'repeated failure'; Parameters = @{ Automatic = $true; Succeeded = $false; Fingerprint = ''; HasPrevious = $true; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'None' },
+    @{ Name = 'recovery'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = 'x'; HasPrevious = $true; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'Recovered' }
+)
+foreach ($case in $cases) {
+    $parameters = $case.Parameters
+    $got = Get-MemberLogDecision @parameters
+    if ($got -ne $case.Want) { throw ($case.Name + ': got ' + $got + ', want ' + $case.Want) }
+}
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell member-log decision check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWindowsUIMemberLayoutMode(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+$function = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-MemberLayoutMode' }, $true) | Select-Object -First 1
+if ($null -eq $function) { Write-Error 'Get-MemberLayoutMode function not found'; exit 1 }
+. ([scriptblock]::Create($function.Extent.Text))
+if ((Get-MemberLayoutMode -AvailableWidth 1120 -SettingsPreferredWidth 620 -MembersMinimumWidth 300 -Gap 16) -ne 'Wide') { throw 'wide failed' }
+if ((Get-MemberLayoutMode -AvailableWidth 900 -SettingsPreferredWidth 620 -MembersMinimumWidth 300 -Gap 16) -ne 'Narrow') { throw 'narrow failed' }
+if ((Get-MemberLayoutMode -AvailableWidth 0 -SettingsPreferredWidth 620 -MembersMinimumWidth 300 -Gap 16) -ne 'Narrow') { throw 'zero failed' }
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell member-layout mode check failed: %v\n%s", err, output)
 	}
 }
 
@@ -638,6 +993,9 @@ func TestWindowsUILiveStatusTimerUsesQuietDeduplicatedPolling(t *testing.T) {
 		t.Fatalf("read UI script: %v", err)
 	}
 	contents := string(uiScript)
+	if strings.Contains(contents, "Start-Job") || strings.Contains(contents, "Remove-Job") {
+		t.Fatal("automatic polling must not use Start-Job lifecycle")
+	}
 	for _, required := range []string{
 		`$script:statusRefreshTimer = New-Object System.Windows.Forms.Timer`,
 		`$script:statusRefreshTimer.Interval = 2000`,
@@ -647,10 +1005,23 @@ func TestWindowsUILiveStatusTimerUsesQuietDeduplicatedPolling(t *testing.T) {
 		`function Dispose-StatusRefreshTimer`,
 		`function Invoke-AutomaticStatusRefresh`,
 		`$script:primaryBusy -or $script:cleanupStarted`,
-		`$script:activePage -eq "Welcome" -or $script:statusRefreshInProgress`,
-		`Get-NodeStatus -Automatic`,
+		`if ($script:activePage -eq "Welcome") { return }`,
+		`$script:statusRefreshInProgress -or $script:automaticPollingApplyPending`,
+		`function Start-AutomaticPollingCommand`,
+		`function Complete-AutomaticPollingCommand`,
+		`ReadToEndAsync()`,
+		`$process.EnableRaisingEvents = $true`,
+		`$process.HasExited`,
+		`$script:automaticPollingGeneration`,
+		`Invoke-UiBeginInvoke`,
+		`function Apply-NodeStatusResult`,
+		`function Apply-RoomMembersResult`,
+		`function Get-RoomMembers`,
+		`Invoke-VpnCtl -Arguments @("room", "members") -SuppressStandardOutput -Quiet:$Automatic`,
+		`$script:uiFlowState -in @("Hosting", "JoinedMember")`,
+		`Get-MemberLogDecision`,
 		`Invoke-VpnCtl -Arguments @("status") -SuppressStandardOutput -Quiet:$Automatic`,
-		`Convert-ResultToJson $result "读取节点状态" -Quiet:$Automatic`,
+		`Convert-ResultToJson $Result "读取节点状态" -Quiet:$Automatic`,
 		`Get-StatusLogDecision`,
 		`Dispose-StatusRefreshTimer`,
 	} {
@@ -691,5 +1062,179 @@ func TestInstallScriptStopsExistingServiceBeforeCopyingFiles(t *testing.T) {
 	}
 	if stopIndex > copyIndex {
 		t.Fatalf("Stop-Service occurs after Copy-Item (stop=%d, copy=%d)", stopIndex, copyIndex)
+	}
+}
+
+func readWindowsPackagingFile(t *testing.T, name string) string {
+	t.Helper()
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	path := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", name)
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(contents)
+}
+
+func TestInstallScriptWaitsForNamedPipeReadinessAfterServiceStart(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "install.ps1")
+	start := strings.Index(contents, "Start-Service -Name $ServiceName")
+	waitOffset := strings.Index(contents[start:], "Wait-NodeServiceReady")
+	wait := -1
+	if start >= 0 && waitOffset >= 0 {
+		wait = start + waitOffset
+	}
+	success := strings.Index(contents, `Write-Host "IPv6Mesh installed`)
+	if start < 0 || wait < 0 || success < 0 || wait < start || wait > success {
+		t.Fatalf("readiness order start=%d wait=%d success=%d", start, wait, success)
+	}
+	for _, required := range []string{"vpnctl.exe", `@("status")`, "15", "ConvertFrom-Json", ".ok"} {
+		if !strings.Contains(contents, required) {
+			t.Errorf("readiness logic missing %q", required)
+		}
+	}
+}
+
+func TestWindowsUIFlowTransitions(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+$function = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-UiFlowTransition' }, $true) | Select-Object -First 1
+if ($null -eq $function) { Write-Error 'Test-UiFlowTransition function not found'; exit 1 }
+. ([scriptblock]::Create($function.Extent.Text))
+$allowed = @(
+    @('Idle','HostSetup'), @('Idle','MemberSetup'),
+    @('HostSetup','Idle'), @('HostSetup','PreparingHost'),
+    @('MemberSetup','Idle'), @('MemberSetup','PreparingMember'),
+    @('PreparingHost','Hosting'), @('PreparingHost','Cleaning'),
+    @('PreparingMember','JoinedMember'), @('PreparingMember','Cleaning'),
+    @('Hosting','Cleaning'), @('JoinedMember','Cleaning'),
+    @('Cleaning','Idle'), @('Cleaning','HostSetup'), @('Cleaning','MemberSetup')
+)
+foreach ($pair in $allowed) { if (!(Test-UiFlowTransition -From $pair[0] -To $pair[1])) { throw ('rejected ' + ($pair -join ' -> ')) } }
+$rejected = @(
+    @('Hosting','MemberSetup'), @('Hosting','JoinedMember'),
+    @('JoinedMember','HostSetup'), @('JoinedMember','Hosting'),
+    @('PreparingHost','PreparingMember'), @('PreparingMember','PreparingHost')
+)
+foreach ($pair in $rejected) { if (Test-UiFlowTransition -From $pair[0] -To $pair[1]) { throw ('accepted ' + ($pair -join ' -> ')) } }
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell flow-transition check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWindowsUISingleInstance(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "ui.ps1")
+	for _, required := range []string{
+		`Global\IPv6Mesh.WindowsUI`,
+		"function Enter-UiInstance",
+		"function Exit-UiInstance",
+		"IPv6Mesh 已在运行。请使用现有窗口。",
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("UI missing single-instance behavior %q", required)
+		}
+	}
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	readyPath := filepath.Join(t.TempDir(), "ready")
+	releasePath := filepath.Join(filepath.Dir(readyPath), "release")
+	fileExists := func(path string) bool { _, err := os.Stat(path); return err == nil }
+	holder := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", `$created = $false; $held = New-Object System.Threading.Mutex($true, 'Global\IPv6Mesh.WindowsUI', [ref]$created); if (!$created) { exit 2 }; [IO.File]::WriteAllText($env:IPV6MESH_MUTEX_READY, 'ready'); while (!(Test-Path -LiteralPath $env:IPV6MESH_MUTEX_RELEASE)) { Start-Sleep -Milliseconds 50 }; $held.ReleaseMutex(); $held.Dispose()`)
+	holder.Env = append(os.Environ(), "IPV6MESH_MUTEX_READY="+readyPath, "IPV6MESH_MUTEX_RELEASE="+releasePath)
+	if err := holder.Start(); err != nil {
+		t.Fatalf("start mutex holder: %v", err)
+	}
+	defer func() {
+		_ = os.WriteFile(releasePath, []byte("release"), 0600)
+		if holder.ProcessState == nil {
+			_ = holder.Process.Kill()
+		}
+		_ = holder.Wait()
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !fileExists(readyPath) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !fileExists(readyPath) {
+		t.Fatal("mutex holder did not become ready")
+	}
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+$function = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Enter-UiInstance' }, $true) | Select-Object -First 1
+. ([scriptblock]::Create($function.Extent.Text))
+$script:uiMutex = $null
+$script:ownsUiMutex = $false
+if (Enter-UiInstance) { throw 'second instance acquired held mutex' }
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell single-instance check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWindowsUIMemberPreflight(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "ui.ps1")
+	if !strings.Contains(contents, "function Assert-MemberControlReady") {
+		t.Fatal("Assert-MemberControlReady function not found")
+	}
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+function Get-FunctionText([string]$name) {
+    $node = $ast.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq $name }, $true) | Select-Object -First 1
+    if ($null -eq $node) { throw ($name + ' function not found') }
+    return $node.Extent.Text
+}
+$preflight = Get-FunctionText 'Assert-MemberControlReady'
+if ($preflight -notmatch 'Test-ControlHealth\s+-Quiet') { throw 'preflight is not quiet health check' }
+if ($preflight -notmatch '房主控制面不可访问，请确认房主窗口仍在运行且 TCP 8080 可达。') { throw 'preflight message is not safe' }
+if ($preflight -match 'Start-Sleep|while\s*\(|for\s*\(') { throw 'preflight contains a retry loop' }
+$member = Get-FunctionText 'Join-MemberRoom'
+$memberState = $member.IndexOf("Set-UiFlowState 'PreparingMember'")
+$endpoint = $member.IndexOf('room", "endpoint')
+$preflightCall = $member.IndexOf('Assert-MemberControlReady')
+$install = $member.IndexOf('Install-NodeService')
+if ($member.IndexOf('HostSetup') -ge 0 -or $memberState -lt 0 -or $memberState -gt $endpoint -or $endpoint -gt $preflightCall -or $preflightCall -gt $install) { throw 'member state/preflight ordering is invalid' }
+	$hostText = Get-FunctionText 'Start-HostRoom'
+	$hostState = $hostText.IndexOf("Set-UiFlowState 'PreparingHost'")
+	if ($hostText.IndexOf('HostSetup') -lt 0 -or $hostState -lt 0 -or $hostState -gt $hostText.IndexOf('Refresh-LocalIPv6') -or $hostState -gt $hostText.IndexOf('Invoke-VpnCtl')) { throw 'host state ordering is invalid' }
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell member-preflight check failed: %v\n%s", err, output)
 	}
 }

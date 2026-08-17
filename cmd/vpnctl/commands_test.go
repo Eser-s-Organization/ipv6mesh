@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ func TestParseCommandCoversServiceAndControlCommands(t *testing.T) {
 		{name: "room create", args: []string{"room", "create", "--name", "IPv6Mesh-HOST", "--pool", "10.42.0.0/24"}, kind: controlCommand},
 		{name: "room endpoint", args: []string{"room", "endpoint", "--host-ipv6", "2001:db8::1"}, kind: localCommand},
 		{name: "room join", args: []string{"room", "join", "--host-ipv6", "2001:db8::1", "--name", "MEMBER-PC"}, kind: serviceCommand, want: ipc.CommandJoinRoom},
+		{name: "room members", args: []string{"room", "members"}, kind: serviceCommand, want: ipc.CommandRoomMembers},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -56,11 +58,45 @@ func TestParseCommandRejectsUnknownDuplicateAndMissingOptions(t *testing.T) {
 		{"room", "endpoint", "--host-ipv6", "2001:db8::1", "--host-ipv6", "2001:db8::2"},
 		{"room", "endpoint", "--host-ipv6", "2001:db8::1", "--unexpected", "value"},
 		{"room", "join", "--host-ipv6", "2001:db8::1"},
+		{"room", "members", "--network", "room-1"},
+		{"room", "members", "extra"},
 	}
 	for _, args := range tests {
 		if _, err := parseCommand(args); err == nil {
 			t.Fatalf("parseCommand(%q) unexpectedly succeeded", args)
 		}
+	}
+}
+
+type recordingCaller struct {
+	request  ipc.Request
+	response ipc.Response
+	err      error
+}
+
+func (caller *recordingCaller) Call(_ context.Context, request ipc.Request) (ipc.Response, error) {
+	caller.request = request
+	return caller.response, caller.err
+}
+
+func TestRunRoomMembersUsesSanitizedServiceResponse(t *testing.T) {
+	parsed, err := parseCommand([]string{"room", "members"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Service != (ipc.Request{Type: ipc.CommandRoomMembers}) {
+		t.Fatalf("request = %#v", parsed.Service)
+	}
+	caller := &recordingCaller{response: ipc.SuccessMembersResponse("room-1", []ipc.RoomMember{{DisplayName: "HOST-PC", VirtualIPv4: "10.42.0.2", IsLocal: true, State: ipc.RoomMemberOnline}})}
+	var output bytes.Buffer
+	if err := runServiceRequest(parsed.Service, &output, caller); err != nil {
+		t.Fatal(err)
+	}
+	if caller.request.Type != ipc.CommandRoomMembers {
+		t.Fatalf("request = %#v", caller.request)
+	}
+	if !strings.Contains(output.String(), `"members":[{"display_name":"HOST-PC","virtual_ipv4":"10.42.0.2","is_local":true,"state":"online"}]`) {
+		t.Fatalf("output = %s", output.String())
 	}
 }
 

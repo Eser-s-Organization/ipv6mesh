@@ -57,7 +57,7 @@ func newServerWithOptions(path string, handler RequestHandler, authorizer Caller
 	}
 	connectionTimeout := options.ConnectionTimeout
 	if connectionTimeout <= 0 {
-		connectionTimeout = 30 * time.Second
+		connectionTimeout = 60 * time.Second
 	}
 	listener, err := winio.ListenPipe(path, &winio.PipeConfig{
 		SecurityDescriptor: securityDescriptor,
@@ -101,17 +101,21 @@ func (server *Server) handleConnection(ctx context.Context, connection net.Conn)
 		server.untrack(connection)
 		_ = connection.Close()
 	}()
+	connectionContext := ctx
+	cancel := func() {}
 	if server.connectionTimeout > 0 {
+		connectionContext, cancel = context.WithTimeout(ctx, server.connectionTimeout)
 		_ = connection.SetDeadline(time.Now().Add(server.connectionTimeout))
 	}
-	if err := server.authorizer.Authorize(ctx); err != nil {
+	defer cancel()
+	if err := server.authorizer.Authorize(connectionContext); err != nil {
 		return
 	}
 	data, err := io.ReadAll(io.LimitReader(connection, MaxMessageSize+1))
 	if err != nil || len(data) > MaxMessageSize {
 		return
 	}
-	response, err := server.handler.HandleJSON(ctx, data)
+	response, err := server.handler.HandleJSON(connectionContext, data)
 	if err != nil || len(response) > MaxMessageSize {
 		return
 	}
