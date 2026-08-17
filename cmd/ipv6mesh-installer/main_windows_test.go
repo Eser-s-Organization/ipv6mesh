@@ -404,7 +404,7 @@ func TestWindowsUIOperationPagesUseResponsiveGrids(t *testing.T) {
 		`$script:hostPanel = New-ResponsivePageGrid "HostPanel"`,
 		`$script:memberPanel = New-ResponsivePageGrid "MemberPanel"`,
 		`$page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))`,
-		`$page.MinimumSize = New-Object System.Drawing.Size(820, 0)`,
+		`$page.MinimumSize = New-Object System.Drawing.Size(620, 0)`,
 		`$script:ipv6AddressBox.Dock = [System.Windows.Forms.DockStyle]::Fill`,
 		`$script:memberHostIPv6Box.Dock = [System.Windows.Forms.DockStyle]::Fill`,
 		`$script:operationSplit.Panel1.AutoScroll = $true`,
@@ -488,10 +488,71 @@ func TestWindowsUIResponsiveLayoutAudit(t *testing.T) {
 	if !strings.Contains(compact, `"Passed":true`) {
 		t.Fatalf("responsive WinForms layout audit did not report success:\n%s", output)
 	}
-	for _, required := range []string{`"Case":"preferred"`, `"Case":"minimum"`, `"Case":"large"`, `"Case":"constrained"`, `"Case":"large-font"`, `"Case":"upper-limit"`, `"Case":"lower-limit"`} {
+	for _, required := range []string{`"Case":"preferred"`, `"Case":"minimum"`, `"Case":"large"`, `"Case":"constrained"`, `"Case":"large-font"`, `"Case":"upper-limit"`, `"Case":"lower-limit"`, `"MemberLayoutMode":"Wide"`, `"MemberLayoutMode":"Narrow"`, `"MemberPanelWidth":`, `"MemberGridWidth":`, `"SettingsMemberOverlap":0`, `"SplitterPreserved":true`} {
 		if !strings.Contains(compact, required) {
 			t.Errorf("responsive WinForms layout audit missing sample %s", required)
 		}
+	}
+}
+
+func TestWindowsUIMemberLogDecision(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+$function = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-MemberLogDecision' }, $true) | Select-Object -First 1
+if ($null -eq $function) { Write-Error 'Get-MemberLogDecision function not found'; exit 1 }
+. ([scriptblock]::Create($function.Extent.Text))
+$cases = @(
+    @{ Name = 'first success'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = 'HOST-PC|10.42.0.2|True|online'; HasPrevious = $false; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'Changed' },
+    @{ Name = 'unchanged success'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = 'HOST-PC|10.42.0.2|True|online'; HasPrevious = $true; PreviousSucceeded = $true; PreviousFingerprint = 'HOST-PC|10.42.0.2|True|online' }; Want = 'None' },
+    @{ Name = 'failure'; Parameters = @{ Automatic = $true; Succeeded = $false; Fingerprint = ''; HasPrevious = $true; PreviousSucceeded = $true; PreviousFingerprint = 'x' }; Want = 'Failed' },
+    @{ Name = 'repeated failure'; Parameters = @{ Automatic = $true; Succeeded = $false; Fingerprint = ''; HasPrevious = $true; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'None' },
+    @{ Name = 'recovery'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = 'x'; HasPrevious = $true; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'Recovered' }
+)
+foreach ($case in $cases) {
+    $parameters = $case.Parameters
+    $got = Get-MemberLogDecision @parameters
+    if ($got -ne $case.Want) { throw ($case.Name + ': got ' + $got + ', want ' + $case.Want) }
+}
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell member-log decision check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWindowsUIMemberLayoutMode(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+$function = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-MemberLayoutMode' }, $true) | Select-Object -First 1
+if ($null -eq $function) { Write-Error 'Get-MemberLayoutMode function not found'; exit 1 }
+. ([scriptblock]::Create($function.Extent.Text))
+if ((Get-MemberLayoutMode -AvailableWidth 1120 -SettingsPreferredWidth 620 -MembersMinimumWidth 300 -Gap 16) -ne 'Wide') { throw 'wide failed' }
+if ((Get-MemberLayoutMode -AvailableWidth 900 -SettingsPreferredWidth 620 -MembersMinimumWidth 300 -Gap 16) -ne 'Narrow') { throw 'narrow failed' }
+if ((Get-MemberLayoutMode -AvailableWidth 0 -SettingsPreferredWidth 620 -MembersMinimumWidth 300 -Gap 16) -ne 'Narrow') { throw 'zero failed' }
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell member-layout mode check failed: %v\n%s", err, output)
 	}
 }
 
@@ -651,6 +712,10 @@ func TestWindowsUILiveStatusTimerUsesQuietDeduplicatedPolling(t *testing.T) {
 		`$script:primaryBusy -or $script:cleanupStarted`,
 		`$script:activePage -eq "Welcome" -or $script:statusRefreshInProgress`,
 		`Get-NodeStatus -Automatic`,
+		`function Get-RoomMembers`,
+		`Invoke-VpnCtl -Arguments @("room", "members") -SuppressStandardOutput -Quiet:$Automatic`,
+		`$script:uiFlowState -in @("Hosting", "JoinedMember")`,
+		`Get-MemberLogDecision`,
 		`Invoke-VpnCtl -Arguments @("status") -SuppressStandardOutput -Quiet:$Automatic`,
 		`Convert-ResultToJson $result "读取节点状态" -Quiet:$Automatic`,
 		`Get-StatusLogDecision`,

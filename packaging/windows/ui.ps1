@@ -33,6 +33,16 @@ $script:memberVirtualIPv4Label = $null
 $script:welcomePanel = $null
 $script:hostPanel = $null
 $script:memberPanel = $null
+$script:hostPageShell = $null
+$script:memberPageShell = $null
+$script:hostMemberPanel = $null
+$script:memberMemberPanel = $null
+$script:hostMemberGrid = $null
+$script:memberMemberGrid = $null
+$script:hostMemberCountLabel = $null
+$script:memberMemberCountLabel = $null
+$script:hostMemberRefreshLabel = $null
+$script:memberMemberRefreshLabel = $null
 $script:diagnosticsPanel = $null
 $script:contentPanel = $null
 $script:operationShell = $null
@@ -56,6 +66,11 @@ $script:statusRefreshInProgress = $false
 $script:hasStatusRefreshResult = $false
 $script:lastStatusRefreshSucceeded = $false
 $script:lastStatusFingerprint = ""
+$script:hasMemberRefreshResult = $false
+$script:lastMemberRefreshSucceeded = $false
+$script:lastMemberFingerprint = ""
+$script:memberRefreshInProgress = $false
+$script:updatingMemberLayout = $false
 $script:uiMutex = $null
 $script:ownsUiMutex = $false
 $script:uiInstanceActive = $false
@@ -118,6 +133,41 @@ function Get-StatusLogDecision {
     if (!$PreviousSucceeded) { return "Recovered" }
     if ($Fingerprint -ne $PreviousFingerprint) { return "Changed" }
     return "None"
+}
+
+function Get-MemberLogDecision {
+    param(
+        [bool]$Automatic,
+        [bool]$Succeeded,
+        [AllowEmptyString()][string]$Fingerprint,
+        [bool]$HasPrevious,
+        [bool]$PreviousSucceeded,
+        [AllowEmptyString()][string]$PreviousFingerprint
+    )
+    if (!$Automatic) { return "Manual" }
+    if (!$HasPrevious) {
+        if ($Succeeded) { return "Changed" }
+        return "Failed"
+    }
+    if (!$Succeeded) {
+        if ($PreviousSucceeded) { return "Failed" }
+        return "None"
+    }
+    if (!$PreviousSucceeded) { return "Recovered" }
+    if ($Fingerprint -ne $PreviousFingerprint) { return "Changed" }
+    return "None"
+}
+
+function Get-MemberLayoutMode {
+    param(
+        [int]$AvailableWidth,
+        [int]$SettingsPreferredWidth,
+        [int]$MembersMinimumWidth,
+        [int]$Gap
+    )
+    $required = [Math]::Max(0, $SettingsPreferredWidth) + [Math]::Max(0, $MembersMinimumWidth) + [Math]::Max(0, $Gap)
+    if ([Math]::Max(0, $AvailableWidth) -ge $required) { return "Wide" }
+    return "Narrow"
 }
 
 function Test-UiFlowTransition {
@@ -662,6 +712,7 @@ function Stop-StartedResources {
 
 function Clear-ActiveRoomState {
     $script:activeNetworkId = ""
+    Clear-RoomMembers
     if ($null -ne $script:hostVirtualIPv4Label -and !$script:hostVirtualIPv4Label.IsDisposed) { $script:hostVirtualIPv4Label.Text = "房主虚拟 IPv4：未加入" }
     if ($null -ne $script:memberVirtualIPv4Label -and !$script:memberVirtualIPv4Label.IsDisposed) { $script:memberVirtualIPv4Label.Text = "本机虚拟 IPv4：未加入" }
     if ($null -ne $script:nodeStatusLabel -and !$script:nodeStatusLabel.IsDisposed) { $script:nodeStatusLabel.Text = "本机尚未加入房间" }
@@ -794,6 +845,44 @@ function Set-ActiveVirtualIPv4 {
     }
 }
 
+function Get-RoomMembers {
+    param([switch]$Automatic)
+    if ($script:memberRefreshInProgress -or [string]::IsNullOrWhiteSpace($script:activeNetworkId)) { return $null }
+    if ($script:uiFlowState -notin @("Hosting", "JoinedMember")) { return $null }
+    $script:memberRefreshInProgress = $true
+    try {
+        $result = Invoke-VpnCtl -Arguments @("room", "members") -SuppressStandardOutput -Quiet:$Automatic
+        $response = Convert-ResultToJson $result "读取房间成员" -Quiet:$Automatic
+        $members = @($response.members)
+        $fingerprint = (($members | ForEach-Object { "{0}|{1}|{2}|{3}" -f $_.display_name, $_.virtual_ipv4, $_.is_local, $_.state }) -join ";")
+        Set-RoomMemberRows $members
+        foreach ($label in @($script:hostMemberRefreshLabel, $script:memberMemberRefreshLabel)) {
+            if ($null -ne $label -and !$label.IsDisposed) { $label.Text = "已更新：$($members.Count) 名在线" }
+        }
+        $decision = Get-MemberLogDecision -Automatic ([bool]$Automatic) -Succeeded $true -Fingerprint $fingerprint -HasPrevious $script:hasMemberRefreshResult -PreviousSucceeded $script:lastMemberRefreshSucceeded -PreviousFingerprint $script:lastMemberFingerprint
+        if ($decision -eq "Recovered") {
+            Add-UiLog "房间成员读取已恢复：$($members.Count) 名在线。"
+        } elseif ($decision -eq "Changed" -or $decision -eq "Manual") {
+            Add-UiLog "房间成员列表已更新：$($members.Count) 名在线。"
+        }
+        $script:hasMemberRefreshResult = $true
+        $script:lastMemberRefreshSucceeded = $true
+        $script:lastMemberFingerprint = $fingerprint
+        return $members
+    } catch {
+        foreach ($label in @($script:hostMemberRefreshLabel, $script:memberMemberRefreshLabel)) {
+            if ($null -ne $label -and !$label.IsDisposed) { $label.Text = "成员读取失败，保留上次列表" }
+        }
+        $decision = Get-MemberLogDecision -Automatic ([bool]$Automatic) -Succeeded $false -Fingerprint "" -HasPrevious $script:hasMemberRefreshResult -PreviousSucceeded $script:lastMemberRefreshSucceeded -PreviousFingerprint $script:lastMemberFingerprint
+        if ($decision -eq "Failed" -or $decision -eq "Manual") { Add-UiLog "读取房间成员失败，保留上次列表。" "警告" }
+        $script:hasMemberRefreshResult = $true
+        $script:lastMemberRefreshSucceeded = $false
+        return $null
+    } finally {
+        $script:memberRefreshInProgress = $false
+    }
+}
+
 function Start-HostRoom {
     if ($script:uiFlowState -ne "HostSetup") { Add-UiLog "创建房间操作已被忽略。" "警告"; return }
     if (!(Set-UiFlowState 'PreparingHost')) { return }
@@ -814,6 +903,7 @@ function Start-HostRoom {
         $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("connect", "--network", $script:activeNetworkId) -SuppressStandardOutput) "连接虚拟网络"
         [void](Set-UiFlowState 'Hosting')
         $null = Get-NodeStatus
+        $null = Get-RoomMembers
         Set-UiStatus "房主已连接" ([System.Drawing.Color]::ForestGreen)
         Add-UiLog "房间创建完成；可将房主 IPv6 提供给成员。"
     } catch {
@@ -843,6 +933,7 @@ function Join-MemberRoom {
         $null = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("connect", "--network", $script:activeNetworkId) -SuppressStandardOutput) "连接虚拟网络"
         [void](Set-UiFlowState 'JoinedMember')
         $null = Get-NodeStatus
+        $null = Get-RoomMembers
         Set-UiStatus "成员已连接" ([System.Drawing.Color]::ForestGreen)
         Add-UiLog "已加入房间并连接本机。"
     } catch {
@@ -918,6 +1009,7 @@ function Invoke-AutomaticStatusRefresh {
     if ($script:primaryBusy -or $script:cleanupStarted) { return }
     if ($script:activePage -eq "Welcome" -or $script:statusRefreshInProgress) { return }
     $null = Get-NodeStatus -Automatic
+    if ($script:uiFlowState -in @("Hosting", "JoinedMember")) { $null = Get-RoomMembers -Automatic }
 }
 
 function Stop-StatusRefresh {
@@ -951,6 +1043,52 @@ function Set-PageLayoutState {
     if ($null -ne $script:memberPanel) { $script:memberPanel.Visible = ($Name -eq "Member") }
 }
 
+function Set-ResponsiveMemberLayout {
+    if ($script:updatingMemberLayout) { return }
+    $shell = if ($script:activePage -eq "Host") { $script:hostPageShell } elseif ($script:activePage -eq "Member") { $script:memberPageShell } else { $null }
+    $settings = if ($script:activePage -eq "Host") { $script:hostPanel } elseif ($script:activePage -eq "Member") { $script:memberPanel } else { $null }
+    $members = if ($script:activePage -eq "Host") { $script:hostMemberPanel } elseif ($script:activePage -eq "Member") { $script:memberMemberPanel } else { $null }
+    if ($null -eq $shell -or $null -eq $settings -or $null -eq $members -or $shell.IsDisposed) { return }
+    $availableWidth = [Math]::Max(0, [int]$shell.ClientSize.Width)
+    if ($availableWidth -le 0 -and $null -ne $script:operationSplit) { $availableWidth = [Math]::Max(0, [int]$script:operationSplit.Panel1.ClientSize.Width) }
+    $mode = Get-MemberLayoutMode -AvailableWidth $availableWidth -SettingsPreferredWidth 620 -MembersMinimumWidth 300 -Gap 16
+    $script:updatingMemberLayout = $true
+    try {
+        $shell.SuspendLayout()
+        try {
+            $shell.ColumnStyles.Clear()
+            $shell.RowStyles.Clear()
+            if ($mode -eq "Wide") {
+                $shell.ColumnCount = 2
+                $shell.RowCount = 1
+                [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+                [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 320)))
+                [void]$shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+                $shell.SetColumn($settings, 0)
+                $shell.SetRow($settings, 0)
+                $shell.SetColumn($members, 1)
+                $shell.SetRow($members, 0)
+            } else {
+                $shell.ColumnCount = 1
+                $shell.RowCount = 2
+                [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+                [void]$shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+                [void]$shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+                $shell.SetColumn($settings, 0)
+                $shell.SetRow($settings, 0)
+                $shell.SetColumn($members, 0)
+                $shell.SetRow($members, 1)
+            }
+            $shell.Tag = $mode
+            $shell.PerformLayout()
+        } finally {
+            $shell.ResumeLayout($true)
+        }
+    } finally {
+        $script:updatingMemberLayout = $false
+    }
+}
+
 function Set-ResponsiveSplitLayout {
     if ($script:updatingSplitLayout -or $null -eq $script:operationSplit -or $script:operationSplit.IsDisposed) { return }
     if ($script:activePage -eq "Welcome") { return }
@@ -966,6 +1104,7 @@ function Set-ResponsiveSplitLayout {
             $script:operationSplit.Panel1MinSize = $decision.UpperMinimum
             $script:operationSplit.Panel2MinSize = $decision.LowerMinimum
             $script:userSplitterDistance = $decision.Distance
+            Set-ResponsiveMemberLayout
         } finally {
             $script:operationSplit.ResumeLayout($true)
         }
@@ -1000,6 +1139,7 @@ function Show-Page {
         Stop-StatusRefresh
     } else {
         Set-ResponsiveSplitLayout
+        Set-ResponsiveMemberLayout
         Start-StatusRefresh
     }
 }
@@ -1073,6 +1213,127 @@ function New-LayoutButton {
     return $button
 }
 
+function New-RoomMembersPanel {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $panel = New-Object System.Windows.Forms.GroupBox
+    $panel.Name = $Name
+    $panel.Text = "房间成员（0）"
+    $panel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $panel.MinimumSize = New-Object System.Drawing.Size(300, 150)
+    $panel.Padding = New-Object System.Windows.Forms.Padding(10, 8, 10, 10)
+
+    $layout = New-Object System.Windows.Forms.TableLayoutPanel
+    $layout.Name = "$Name`Layout"
+    $layout.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $layout.ColumnCount = 2
+    $layout.RowCount = 2
+    [void]$layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$layout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$panel.Controls.Add($layout)
+
+    $countLabel = New-LayoutLabel "$Name`Count" "房间成员（0）"
+    $countLabel.Margin = New-Object System.Windows.Forms.Padding(2, 2, 6, 6)
+    [void]$layout.Controls.Add($countLabel, 0, 0)
+    $refreshLabel = New-LayoutLabel "$Name`Refresh" "尚未加入房间"
+    $refreshLabel.AutoEllipsis = $true
+    $refreshLabel.Margin = New-Object System.Windows.Forms.Padding(6, 2, 2, 6)
+    $refreshLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Right
+    [void]$layout.Controls.Add($refreshLabel, 1, 0)
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Name = "$Name`Grid"
+    $grid.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $grid.MinimumSize = New-Object System.Drawing.Size(280, 100)
+    $grid.ReadOnly = $true
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToOrderColumns = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.AutoGenerateColumns = $false
+    $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+    $grid.ColumnHeadersHeightSizeMode = [System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode]::AutoSize
+    $grid.RowHeadersVisible = $false
+    $grid.MultiSelect = $false
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::CellSelect
+    foreach ($header in @("名称", "虚拟 IPv4", "状态")) {
+        $column = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $column.HeaderText = $header
+        $column.Name = $header
+        $column.ReadOnly = $true
+        $column.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+        [void]$grid.Columns.Add($column)
+    }
+    [void]$layout.Controls.Add($grid, 0, 1)
+    $layout.SetColumnSpan($grid, 2)
+    return [pscustomobject]@{ Panel = $panel; Grid = $grid; CountLabel = $countLabel; RefreshLabel = $refreshLabel }
+}
+
+function Set-RoomMemberRows {
+    param([Parameter(Mandatory = $true)][object[]]$Members)
+    $rows = @($Members)
+    foreach ($grid in @($script:hostMemberGrid, $script:memberMemberGrid)) {
+        if ($null -eq $grid -or $grid.IsDisposed) { continue }
+        $grid.Rows.Clear()
+        foreach ($member in $rows) {
+            $displayName = [string]$member.display_name
+            if ([bool]$member.is_local) { $displayName += "（本机）" }
+            $state = if ([string]$member.state -eq "online") { "在线" } else { "在线" }
+            [void]$grid.Rows.Add($displayName, [string]$member.virtual_ipv4, $state)
+        }
+        $grid.ClearSelection()
+    }
+    foreach ($label in @($script:hostMemberCountLabel, $script:memberMemberCountLabel)) {
+        if ($null -ne $label -and !$label.IsDisposed) { $label.Text = "房间成员（$($rows.Count)）" }
+    }
+    foreach ($panel in @($script:hostMemberPanel, $script:memberMemberPanel)) {
+        if ($null -ne $panel -and !$panel.IsDisposed) { $panel.Text = "房间成员（$($rows.Count)）" }
+    }
+    foreach ($label in @($script:hostMemberRefreshLabel, $script:memberMemberRefreshLabel)) {
+        if ($null -ne $label -and !$label.IsDisposed) { $label.Text = "已更新" }
+    }
+}
+
+function Clear-RoomMembers {
+    foreach ($grid in @($script:hostMemberGrid, $script:memberMemberGrid)) {
+        if ($null -ne $grid -and !$grid.IsDisposed) { $grid.Rows.Clear() }
+    }
+    foreach ($label in @($script:hostMemberCountLabel, $script:memberMemberCountLabel)) {
+        if ($null -ne $label -and !$label.IsDisposed) { $label.Text = "房间成员（0）" }
+    }
+    foreach ($panel in @($script:hostMemberPanel, $script:memberMemberPanel)) {
+        if ($null -ne $panel -and !$panel.IsDisposed) { $panel.Text = "房间成员（0）" }
+    }
+    foreach ($label in @($script:hostMemberRefreshLabel, $script:memberMemberRefreshLabel)) {
+        if ($null -ne $label -and !$label.IsDisposed) { $label.Text = "尚未加入房间" }
+    }
+    $script:hasMemberRefreshResult = $false
+    $script:lastMemberRefreshSucceeded = $false
+    $script:lastMemberFingerprint = ""
+}
+
+function New-RoomPageShell {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][System.Windows.Forms.Control]$Settings,
+        [Parameter(Mandatory = $true)][System.Windows.Forms.Control]$Members
+    )
+    $shell = New-Object System.Windows.Forms.TableLayoutPanel
+    $shell.Name = $Name
+    $shell.Dock = [System.Windows.Forms.DockStyle]::Top
+    $shell.AutoSize = $true
+    $shell.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $shell.ColumnCount = 2
+    $shell.RowCount = 1
+    [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$shell.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 320)))
+    [void]$shell.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$shell.Controls.Add($Settings, 0, 0)
+    [void]$shell.Controls.Add($Members, 1, 0)
+    return $shell
+}
+
 function New-ResponsivePageGrid {
     param([string]$Name)
     $page = New-Object System.Windows.Forms.TableLayoutPanel
@@ -1080,7 +1341,7 @@ function New-ResponsivePageGrid {
     $page.Dock = [System.Windows.Forms.DockStyle]::Top
     $page.AutoSize = $true
     $page.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
-    $page.MinimumSize = New-Object System.Drawing.Size(820, 0)
+    $page.MinimumSize = New-Object System.Drawing.Size(620, 0)
     $page.Padding = New-Object System.Windows.Forms.Padding(20, 8, 20, 20)
     $page.ColumnCount = 3
     [void]$page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 130)))
@@ -1185,6 +1446,9 @@ function Invoke-ResponsiveLayoutAudit {
             Set-PageLayoutState $page
             Set-ResponsiveSplitLayout
             Invoke-ControlLayout $script:form
+            $splitterBeforeMemberLayout = $script:operationSplit.SplitterDistance
+            Set-ResponsiveMemberLayout
+            Invoke-ControlLayout $script:form
             [System.Windows.Forms.Application]::DoEvents()
 
             if ($script:statusRefreshTimer.Enabled) {
@@ -1233,6 +1497,32 @@ function Invoke-ResponsiveLayoutAudit {
             }
 
             $inputWidth = if ($page -eq "Host") { $script:ipv6AddressBox.ClientSize.Width } elseif ($page -eq "Member") { $script:memberHostIPv6Box.ClientSize.Width } else { 0 }
+            $memberMode = "Narrow"
+            $memberPanelWidth = 0
+            $memberPanelHeight = 0
+            $memberGridWidth = 0
+            $memberGridHeight = 0
+            $settingsMemberOverlap = 0
+            if ($wantDiagnostics) {
+                $memberShell = if ($page -eq "Host") { $script:hostPageShell } else { $script:memberPageShell }
+                $memberPanel = if ($page -eq "Host") { $script:hostMemberPanel } else { $script:memberMemberPanel }
+                $memberGrid = if ($page -eq "Host") { $script:hostMemberGrid } else { $script:memberMemberGrid }
+                $settingsPanel = if ($page -eq "Host") { $script:hostPanel } else { $script:memberPanel }
+                $memberMode = if ($null -ne $memberShell.Tag) { [string]$memberShell.Tag } else { "Narrow" }
+                $settingsRectangle = $settingsPanel.RectangleToScreen($settingsPanel.ClientRectangle)
+                $memberRectangle = $memberPanel.RectangleToScreen($memberPanel.ClientRectangle)
+                $memberGridRectangle = $memberGrid.RectangleToScreen($memberGrid.ClientRectangle)
+                $settingsMemberIntersection = [System.Drawing.Rectangle]::Intersect($settingsRectangle, $memberRectangle)
+                $settingsMemberOverlap = if ($settingsMemberIntersection.Width -gt 0 -and $settingsMemberIntersection.Height -gt 0) { 1 } else { 0 }
+                $memberPanelWidth = $memberRectangle.Width
+                $memberPanelHeight = $memberRectangle.Height
+                $memberGridWidth = $memberGridRectangle.Width
+                $memberGridHeight = $memberGridRectangle.Height
+                $expectedMemberMode = if ($case.Width -ge 1120) { "Wide" } else { "Narrow" }
+                if ($memberMode -ne $expectedMemberMode) { [void]$errors.Add("$($case.Name)/$page member layout mode mismatch: $memberMode") }
+                if ($memberPanelWidth -le 0 -or $memberPanelHeight -le 0 -or $memberGridWidth -le 0 -or $memberGridHeight -le 0) { [void]$errors.Add("$($case.Name)/$page member panel or grid has no usable area") }
+                if ($settingsMemberOverlap -ne 0) { [void]$errors.Add("$($case.Name)/$page settings and member panel overlap") }
+            }
             [void]$samples.Add([pscustomobject]@{
                 Case = $case.Name
                 Page = $page
@@ -1240,6 +1530,13 @@ function Invoke-ResponsiveLayoutAudit {
                 LogWidth = if ($wantDiagnostics) { $script:logBox.ClientSize.Width } else { 0 }
                 LogHeight = if ($wantDiagnostics) { $script:logBox.ClientSize.Height } else { 0 }
                 SplitterDistance = if ($wantDiagnostics) { $script:operationSplit.SplitterDistance } else { 0 }
+                MemberLayoutMode = $memberMode
+                MemberPanelWidth = $memberPanelWidth
+                MemberPanelHeight = $memberPanelHeight
+                MemberGridWidth = $memberGridWidth
+                MemberGridHeight = $memberGridHeight
+                SettingsMemberOverlap = $settingsMemberOverlap
+                SplitterPreserved = ($splitterBeforeMemberLayout -eq $script:operationSplit.SplitterDistance)
             })
         }
     }
@@ -1399,6 +1696,7 @@ $script:operationSplit.Add_SplitterMoved({
     }
 })
 $script:operationSplit.Add_SizeChanged({ Set-ResponsiveSplitLayout })
+$script:operationSplit.Panel1.Add_SizeChanged({ Set-ResponsiveMemberLayout })
 $script:form.Add_Shown({ Set-ResponsiveSplitLayout })
 
 $script:hostPanel = New-ResponsivePageGrid "HostPanel"
@@ -1406,7 +1704,6 @@ $script:hostPanel.RowCount = 6
 for ($row = 0; $row -lt 6; $row++) {
     [void]$script:hostPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
 }
-[void]$script:operationSplit.Panel1.Controls.Add($script:hostPanel)
 
 $hostBackButton = New-LayoutButton "HostBack" "返回" 90
 $hostBackButton.Add_Click({ Return-ToWelcome })
@@ -1441,6 +1738,13 @@ Add-PageControl $script:hostPanel $script:hostVirtualIPv4Label 0 4 3
 $script:hostStartButton = New-LayoutButton "HostStart" "创建并连接" 190 44
 $script:hostStartButton.Add_Click({ Start-HostRoom })
 Add-PageControl $script:hostPanel $script:hostStartButton 0 5 3
+$hostMemberInfo = New-RoomMembersPanel "HostMembers"
+$script:hostMemberPanel = $hostMemberInfo.Panel
+$script:hostMemberGrid = $hostMemberInfo.Grid
+$script:hostMemberCountLabel = $hostMemberInfo.CountLabel
+$script:hostMemberRefreshLabel = $hostMemberInfo.RefreshLabel
+$script:hostPageShell = New-RoomPageShell "HostPageShell" $script:hostPanel $script:hostMemberPanel
+[void]$script:operationSplit.Panel1.Controls.Add($script:hostPageShell)
 
 $script:memberPanel = New-ResponsivePageGrid "MemberPanel"
 $script:memberPanel.RowCount = 6
@@ -1448,7 +1752,6 @@ for ($row = 0; $row -lt 6; $row++) {
     [void]$script:memberPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
 }
 $script:memberPanel.Visible = $false
-[void]$script:operationSplit.Panel1.Controls.Add($script:memberPanel)
 
 $memberBackButton = New-LayoutButton "MemberBack" "返回" 90
 $memberBackButton.Add_Click({ Return-ToWelcome })
@@ -1476,6 +1779,13 @@ Add-PageControl $script:memberPanel $script:memberVirtualIPv4Label 0 4 3
 $script:memberJoinButton = New-LayoutButton "MemberJoin" "加入并连接" 190 44
 $script:memberJoinButton.Add_Click({ Join-MemberRoom })
 Add-PageControl $script:memberPanel $script:memberJoinButton 0 5 3
+$memberMemberInfo = New-RoomMembersPanel "MemberMembers"
+$script:memberMemberPanel = $memberMemberInfo.Panel
+$script:memberMemberGrid = $memberMemberInfo.Grid
+$script:memberMemberCountLabel = $memberMemberInfo.CountLabel
+$script:memberMemberRefreshLabel = $memberMemberInfo.RefreshLabel
+$script:memberPageShell = New-RoomPageShell "MemberPageShell" $script:memberPanel $script:memberMemberPanel
+[void]$script:operationSplit.Panel1.Controls.Add($script:memberPageShell)
 
 $script:diagnosticsPanel = New-Object System.Windows.Forms.GroupBox
 $script:diagnosticsPanel.Name = "DiagnosticsPanel"
