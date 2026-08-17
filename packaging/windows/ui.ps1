@@ -82,6 +82,9 @@ $script:asyncPollingAuditCounters = @{
     MembersRetainedOnFail = $false
     PollingTicks = 0
     LastOperationState = ''
+    StartFailures = 0
+    LastStartErrorType = ''
+    LastStartErrorMessage = ''
 }
 $script:asyncPollingAuditUiThreadId = 0
 $script:asyncPollingAuditOwnerThreadId = 0
@@ -1277,6 +1280,14 @@ function Invoke-AutomaticStatusRefresh {
         $script:memberRefreshInProgress = $script:uiFlowState -in @("Hosting", "JoinedMember")
         $script:automaticPollingOperation = Start-AutomaticPollingOperation -Generation $script:automaticPollingGeneration
     } catch {
+        if ($script:asyncPollingAuditMode) {
+            $script:asyncPollingAuditCounters.StartFailures++
+            $script:asyncPollingAuditCounters.LastStartErrorType = [string]$_.Exception.GetType().FullName
+            $message = [string]$_.Exception.Message
+            $message = $message -replace '[\r\n\t]+', ' '
+            if ($message.Length -gt 256) { $message = $message.Substring(0, 256) }
+            $script:asyncPollingAuditCounters.LastStartErrorMessage = $message
+        }
         $script:statusRefreshInProgress = $false
         $script:memberRefreshInProgress = $false
         Add-UiLog "自动读取节点状态失败。" "警告"
@@ -2092,6 +2103,9 @@ function Invoke-PreparationRaceAudit {
         JoinedNetworkPreserved = [bool]$state["JoinedNetworkPreserved"]
         FailureReturnedToSetup = [bool]$state["FailureReturnedToSetup"]
         RefreshRestarted = [bool]$state["RefreshRestarted"]
+        StartFailures = $script:asyncPollingAuditCounters.StartFailures
+        LastStartErrorType = $script:asyncPollingAuditCounters.LastStartErrorType
+        LastStartErrorMessage = $script:asyncPollingAuditCounters.LastStartErrorMessage
     }
 }
 
@@ -2175,6 +2189,9 @@ function Invoke-AsyncPollingAudit {
         PollingTicks = $script:asyncPollingAuditCounters.PollingTicks
         LastOperationState = $script:asyncPollingAuditCounters.LastOperationState
         LateResultQueued = $script:asyncPollingAuditLateQueued
+        StartFailures = $script:asyncPollingAuditCounters.StartFailures
+        LastStartErrorType = $script:asyncPollingAuditCounters.LastStartErrorType
+        LastStartErrorMessage = $script:asyncPollingAuditCounters.LastStartErrorMessage
     }
 }
 

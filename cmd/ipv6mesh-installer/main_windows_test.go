@@ -604,6 +604,21 @@ func TestWindowsUIAsyncPollingMessagePumpAudit(t *testing.T) {
 	}
 }
 
+func TestWindowsUIAsyncPollingAuditCapturesStartFailureDiagnostics(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "ui.ps1")
+	for _, required := range []string{
+		`LastStartErrorType`,
+		`LastStartErrorMessage`,
+		`StartFailures`,
+		`$_.Exception.GetType().FullName`,
+		`$_.Exception.Message`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("async polling audit must expose safe start-failure diagnostic %q", required)
+		}
+	}
+}
+
 func TestWindowsUIAsyncPollingAuditCanRunConcurrently(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
