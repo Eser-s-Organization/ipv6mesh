@@ -46,3 +46,15 @@ jobs:
           if ($formatted) {
             Write-Error "gofmt required for: $formatted"
           }
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - run: go vet ./...
+      - name: Check macOS package script
+        run: bash -n packaging/macos/build-dmg.sh
