@@ -109,6 +109,23 @@ The official WireGuardNT DLL is intentionally excluded from source control. A
 release package must provide the official DLL, its license, and provenance
 separately.
 
+## macOS DMG（Apple Silicon 工具包）
+
+在本机 macOS 上构建原生 arm64 DMG：
+
+~~~sh
+./packaging/macos/build-dmg.sh --version v0.1.0-dev
+~~~
+
+产物位于 `packaging/macos/dist/`，同时生成 `.sha256` 校验文件。GitHub tag
+release 会由 `.github/workflows/release-macos.yml` 在 macOS runner 上自动构建并
+上传 DMG。
+
+当前 DMG 只包含 macOS 可运行的 `vpnctl` 和 `control-server` 控制面工具；节点
+`vpn-service`、WireGuard 数据面、虚拟 IPv4 路由和本机 IPC 仍是 Windows-only，
+所以 macOS DMG 暂不代表完整的 macOS 节点 VPN 支持。详见
+`packaging/macos/README.md`。
+
 ## Troubleshooting and acceptance boundary
 
 For a room join failure, check the stable error code in the diagnostics panel:
