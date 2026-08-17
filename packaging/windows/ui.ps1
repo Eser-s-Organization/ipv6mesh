@@ -8,7 +8,8 @@ param(
     [string]$InstallDirectory = (Join-Path $env:ProgramFiles "IPv6Mesh"),
     [string]$DataDirectory = (Join-Path $env:ProgramData "IPv6Mesh"),
     [string]$ServiceName = "IPv6Mesh",
-    [string]$Version = "dev"
+    [string]$Version = "dev",
+    [switch]$LayoutAudit
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,6 +34,11 @@ $script:welcomePanel = $null
 $script:hostPanel = $null
 $script:memberPanel = $null
 $script:diagnosticsPanel = $null
+$script:contentPanel = $null
+$script:operationShell = $null
+$script:operationSplit = $null
+$script:updatingSplitLayout = $false
+$script:userSplitterDistance = -1
 $script:activePage = "Welcome"
 $script:hostStartButton = $null
 $script:memberJoinButton = $null
@@ -101,6 +107,42 @@ function Get-StatusLogDecision {
     if (!$PreviousSucceeded) { return "Recovered" }
     if ($Fingerprint -ne $PreviousFingerprint) { return "Changed" }
     return "None"
+}
+
+function Get-SplitLayoutDecision {
+    param(
+        [int]$AvailableHeight,
+        [int]$SplitterWidth,
+        [int]$CurrentDistance = -1
+    )
+    $height = [Math]::Max(0, $AvailableHeight)
+    $splitter = [Math]::Max(0, $SplitterWidth)
+    $usable = [Math]::Max(0, $height - $splitter)
+    if ($usable -eq 0) {
+        return [pscustomobject]@{ UpperMinimum = 0; LowerMinimum = 0; Distance = 0 }
+    }
+
+    if ($usable -ge 450) {
+        $upperMinimum = 250
+        $lowerMinimum = 200
+    } else {
+        $upperMinimum = [int][Math]::Floor($usable * 5.0 / 9.0)
+        $lowerMinimum = $usable - $upperMinimum
+    }
+
+    $lowerBound = $upperMinimum
+    $upperBound = $usable - $lowerMinimum
+    if ($CurrentDistance -lt 0) {
+        $distance = [int][Math]::Round($usable * 0.45, [System.MidpointRounding]::AwayFromZero)
+    } else {
+        $distance = $CurrentDistance
+    }
+    $distance = [Math]::Max($lowerBound, [Math]::Min($upperBound, $distance))
+    return [pscustomobject]@{
+        UpperMinimum = $upperMinimum
+        LowerMinimum = $lowerMinimum
+        Distance = $distance
+    }
 }
 
 function Set-UiStatus {
@@ -737,19 +779,64 @@ function Dispose-StatusRefreshTimer {
     }
 }
 
-function Show-Page {
+function Set-PageLayoutState {
     param([ValidateSet("Welcome", "Host", "Member")][string]$Name)
     $script:activePage = $Name
     if ($null -ne $script:welcomePanel) { $script:welcomePanel.Visible = ($Name -eq "Welcome") }
+    if ($null -ne $script:operationShell) { $script:operationShell.Visible = ($Name -ne "Welcome") }
     if ($null -ne $script:hostPanel) { $script:hostPanel.Visible = ($Name -eq "Host") }
     if ($null -ne $script:memberPanel) { $script:memberPanel.Visible = ($Name -eq "Member") }
-    if ($null -ne $script:diagnosticsPanel) {
-        $script:diagnosticsPanel.Visible = ($Name -ne "Welcome")
-        if ($Name -ne "Welcome") { $script:diagnosticsPanel.BringToFront() }
+}
+
+function Set-ResponsiveSplitLayout {
+    if ($script:updatingSplitLayout -or $null -eq $script:operationSplit -or $script:operationSplit.IsDisposed) { return }
+    if ($script:activePage -eq "Welcome") { return }
+    if ($script:operationSplit.ClientSize.Height -le 0) { return }
+    $script:updatingSplitLayout = $true
+    try {
+        $decision = Get-SplitLayoutDecision -AvailableHeight $script:operationSplit.ClientSize.Height -SplitterWidth $script:operationSplit.SplitterWidth -CurrentDistance $script:userSplitterDistance
+        $script:operationSplit.SuspendLayout()
+        try {
+            $script:operationSplit.Panel1MinSize = 0
+            $script:operationSplit.Panel2MinSize = 0
+            $script:operationSplit.SplitterDistance = $decision.Distance
+            $script:operationSplit.Panel1MinSize = $decision.UpperMinimum
+            $script:operationSplit.Panel2MinSize = $decision.LowerMinimum
+            $script:userSplitterDistance = $decision.Distance
+        } finally {
+            $script:operationSplit.ResumeLayout($true)
+        }
+    } catch {
+        if ($LayoutAudit) { throw }
+        return
+    } finally {
+        $script:updatingSplitLayout = $false
     }
+}
+
+function Set-ResponsiveWindowBounds {
+    param([Parameter(Mandatory = $true)][System.Windows.Forms.Form]$Form)
+    $workingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $previousClientSize = $Form.ClientSize
+    $Form.ClientSize = New-Object System.Drawing.Size(1120, 720)
+    $preferredOuter = $Form.Size
+    $Form.ClientSize = $previousClientSize
+    $minimumWidth = [Math]::Min(900, $workingArea.Width)
+    $minimumHeight = [Math]::Min(640, $workingArea.Height)
+    $Form.MinimumSize = New-Object System.Drawing.Size($minimumWidth, $minimumHeight)
+    $Form.Size = New-Object System.Drawing.Size(
+        ([Math]::Min($preferredOuter.Width, $workingArea.Width)),
+        ([Math]::Min($preferredOuter.Height, $workingArea.Height))
+    )
+}
+
+function Show-Page {
+    param([ValidateSet("Welcome", "Host", "Member")][string]$Name)
+    Set-PageLayoutState $Name
     if ($Name -eq "Welcome") {
         Stop-StatusRefresh
     } else {
+        Set-ResponsiveSplitLayout
         Start-StatusRefresh
     }
 }
@@ -769,34 +856,228 @@ function Show-MemberPage {
     Set-UiStatus "请输入房主 IPv6" ([System.Drawing.Color]::MidnightBlue)
 }
 
-function New-Label {
-    param([string]$Text, [int]$X, [int]$Y, [int]$Width = 100, [int]$Height = 24, [int]$FontSize = 9)
+function New-LayoutLabel {
+    param([string]$Name, [string]$Text, [int]$FontSize = 9, [switch]$Bold)
     $label = New-Object System.Windows.Forms.Label
+    $label.Name = $Name
     $label.Text = $Text
-    $label.Location = New-Object System.Drawing.Point($X, $Y)
-    $label.Size = New-Object System.Drawing.Size($Width, $Height)
-    $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-    $label.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", $FontSize)
+    $label.AutoSize = $true
+    $label.Anchor = [System.Windows.Forms.AnchorStyles]::Left
+    $label.Margin = New-Object System.Windows.Forms.Padding(6, 8, 6, 8)
+    $style = if ($Bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }
+    $label.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", $FontSize, $style)
     return $label
 }
 
-function New-TextBox {
-    param([int]$X, [int]$Y, [int]$Width = 200, [int]$Height = 24, [switch]$Password, [switch]$ReadOnly)
+function New-LayoutTextBox {
+    param([string]$Name, [switch]$Password, [switch]$ReadOnly)
     $box = New-Object System.Windows.Forms.TextBox
-    $box.Location = New-Object System.Drawing.Point($X, $Y)
-    $box.Size = New-Object System.Drawing.Size($Width, $Height)
+    $box.Name = $Name
+    $box.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $box.Margin = New-Object System.Windows.Forms.Padding(6)
     $box.UseSystemPasswordChar = $Password
     $box.ReadOnly = $ReadOnly
     return $box
 }
 
-function New-Button {
-    param([string]$Text, [int]$X, [int]$Y, [int]$Width = 120, [int]$Height = 30)
+function New-LayoutButton {
+    param([string]$Name, [string]$Text, [int]$MinimumWidth = 100, [int]$MinimumHeight = 32)
     $button = New-Object System.Windows.Forms.Button
+    $button.Name = $Name
     $button.Text = $Text
-    $button.Location = New-Object System.Drawing.Point($X, $Y)
-    $button.Size = New-Object System.Drawing.Size($Width, $Height)
+    $button.AutoSize = $true
+    $button.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $button.MinimumSize = New-Object System.Drawing.Size($MinimumWidth, $MinimumHeight)
+    $button.Padding = New-Object System.Windows.Forms.Padding(10, 2, 10, 2)
+    $button.Margin = New-Object System.Windows.Forms.Padding(6)
+    $button.Anchor = [System.Windows.Forms.AnchorStyles]::Left
     return $button
+}
+
+function New-ResponsivePageGrid {
+    param([string]$Name)
+    $page = New-Object System.Windows.Forms.TableLayoutPanel
+    $page.Name = $Name
+    $page.Dock = [System.Windows.Forms.DockStyle]::Top
+    $page.AutoSize = $true
+    $page.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $page.MinimumSize = New-Object System.Drawing.Size(820, 0)
+    $page.Padding = New-Object System.Windows.Forms.Padding(20, 8, 20, 20)
+    $page.ColumnCount = 3
+    [void]$page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 130)))
+    [void]$page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 150)))
+    return $page
+}
+
+function Add-PageControl {
+    param(
+        [System.Windows.Forms.TableLayoutPanel]$Page,
+        [System.Windows.Forms.Control]$Control,
+        [int]$Column,
+        [int]$Row,
+        [int]$ColumnSpan = 1
+    )
+    [void]$Page.Controls.Add($Control, $Column, $Row)
+    if ($ColumnSpan -gt 1) { $Page.SetColumnSpan($Control, $ColumnSpan) }
+}
+
+function Get-LeafControls {
+    param([System.Windows.Forms.Control]$Root)
+    foreach ($child in $Root.Controls) {
+        if ($child.Controls.Count -eq 0) {
+            Write-Output $child
+        } else {
+            Get-LeafControls $child
+        }
+    }
+}
+
+function Get-ClippedScreenRectangle {
+    param(
+        [System.Windows.Forms.Control]$Control,
+        [System.Windows.Forms.Control]$Root
+    )
+    $rectangle = $Control.RectangleToScreen($Control.ClientRectangle)
+    $ancestor = $Control.Parent
+    while ($null -ne $ancestor) {
+        $ancestorRectangle = $ancestor.RectangleToScreen($ancestor.ClientRectangle)
+        $rectangle = [System.Drawing.Rectangle]::Intersect($rectangle, $ancestorRectangle)
+        if ($ancestor -eq $Root) { break }
+        $ancestor = $ancestor.Parent
+    }
+    return $rectangle
+}
+
+function Set-AuditFont {
+    param([System.Windows.Forms.Control]$Root, [float]$Size)
+    foreach ($child in $Root.Controls) {
+        if ($child -eq $script:logBox) {
+            $child.Font = New-Object System.Drawing.Font("Consolas", $Size)
+        } else {
+            $child.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", $Size)
+        }
+        if ($child.Controls.Count -gt 0) { Set-AuditFont $child $Size }
+    }
+}
+
+function Invoke-ControlLayout {
+    param([System.Windows.Forms.Control]$Root)
+    $Root.PerformLayout()
+    foreach ($child in $Root.Controls) {
+        if ($child.Controls.Count -gt 0) { Invoke-ControlLayout $child }
+    }
+}
+
+function Invoke-ResponsiveLayoutAudit {
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    $samples = New-Object 'System.Collections.Generic.List[object]'
+    $cases = @(
+        @{ Name = "preferred"; Width = 1120; Height = 720; Font = 9; Distance = -1 },
+        @{ Name = "minimum"; Width = 900; Height = 640; Font = 9; Distance = -1 },
+        @{ Name = "large"; Width = 1440; Height = 900; Font = 9; Distance = -1 },
+        @{ Name = "constrained"; Width = 760; Height = 520; Font = 9; Distance = -1 },
+        @{ Name = "large-font"; Width = 900; Height = 640; Font = 12; Distance = -1 },
+        @{ Name = "upper-limit"; Width = 1120; Height = 720; Font = 9; Distance = 0 },
+        @{ Name = "lower-limit"; Width = 1120; Height = 720; Font = 9; Distance = 100000 }
+    )
+
+    $workingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    if ($script:form.MinimumSize.Width -gt $workingArea.Width -or $script:form.MinimumSize.Height -gt $workingArea.Height) {
+        [void]$errors.Add("configured minimum exceeds the screen working area")
+    }
+    if ($script:form.Width -gt $workingArea.Width -or $script:form.Height -gt $workingArea.Height) {
+        [void]$errors.Add("initial window exceeds the screen working area")
+    }
+
+    $script:form.ShowInTaskbar = $false
+    $script:form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $script:form.Location = New-Object System.Drawing.Point(-32000, -32000)
+    $script:form.Opacity = 0
+    $script:form.Show()
+    $script:form.MinimumSize = New-Object System.Drawing.Size(1, 1)
+
+    foreach ($case in $cases) {
+        Set-AuditFont $script:form ([float]$case.Font)
+        foreach ($page in @("Welcome", "Host", "Member")) {
+            if (($case.Name -in @("large-font", "upper-limit", "lower-limit")) -and $page -eq "Welcome") { continue }
+            $script:form.ClientSize = New-Object System.Drawing.Size($case.Width, $case.Height)
+            $script:userSplitterDistance = [int]$case.Distance
+            Set-PageLayoutState $page
+            Set-ResponsiveSplitLayout
+            Invoke-ControlLayout $script:form
+            [System.Windows.Forms.Application]::DoEvents()
+
+            if ($script:statusRefreshTimer.Enabled) {
+                [void]$errors.Add("$($case.Name)/$page started the status timer during audit")
+            }
+            $wantDiagnostics = $page -ne "Welcome"
+            if ($script:operationShell.Visible -ne $wantDiagnostics) {
+                [void]$errors.Add("$($case.Name)/$page operation-shell visibility mismatch")
+            }
+            if ($script:diagnosticsPanel.Visible -ne $wantDiagnostics) {
+                [void]$errors.Add("$($case.Name)/$page diagnostics visibility mismatch")
+            }
+
+            if ($wantDiagnostics) {
+                $upper = $script:operationSplit.Panel1.RectangleToScreen($script:operationSplit.Panel1.ClientRectangle)
+                $lower = $script:operationSplit.Panel2.RectangleToScreen($script:operationSplit.Panel2.ClientRectangle)
+                $intersection = [System.Drawing.Rectangle]::Intersect($upper, $lower)
+                if (!$intersection.IsEmpty) {
+                    [void]$errors.Add("$($case.Name)/$page split panels intersect")
+                }
+                $usable = [Math]::Max(0, $script:operationSplit.ClientSize.Height - $script:operationSplit.SplitterWidth)
+                if (($script:operationSplit.Panel1MinSize + $script:operationSplit.Panel2MinSize) -gt $usable) {
+                    [void]$errors.Add("$($case.Name)/$page split minima exceed usable height")
+                }
+                if ($script:operationSplit.SplitterDistance -lt $script:operationSplit.Panel1MinSize -or
+                    $script:operationSplit.SplitterDistance -gt ($usable - $script:operationSplit.Panel2MinSize)) {
+                    [void]$errors.Add("$($case.Name)/$page splitter lies outside minima")
+                }
+                if ($script:logBox.ClientSize.Width -le 0 -or $script:logBox.ClientSize.Height -le 0) {
+                    [void]$errors.Add("$($case.Name)/$page log box has no usable area")
+                }
+            }
+
+            $leaves = @(Get-LeafControls $script:form | Where-Object { $_.Visible -and $_.ClientSize.Width -gt 0 -and $_.ClientSize.Height -gt 0 })
+            for ($leftIndex = 0; $leftIndex -lt $leaves.Count; $leftIndex++) {
+                $left = Get-ClippedScreenRectangle $leaves[$leftIndex] $script:form
+                if ($left.IsEmpty) { continue }
+                for ($rightIndex = $leftIndex + 1; $rightIndex -lt $leaves.Count; $rightIndex++) {
+                    $right = Get-ClippedScreenRectangle $leaves[$rightIndex] $script:form
+                    if ($right.IsEmpty) { continue }
+                    $leafIntersection = [System.Drawing.Rectangle]::Intersect($left, $right)
+                    if ($leafIntersection.Width -gt 0 -and $leafIntersection.Height -gt 0) {
+                        [void]$errors.Add("$($case.Name)/$page controls $($leaves[$leftIndex].Name) and $($leaves[$rightIndex].Name) overlap")
+                    }
+                }
+            }
+
+            $inputWidth = if ($page -eq "Host") { $script:ipv6AddressBox.ClientSize.Width } elseif ($page -eq "Member") { $script:memberHostIPv6Box.ClientSize.Width } else { 0 }
+            [void]$samples.Add([pscustomobject]@{
+                Case = $case.Name
+                Page = $page
+                InputWidth = $inputWidth
+                LogWidth = if ($wantDiagnostics) { $script:logBox.ClientSize.Width } else { 0 }
+                LogHeight = if ($wantDiagnostics) { $script:logBox.ClientSize.Height } else { 0 }
+                SplitterDistance = if ($wantDiagnostics) { $script:operationSplit.SplitterDistance } else { 0 }
+            })
+        }
+    }
+
+    foreach ($page in @("Host", "Member")) {
+        $minimum = $samples | Where-Object { $_.Case -eq "minimum" -and $_.Page -eq $page } | Select-Object -First 1
+        $large = $samples | Where-Object { $_.Case -eq "large" -and $_.Page -eq $page } | Select-Object -First 1
+        if ($large.InputWidth -le $minimum.InputWidth) { [void]$errors.Add("$page input did not grow") }
+        if ($large.LogWidth -le $minimum.LogWidth) { [void]$errors.Add("$page log width did not grow") }
+        if ($large.LogHeight -le $minimum.LogHeight) { [void]$errors.Add("$page log height did not grow") }
+    }
+
+    return [pscustomobject]@{
+        Passed = $errors.Count -eq 0
+        Errors = $errors.ToArray()
+        Samples = $samples.ToArray()
+    }
 }
 
 $initialIPv6 = Get-DetectedIPv6Address
@@ -810,123 +1091,285 @@ if ([string]::IsNullOrWhiteSpace($initialIPv6) -and ![string]::IsNullOrWhiteSpac
 $script:form = New-Object System.Windows.Forms.Form
 $script:form.Text = "IPv6Mesh 远程组网"
 $script:form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-$script:form.ClientSize = New-Object System.Drawing.Size(1120, 720)
-$script:form.MinimumSize = New-Object System.Drawing.Size(1120, 720)
+$script:form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+$script:form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
 $script:form.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
+Set-ResponsiveWindowBounds $script:form
 
-$title = New-Label "IPv6Mesh 远程组网" 20 15 500 32
+$rootLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$rootLayout.Name = "RootLayout"
+$rootLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
+$rootLayout.ColumnCount = 1
+$rootLayout.RowCount = 2
+[void]$rootLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$rootLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$script:form.Controls.Add($rootLayout)
+
+$headerLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$headerLayout.Name = "HeaderLayout"
+$headerLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
+$headerLayout.AutoSize = $true
+$headerLayout.Padding = New-Object System.Windows.Forms.Padding(20, 12, 20, 10)
+$headerLayout.ColumnCount = 2
+[void]$headerLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$headerLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$rootLayout.Controls.Add($headerLayout, 0, 0)
+
+$title = New-Object System.Windows.Forms.Label
+$title.Name = "ProductTitle"
+$title.Text = "IPv6Mesh 远程组网"
+$title.AutoSize = $true
+$title.Anchor = [System.Windows.Forms.AnchorStyles]::Left
 $title.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 15, [System.Drawing.FontStyle]::Bold)
-$script:form.Controls.Add($title)
-$script:statusLabel = New-Label "等待选择" 620 18 470 28
-$script:statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-$script:form.Controls.Add($script:statusLabel)
+[void]$headerLayout.Controls.Add($title, 0, 0)
 
-$script:welcomePanel = New-Object System.Windows.Forms.Panel
-$script:welcomePanel.Location = New-Object System.Drawing.Point(20, 70)
-$script:welcomePanel.Size = New-Object System.Drawing.Size(1080, 570)
-$script:form.Controls.Add($script:welcomePanel)
-$script:welcomePanel.Controls.Add((New-Label "你想做什么？" 20 20 500 40 22))
-$script:welcomePanel.Controls.Add((New-Label "选择一种方式开始 IPv6Mesh 房间流程。" 22 70 600 28))
-$createButton = New-Button "创建网络" 180 150 260 70
+$script:statusLabel = New-Object System.Windows.Forms.Label
+$script:statusLabel.Name = "HeaderStatus"
+$script:statusLabel.Text = "等待选择"
+$script:statusLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:statusLabel.AutoEllipsis = $true
+$script:statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+[void]$headerLayout.Controls.Add($script:statusLabel, 1, 0)
+
+$script:contentPanel = New-Object System.Windows.Forms.Panel
+$script:contentPanel.Name = "ContentPanel"
+$script:contentPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:contentPanel.Padding = New-Object System.Windows.Forms.Padding(20, 8, 20, 20)
+[void]$rootLayout.Controls.Add($script:contentPanel, 0, 1)
+
+$script:welcomePanel = New-Object System.Windows.Forms.TableLayoutPanel
+$script:welcomePanel.Name = "WelcomePanel"
+$script:welcomePanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:welcomePanel.ColumnCount = 4
+$script:welcomePanel.RowCount = 5
+[void]$script:welcomePanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 25)))
+[void]$script:welcomePanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 25)))
+[void]$script:welcomePanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 25)))
+[void]$script:welcomePanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 25)))
+[void]$script:welcomePanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 35)))
+[void]$script:welcomePanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$script:welcomePanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$script:welcomePanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 100)))
+[void]$script:welcomePanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 65)))
+[void]$script:contentPanel.Controls.Add($script:welcomePanel)
+
+$welcomeTitle = New-Object System.Windows.Forms.Label
+$welcomeTitle.Name = "WelcomeTitle"
+$welcomeTitle.Text = "你想做什么？"
+$welcomeTitle.AutoSize = $true
+$welcomeTitle.Anchor = [System.Windows.Forms.AnchorStyles]::None
+$welcomeTitle.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 22)
+[void]$script:welcomePanel.Controls.Add($welcomeTitle, 1, 1)
+$script:welcomePanel.SetColumnSpan($welcomeTitle, 2)
+
+$welcomeHelp = New-Object System.Windows.Forms.Label
+$welcomeHelp.Name = "WelcomeHelp"
+$welcomeHelp.Text = "选择一种方式开始 IPv6Mesh 房间流程。"
+$welcomeHelp.AutoSize = $true
+$welcomeHelp.Anchor = [System.Windows.Forms.AnchorStyles]::None
+[void]$script:welcomePanel.Controls.Add($welcomeHelp, 1, 2)
+$script:welcomePanel.SetColumnSpan($welcomeHelp, 2)
+
+$createButton = New-Object System.Windows.Forms.Button
+$createButton.Name = "WelcomeCreate"
+$createButton.Text = "创建网络"
+$createButton.Dock = [System.Windows.Forms.DockStyle]::Fill
+$createButton.Margin = New-Object System.Windows.Forms.Padding(10, 15, 10, 15)
 $createButton.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 12)
 $createButton.Add_Click({ Show-HostPage })
-$script:welcomePanel.Controls.Add($createButton)
-$joinButton = New-Button "加入网络" 540 150 260 70
+[void]$script:welcomePanel.Controls.Add($createButton, 1, 3)
+
+$joinButton = New-Object System.Windows.Forms.Button
+$joinButton.Name = "WelcomeJoin"
+$joinButton.Text = "加入网络"
+$joinButton.Dock = [System.Windows.Forms.DockStyle]::Fill
+$joinButton.Margin = New-Object System.Windows.Forms.Padding(10, 15, 10, 15)
 $joinButton.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 12)
 $joinButton.Add_Click({ Show-MemberPage })
-$script:welcomePanel.Controls.Add($joinButton)
+[void]$script:welcomePanel.Controls.Add($joinButton, 2, 3)
 
-$script:hostPanel = New-Object System.Windows.Forms.Panel
-$script:hostPanel.Location = New-Object System.Drawing.Point(20, 70)
-$script:hostPanel.Size = New-Object System.Drawing.Size(1080, 570)
-$script:hostPanel.Visible = $false
-$script:form.Controls.Add($script:hostPanel)
-$hostBackButton = New-Button "返回" 20 15 90
+$script:operationShell = New-Object System.Windows.Forms.Panel
+$script:operationShell.Name = "OperationShell"
+$script:operationShell.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:operationShell.Visible = $false
+[void]$script:contentPanel.Controls.Add($script:operationShell)
+
+$script:operationSplit = New-Object System.Windows.Forms.SplitContainer
+$script:operationSplit.Name = "OperationSplit"
+$script:operationSplit.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:operationSplit.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+$script:operationSplit.FixedPanel = [System.Windows.Forms.FixedPanel]::Panel1
+$script:operationSplit.SplitterWidth = 6
+$script:operationSplit.Panel1.AutoScroll = $true
+[void]$script:operationShell.Controls.Add($script:operationSplit)
+$script:operationSplit.Add_SplitterMoved({
+    if (!$script:updatingSplitLayout) {
+        $script:userSplitterDistance = $script:operationSplit.SplitterDistance
+        Set-ResponsiveSplitLayout
+    }
+})
+$script:operationSplit.Add_SizeChanged({ Set-ResponsiveSplitLayout })
+$script:form.Add_Shown({ Set-ResponsiveSplitLayout })
+
+$script:hostPanel = New-ResponsivePageGrid "HostPanel"
+$script:hostPanel.RowCount = 6
+for ($row = 0; $row -lt 6; $row++) {
+    [void]$script:hostPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+}
+[void]$script:operationSplit.Panel1.Controls.Add($script:hostPanel)
+
+$hostBackButton = New-LayoutButton "HostBack" "返回" 90
 $hostBackButton.Add_Click({ Show-WelcomePage })
 $script:backButtons += $hostBackButton
-$script:hostPanel.Controls.Add($hostBackButton)
-$script:hostPanel.Controls.Add((New-Label "创建网络" 135 15 300 32 18))
-$script:hostPanel.Controls.Add((New-Label "房主 IPv6：" 40 85 130 28))
-$script:ipv6AddressBox = New-TextBox 170 82 540
-$script:ipv6AddressBox.Text = $initialIPv6
-$script:hostPanel.Controls.Add($script:ipv6AddressBox)
-$detectButton = New-Button "重新检测" 730 80 120
-$detectButton.Add_Click({ $null = Refresh-LocalIPv6 })
-$script:hostPanel.Controls.Add($detectButton)
-$script:hostPanel.Controls.Add((New-Label "房主 IPv6 仅接受首选、非 SkipAsSource 的 2000::/3 全局地址。" 170 115 700 25))
-$script:hostPanel.Controls.Add((New-Label "控制面地址：" 40 160 130 28))
-$script:controlUrlBox = New-TextBox 170 157 540 -ReadOnly
-$script:hostPanel.Controls.Add($script:controlUrlBox)
-$copyHostIPv6Button = New-Button "复制房主 IPv6" 730 155 140
-$copyHostIPv6Button.Add_Click({ Copy-UiField $script:ipv6AddressBox "房主 IPv6" })
-$script:hostPanel.Controls.Add($copyHostIPv6Button)
-$script:hostVirtualIPv4Label = New-Label "房主虚拟 IPv4：未加入" 40 220 650 30 12
-$script:hostPanel.Controls.Add($script:hostVirtualIPv4Label)
-$script:hostStartButton = New-Button "创建并连接" 40 275 190 44
-$script:hostStartButton.Add_Click({ Start-HostRoom })
-$script:hostPanel.Controls.Add($script:hostStartButton)
+Add-PageControl $script:hostPanel $hostBackButton 0 0
 
-$script:memberPanel = New-Object System.Windows.Forms.Panel
-$script:memberPanel.Location = New-Object System.Drawing.Point(20, 70)
-$script:memberPanel.Size = New-Object System.Drawing.Size(1080, 570)
+$hostTitle = New-LayoutLabel "HostTitle" "创建网络" 18
+Add-PageControl $script:hostPanel $hostTitle 1 0 2
+
+Add-PageControl $script:hostPanel (New-LayoutLabel "HostIPv6Label" "房主 IPv6：") 0 1
+$script:ipv6AddressBox = New-LayoutTextBox "HostIPv6Input"
+$script:ipv6AddressBox.Text = $initialIPv6
+$script:ipv6AddressBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+Add-PageControl $script:hostPanel $script:ipv6AddressBox 1 1
+$detectButton = New-LayoutButton "HostDetect" "重新检测" 120
+$detectButton.Add_Click({ $null = Refresh-LocalIPv6 })
+Add-PageControl $script:hostPanel $detectButton 2 1
+
+$hostIPv6Help = New-LayoutLabel "HostIPv6Help" "房主 IPv6 仅接受首选、非 SkipAsSource 的 2000::/3 全局地址。"
+Add-PageControl $script:hostPanel $hostIPv6Help 1 2 2
+
+Add-PageControl $script:hostPanel (New-LayoutLabel "ControlURLLabel" "控制面地址：") 0 3
+$script:controlUrlBox = New-LayoutTextBox "ControlURL" -ReadOnly
+Add-PageControl $script:hostPanel $script:controlUrlBox 1 3
+$copyHostIPv6Button = New-LayoutButton "CopyHostIPv6" "复制房主 IPv6" 140
+$copyHostIPv6Button.Add_Click({ Copy-UiField $script:ipv6AddressBox "房主 IPv6" })
+Add-PageControl $script:hostPanel $copyHostIPv6Button 2 3
+
+$script:hostVirtualIPv4Label = New-LayoutLabel "HostVirtualIPv4" "房主虚拟 IPv4：未加入" 12 -Bold
+Add-PageControl $script:hostPanel $script:hostVirtualIPv4Label 0 4 3
+
+$script:hostStartButton = New-LayoutButton "HostStart" "创建并连接" 190 44
+$script:hostStartButton.Add_Click({ Start-HostRoom })
+Add-PageControl $script:hostPanel $script:hostStartButton 0 5 3
+
+$script:memberPanel = New-ResponsivePageGrid "MemberPanel"
+$script:memberPanel.RowCount = 6
+for ($row = 0; $row -lt 6; $row++) {
+    [void]$script:memberPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+}
 $script:memberPanel.Visible = $false
-$script:form.Controls.Add($script:memberPanel)
-$memberBackButton = New-Button "返回" 20 15 90
+[void]$script:operationSplit.Panel1.Controls.Add($script:memberPanel)
+
+$memberBackButton = New-LayoutButton "MemberBack" "返回" 90
 $memberBackButton.Add_Click({ Show-WelcomePage })
 $script:backButtons += $memberBackButton
-$script:memberPanel.Controls.Add($memberBackButton)
-$script:memberPanel.Controls.Add((New-Label "加入网络" 135 15 300 32 18))
-$script:memberPanel.Controls.Add((New-Label "房主 IPv6：" 40 85 130 28))
-$script:memberHostIPv6Box = New-TextBox 170 82 680
-$script:memberPanel.Controls.Add($script:memberHostIPv6Box)
-$script:memberPanel.Controls.Add((New-Label "成员只需输入房主 IPv6；地址必须是 2000::/3 全局 IPv6。" 170 115 700 25))
-$script:memberPanel.Controls.Add((New-Label "本机名称：" 40 160 130 28))
-$script:memberNameLabel = New-Label ([string]$env:COMPUTERNAME) 170 160 500 28
-$script:memberPanel.Controls.Add($script:memberNameLabel)
-$script:memberVirtualIPv4Label = New-Label "本机虚拟 IPv4：未加入" 40 220 650 30 12
-$script:memberPanel.Controls.Add($script:memberVirtualIPv4Label)
-$script:memberJoinButton = New-Button "加入并连接" 40 275 190 44
+Add-PageControl $script:memberPanel $memberBackButton 0 0
+
+$memberTitle = New-LayoutLabel "MemberTitle" "加入网络" 18
+Add-PageControl $script:memberPanel $memberTitle 1 0 2
+
+Add-PageControl $script:memberPanel (New-LayoutLabel "MemberHostIPv6Label" "房主 IPv6：") 0 1
+$script:memberHostIPv6Box = New-LayoutTextBox "MemberHostIPv6Input"
+$script:memberHostIPv6Box.Dock = [System.Windows.Forms.DockStyle]::Fill
+Add-PageControl $script:memberPanel $script:memberHostIPv6Box 1 1 2
+
+$memberIPv6Help = New-LayoutLabel "MemberIPv6Help" "成员只需输入房主 IPv6；地址必须是 2000::/3 全局 IPv6。"
+Add-PageControl $script:memberPanel $memberIPv6Help 1 2 2
+
+Add-PageControl $script:memberPanel (New-LayoutLabel "MemberNameCaption" "本机名称：") 0 3
+$script:memberNameLabel = New-LayoutLabel "MemberName" ([string]$env:COMPUTERNAME)
+Add-PageControl $script:memberPanel $script:memberNameLabel 1 3 2
+
+$script:memberVirtualIPv4Label = New-LayoutLabel "MemberVirtualIPv4" "本机虚拟 IPv4：未加入" 12 -Bold
+Add-PageControl $script:memberPanel $script:memberVirtualIPv4Label 0 4 3
+
+$script:memberJoinButton = New-LayoutButton "MemberJoin" "加入并连接" 190 44
 $script:memberJoinButton.Add_Click({ Join-MemberRoom })
-$script:memberPanel.Controls.Add($script:memberJoinButton)
+Add-PageControl $script:memberPanel $script:memberJoinButton 0 5 3
 
 $script:diagnosticsPanel = New-Object System.Windows.Forms.GroupBox
+$script:diagnosticsPanel.Name = "DiagnosticsPanel"
 $script:diagnosticsPanel.Text = "诊断与日志"
-$script:diagnosticsPanel.Location = New-Object System.Drawing.Point(40, 350)
-$script:diagnosticsPanel.Size = New-Object System.Drawing.Size(1040, 290)
-$script:diagnosticsPanel.Visible = $false
-$script:form.Controls.Add($script:diagnosticsPanel)
-$script:nodeStatusLabel = New-Label "节点服务未检查状态" 20 25 980 28
-$script:diagnosticsPanel.Controls.Add($script:nodeStatusLabel)
-$refreshStatusButton = New-Button "刷新状态" 20 60 100
+$script:diagnosticsPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:diagnosticsPanel.Visible = $true
+$script:diagnosticsPanel.Padding = New-Object System.Windows.Forms.Padding(12, 8, 12, 12)
+[void]$script:operationSplit.Panel2.Controls.Add($script:diagnosticsPanel)
+
+$diagnosticsLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$diagnosticsLayout.Name = "DiagnosticsLayout"
+$diagnosticsLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
+$diagnosticsLayout.AutoSize = $false
+$diagnosticsLayout.MinimumSize = New-Object System.Drawing.Size(200, 220)
+$diagnosticsLayout.ColumnCount = 1
+$diagnosticsLayout.RowCount = 4
+[void]$diagnosticsLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$diagnosticsLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+[void]$diagnosticsLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$diagnosticsLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+$diagnosticsViewport = New-Object System.Windows.Forms.Panel
+$diagnosticsViewport.Name = "DiagnosticsViewport"
+$diagnosticsViewport.Dock = [System.Windows.Forms.DockStyle]::Fill
+$diagnosticsViewport.AutoScroll = $true
+[void]$script:diagnosticsPanel.Controls.Add($diagnosticsViewport)
+[void]$diagnosticsViewport.Controls.Add($diagnosticsLayout)
+
+$script:nodeStatusLabel = New-LayoutLabel "NodeStatus" "节点服务未检查状态"
+$script:nodeStatusLabel.AutoSize = $false
+$script:nodeStatusLabel.MinimumSize = New-Object System.Drawing.Size(0, 28)
+$script:nodeStatusLabel.AutoEllipsis = $true
+$script:nodeStatusLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+[void]$diagnosticsLayout.Controls.Add($script:nodeStatusLabel, 0, 0)
+
+$statusActions = New-Object System.Windows.Forms.FlowLayoutPanel
+$statusActions.Name = "StatusActions"
+$statusActions.Dock = [System.Windows.Forms.DockStyle]::Fill
+$statusActions.AutoSize = $true
+$statusActions.WrapContents = $true
+$statusActions.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+[void]$diagnosticsLayout.Controls.Add($statusActions, 0, 1)
+
+$refreshStatusButton = New-LayoutButton "RefreshStatus" "刷新状态" 100
 $refreshStatusButton.Add_Click({ $null = Get-NodeStatus })
-$script:diagnosticsPanel.Controls.Add($refreshStatusButton)
-$connectButton = New-Button "连接" 130 60 90
+[void]$statusActions.Controls.Add($refreshStatusButton)
+$connectButton = New-LayoutButton "ConnectNode" "连接" 90
 $connectButton.Add_Click({ Connect-Node })
-$script:diagnosticsPanel.Controls.Add($connectButton)
-$disconnectButton = New-Button "断开" 230 60 90
+[void]$statusActions.Controls.Add($connectButton)
+$disconnectButton = New-LayoutButton "DisconnectNode" "断开" 90
 $disconnectButton.Add_Click({ Disconnect-Node })
-$script:diagnosticsPanel.Controls.Add($disconnectButton)
-$leaveButton = New-Button "离开房间" 330 60 110
+[void]$statusActions.Controls.Add($disconnectButton)
+$leaveButton = New-LayoutButton "LeaveRoom" "离开房间" 110
 $leaveButton.Add_Click({ Leave-Node })
-$script:diagnosticsPanel.Controls.Add($leaveButton)
+[void]$statusActions.Controls.Add($leaveButton)
+
 $script:logBox = New-Object System.Windows.Forms.TextBox
+$script:logBox.Name = "LogBox"
 $script:logBox.Multiline = $true
 $script:logBox.ReadOnly = $true
 $script:logBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
 $script:logBox.WordWrap = $false
-$script:logBox.Location = New-Object System.Drawing.Point(20, 100)
-$script:logBox.Size = New-Object System.Drawing.Size(1000, 145)
+$script:logBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:logBox.MinimumSize = New-Object System.Drawing.Size(200, 80)
+$script:logBox.Margin = New-Object System.Windows.Forms.Padding(6)
 $script:logBox.Font = New-Object System.Drawing.Font("Consolas", 9)
-$script:diagnosticsPanel.Controls.Add($script:logBox)
-$clearLogButton = New-Button "清空日志" 20 250 100
+[void]$diagnosticsLayout.Controls.Add($script:logBox, 0, 2)
+
+$logActions = New-Object System.Windows.Forms.FlowLayoutPanel
+$logActions.Name = "LogActions"
+$logActions.Dock = [System.Windows.Forms.DockStyle]::Fill
+$logActions.AutoSize = $true
+$logActions.WrapContents = $true
+$logActions.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+[void]$diagnosticsLayout.Controls.Add($logActions, 0, 3)
+
+$clearLogButton = New-LayoutButton "ClearLog" "清空日志" 100
 $clearLogButton.Add_Click({ $script:logLines.Clear(); $script:logBox.Clear() })
-$script:diagnosticsPanel.Controls.Add($clearLogButton)
-$copyLogButton = New-Button "复制日志" 130 250 100
+[void]$logActions.Controls.Add($clearLogButton)
+$copyLogButton = New-LayoutButton "CopyLog" "复制日志" 100
 $copyLogButton.Add_Click({ [System.Windows.Forms.Clipboard]::SetText(($script:logLines -join [Environment]::NewLine)) })
-$script:diagnosticsPanel.Controls.Add($copyLogButton)
-$exportLogButton = New-Button "导出日志" 240 250 100
+[void]$logActions.Controls.Add($copyLogButton)
+$exportLogButton = New-LayoutButton "ExportLog" "导出日志" 100
 $exportLogButton.Add_Click({ Export-UiLog })
-$script:diagnosticsPanel.Controls.Add($exportLogButton)
+[void]$logActions.Controls.Add($exportLogButton)
 
 $script:statusRefreshTimer = New-Object System.Windows.Forms.Timer
 $script:statusRefreshTimer.Interval = 2000
@@ -938,6 +1381,20 @@ $script:ipv6AddressBox.Add_TextChanged({
 })
 
 $script:form.Add_FormClosing({ Stop-AllResources })
+if ($LayoutAudit) {
+    try {
+        $audit = Invoke-ResponsiveLayoutAudit
+        $audit | ConvertTo-Json -Depth 6 -Compress
+        if (!$audit.Passed) { exit 1 }
+    } finally {
+        Stop-StatusRefresh
+        if ($null -ne $script:form -and !$script:form.IsDisposed) {
+            $script:form.Hide()
+            $script:form.Dispose()
+        }
+    }
+    return
+}
 Add-UiLog "IPv6Mesh 中文 UI $Version 已启动。"
 Add-UiLog "欢迎页提供创建网络和加入网络两条流程。"
 Add-UiLog "关闭窗口时只清理本窗口启动的节点服务和控制面资源。"

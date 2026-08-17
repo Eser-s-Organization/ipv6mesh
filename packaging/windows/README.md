@@ -32,6 +32,10 @@ Both users open the same installer. The welcome page has two actions:
 The create and join pages keep diagnostics and logs always visible. Node status
 refreshes every two seconds, while the log updates immediately and does not repeat
 unchanged status. The welcome page hides diagnostics and pauses status refresh.
+The Windows room window can be resized. On the create and join pages, drag the
+horizontal diagnostics divider to allocate more space to room settings or logs.
+On a constrained display or with larger system text, the operation area scrolls
+instead of covering diagnostics or other controls.
 
 The UI itself starts even when the current computer has no global IPv6. In that
 case the host create action stays unavailable until a valid host address is found,

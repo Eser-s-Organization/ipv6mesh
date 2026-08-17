@@ -196,7 +196,14 @@ func TestWindowsDocumentationDescribesPersistentLiveDiagnostics(t *testing.T) {
 			t.Fatalf("read %s: %v", name, err)
 		}
 		text := strings.Join(strings.Fields(string(contents)), " ")
-		for _, required := range []string{"always visible", "every two seconds", "does not repeat unchanged status"} {
+		for _, required := range []string{
+			"always visible",
+			"every two seconds",
+			"does not repeat unchanged status",
+			"window can be resized",
+			"drag the horizontal diagnostics divider",
+			"operation area scrolls",
+		} {
 			if !strings.Contains(text, required) {
 				t.Errorf("%s missing diagnostics statement %q", name, required)
 			}
@@ -338,7 +345,7 @@ if ($result -ne $false) {
 	}
 }
 
-func TestWindowsUIKeepsDiagnosticsVisibleOnOperationPages(t *testing.T) {
+func TestWindowsUIUsesManagedOperationShell(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed")
@@ -349,24 +356,139 @@ func TestWindowsUIKeepsDiagnosticsVisibleOnOperationPages(t *testing.T) {
 		t.Fatalf("read UI script: %v", err)
 	}
 	contents := string(uiScript)
-
-	for _, forbidden := range []string{
-		`function Toggle-Diagnostics`,
-		`New-Button "显示诊断与日志"`,
-		`$script:diagnosticsPanel.Visible = !$script:diagnosticsPanel.Visible`,
-	} {
-		if strings.Contains(contents, forbidden) {
-			t.Fatalf("UI still contains collapsible diagnostics behavior %q", forbidden)
-		}
-	}
-
 	for _, required := range []string{
-		`$script:activePage = $Name`,
-		`$script:diagnosticsPanel.Visible = ($Name -ne "Welcome")`,
-		`$script:diagnosticsPanel.BringToFront()`,
+		`$rootLayout = New-Object System.Windows.Forms.TableLayoutPanel`,
+		`$rootLayout.Dock = [System.Windows.Forms.DockStyle]::Fill`,
+		`$script:contentPanel = New-Object System.Windows.Forms.Panel`,
+		`$script:operationShell = New-Object System.Windows.Forms.Panel`,
+		`$script:operationSplit = New-Object System.Windows.Forms.SplitContainer`,
+		`$script:operationSplit.Orientation = [System.Windows.Forms.Orientation]::Horizontal`,
+		`$script:operationSplit.Panel1.AutoScroll = $true`,
+		`$script:operationSplit.Panel2.Controls.Add($script:diagnosticsPanel)`,
+		`$script:diagnosticsPanel.Visible = $true`,
+		`$script:operationShell.Visible = ($Name -ne "Welcome")`,
+		`$script:form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi`,
+		`Set-ResponsiveWindowBounds $script:form`,
+		`$script:statusRefreshTimer.Interval = 2000`,
 	} {
 		if !strings.Contains(contents, required) {
-			t.Fatalf("UI missing persistent diagnostics behavior %q", required)
+			t.Errorf("UI missing managed operation-shell behavior %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		`$script:diagnosticsPanel.BringToFront()`,
+		`$script:diagnosticsPanel.Visible = ($Name -ne "Welcome")`,
+		`$script:form.Controls.Add($script:diagnosticsPanel)`,
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("UI retains form-level diagnostics workaround %q", forbidden)
+		}
+	}
+}
+
+func TestWindowsUIOperationPagesUseResponsiveGrids(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	uiScript, err := os.ReadFile(uiPath)
+	if err != nil {
+		t.Fatalf("read UI script: %v", err)
+	}
+	contents := string(uiScript)
+	for _, required := range []string{
+		`function New-ResponsivePageGrid`,
+		`$script:hostPanel = New-ResponsivePageGrid "HostPanel"`,
+		`$script:memberPanel = New-ResponsivePageGrid "MemberPanel"`,
+		`$page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))`,
+		`$page.MinimumSize = New-Object System.Drawing.Size(820, 0)`,
+		`$script:ipv6AddressBox.Dock = [System.Windows.Forms.DockStyle]::Fill`,
+		`$script:memberHostIPv6Box.Dock = [System.Windows.Forms.DockStyle]::Fill`,
+		`$script:operationSplit.Panel1.AutoScroll = $true`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Errorf("UI missing responsive operation-page behavior %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		`New-TextBox 170 82`,
+		`New-Button "创建并连接" 40 275`,
+		`New-Button "加入并连接" 40 275`,
+		`$script:hostPanel.Size = New-Object System.Drawing.Size(1080, 570)`,
+		`$script:memberPanel.Size = New-Object System.Drawing.Size(1080, 570)`,
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("UI retains fixed operation-page layout %q", forbidden)
+		}
+	}
+}
+
+func TestWindowsUIDiagnosticsUsesFillAndWrappingLayout(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	uiScript, err := os.ReadFile(uiPath)
+	if err != nil {
+		t.Fatalf("read UI script: %v", err)
+	}
+	contents := string(uiScript)
+	for _, required := range []string{
+		`$diagnosticsLayout = New-Object System.Windows.Forms.TableLayoutPanel`,
+		`$diagnosticsLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))`,
+		`$statusActions.WrapContents = $true`,
+		`$logActions.WrapContents = $true`,
+		`$script:logBox.Dock = [System.Windows.Forms.DockStyle]::Fill`,
+		`$script:logBox.MinimumSize = New-Object System.Drawing.Size(200, 80)`,
+		`$script:operationSplit.Panel2.Controls.Add($script:diagnosticsPanel)`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Errorf("UI missing responsive diagnostics behavior %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		`$script:diagnosticsPanel.Location = New-Object System.Drawing.Point(40, 350)`,
+		`$script:diagnosticsPanel.Size = New-Object System.Drawing.Size(1040, 290)`,
+		`$script:logBox.Location = New-Object System.Drawing.Point(20, 100)`,
+		`$script:logBox.Size = New-Object System.Drawing.Size(1000, 145)`,
+		`function New-Label`,
+		`function New-TextBox`,
+		`function New-Button`,
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("UI retains fixed diagnostics layout %q", forbidden)
+		}
+	}
+}
+
+func TestWindowsUIResponsiveLayoutAudit(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	cmd := exec.Command(
+		"powershell.exe",
+		"-NoLogo",
+		"-NoProfile",
+		"-NonInteractive",
+		"-File", uiPath,
+		"-PackageDirectory", t.TempDir(),
+		"-LayoutAudit",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("responsive WinForms layout audit failed: %v\n%s", err, output)
+	}
+	compact := strings.ReplaceAll(strings.ReplaceAll(string(output), "\r", ""), "\n", "")
+	if !strings.Contains(compact, `"Passed":true`) {
+		t.Fatalf("responsive WinForms layout audit did not report success:\n%s", output)
+	}
+	for _, required := range []string{`"Case":"preferred"`, `"Case":"minimum"`, `"Case":"large"`, `"Case":"constrained"`, `"Case":"large-font"`, `"Case":"upper-limit"`, `"Case":"lower-limit"`} {
+		if !strings.Contains(compact, required) {
+			t.Errorf("responsive WinForms layout audit missing sample %s", required)
 		}
 	}
 }
@@ -419,6 +541,89 @@ foreach ($case in $cases) {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("PowerShell status-log decision check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWindowsUISplitLayoutDecision(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) {
+    $parseErrors | ForEach-Object { Write-Error $_.Message }
+    exit 1
+}
+$function = $ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-SplitLayoutDecision'
+}, $true) | Select-Object -First 1
+if ($null -eq $function) {
+    Write-Error 'Get-SplitLayoutDecision function not found'
+    exit 1
+}
+. ([scriptblock]::Create($function.Extent.Text))
+$cases = @(
+    @{ Name = 'normal initial'; Height = 560; Splitter = 6; Current = -1; Upper = 250; Lower = 200; Distance = 250 },
+    @{ Name = 'preserve valid'; Height = 560; Splitter = 6; Current = 310; Upper = 250; Lower = 200; Distance = 310 },
+    @{ Name = 'clamp low'; Height = 560; Splitter = 6; Current = 20; Upper = 250; Lower = 200; Distance = 250 },
+    @{ Name = 'clamp high'; Height = 560; Splitter = 6; Current = 500; Upper = 250; Lower = 200; Distance = 354 },
+    @{ Name = 'constrained'; Height = 306; Splitter = 6; Current = -1; Upper = 166; Lower = 134; Distance = 166 },
+    @{ Name = 'tiny'; Height = 7; Splitter = 6; Current = -1; Upper = 0; Lower = 1; Distance = 0 },
+    @{ Name = 'zero'; Height = 0; Splitter = 6; Current = -1; Upper = 0; Lower = 0; Distance = 0 },
+    @{ Name = 'negative'; Height = -20; Splitter = 6; Current = -1; Upper = 0; Lower = 0; Distance = 0 }
+)
+foreach ($case in $cases) {
+    $got = Get-SplitLayoutDecision -AvailableHeight $case.Height -SplitterWidth $case.Splitter -CurrentDistance $case.Current
+    if ($got.UpperMinimum -ne $case.Upper -or $got.LowerMinimum -ne $case.Lower -or $got.Distance -ne $case.Distance) {
+        Write-Error ("{0}: got {1}/{2}/{3}, want {4}/{5}/{6}" -f $case.Name, $got.UpperMinimum, $got.LowerMinimum, $got.Distance, $case.Upper, $case.Lower, $case.Distance)
+        exit 1
+    }
+    $usable = [Math]::Max(0, $case.Height - [Math]::Max(0, $case.Splitter))
+    if (($got.UpperMinimum + $got.LowerMinimum) -gt $usable) {
+        Write-Error ($case.Name + ': minimum sizes exceed usable height')
+        exit 1
+    }
+    if ($got.Distance -lt $got.UpperMinimum -or $got.Distance -gt ($usable - $got.LowerMinimum)) {
+        Write-Error ($case.Name + ': splitter distance is outside valid bounds')
+        exit 1
+    }
+}
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell split-layout decision check failed: %v\n%s", err, output)
+	}
+}
+
+func TestWindowsUIWelcomeDoesNotMutateSplitterState(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	uiScript, err := os.ReadFile(uiPath)
+	if err != nil {
+		t.Fatalf("read UI script: %v", err)
+	}
+	contents := string(uiScript)
+	functionStart := strings.Index(contents, "function Set-ResponsiveSplitLayout")
+	if functionStart < 0 {
+		t.Fatal("Set-ResponsiveSplitLayout function not found")
+	}
+	functionBody := contents[functionStart:]
+	guard := `if ($script:activePage -eq "Welcome") { return }`
+	guardIndex := strings.Index(functionBody, guard)
+	clientSizeIndex := strings.Index(functionBody, "$script:operationSplit.ClientSize.Height")
+	if guardIndex < 0 || clientSizeIndex < 0 || guardIndex > clientSizeIndex {
+		t.Fatalf("welcome page must return before reading or saving splitter layout state")
 	}
 }
 
