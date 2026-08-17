@@ -273,6 +273,49 @@ if ($badCommands.Count -gt 0) {
 	}
 }
 
+func TestWindowsUIAcceptsMissingGlobalIPv6DuringStartup(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) {
+    $parseErrors | ForEach-Object { Write-Error $_.Message }
+    exit 1
+}
+$function = $ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Test-GlobalIPv6'
+}, $true) | Select-Object -First 1
+if ($null -eq $function) {
+    Write-Error 'Test-GlobalIPv6 function not found'
+    exit 1
+}
+. ([scriptblock]::Create($function.Extent.Text))
+try {
+    $result = Test-GlobalIPv6 -Value ''
+} catch {
+    Write-Error $_.Exception.Message
+    exit 1
+}
+if ($result -ne $false) {
+    Write-Error ('Test-GlobalIPv6 empty input returned ' + $result)
+    exit 1
+}
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell empty-IPv6 regression check failed: %v\n%s", err, output)
+	}
+}
+
 func TestInstallScriptStopsExistingServiceBeforeCopyingFiles(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
