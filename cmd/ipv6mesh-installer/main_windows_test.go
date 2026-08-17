@@ -422,6 +422,65 @@ foreach ($case in $cases) {
 	}
 }
 
+func TestWindowsUISplitLayoutDecision(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) {
+    $parseErrors | ForEach-Object { Write-Error $_.Message }
+    exit 1
+}
+$function = $ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-SplitLayoutDecision'
+}, $true) | Select-Object -First 1
+if ($null -eq $function) {
+    Write-Error 'Get-SplitLayoutDecision function not found'
+    exit 1
+}
+. ([scriptblock]::Create($function.Extent.Text))
+$cases = @(
+    @{ Name = 'normal initial'; Height = 560; Splitter = 6; Current = -1; Upper = 250; Lower = 200; Distance = 250 },
+    @{ Name = 'preserve valid'; Height = 560; Splitter = 6; Current = 310; Upper = 250; Lower = 200; Distance = 310 },
+    @{ Name = 'clamp low'; Height = 560; Splitter = 6; Current = 20; Upper = 250; Lower = 200; Distance = 250 },
+    @{ Name = 'clamp high'; Height = 560; Splitter = 6; Current = 500; Upper = 250; Lower = 200; Distance = 354 },
+    @{ Name = 'constrained'; Height = 306; Splitter = 6; Current = -1; Upper = 166; Lower = 134; Distance = 166 },
+    @{ Name = 'tiny'; Height = 7; Splitter = 6; Current = -1; Upper = 0; Lower = 1; Distance = 0 },
+    @{ Name = 'zero'; Height = 0; Splitter = 6; Current = -1; Upper = 0; Lower = 0; Distance = 0 },
+    @{ Name = 'negative'; Height = -20; Splitter = 6; Current = -1; Upper = 0; Lower = 0; Distance = 0 }
+)
+foreach ($case in $cases) {
+    $got = Get-SplitLayoutDecision -AvailableHeight $case.Height -SplitterWidth $case.Splitter -CurrentDistance $case.Current
+    if ($got.UpperMinimum -ne $case.Upper -or $got.LowerMinimum -ne $case.Lower -or $got.Distance -ne $case.Distance) {
+        Write-Error ("{0}: got {1}/{2}/{3}, want {4}/{5}/{6}" -f $case.Name, $got.UpperMinimum, $got.LowerMinimum, $got.Distance, $case.Upper, $case.Lower, $case.Distance)
+        exit 1
+    }
+    $usable = [Math]::Max(0, $case.Height - [Math]::Max(0, $case.Splitter))
+    if (($got.UpperMinimum + $got.LowerMinimum) -gt $usable) {
+        Write-Error ($case.Name + ': minimum sizes exceed usable height')
+        exit 1
+    }
+    if ($got.Distance -lt $got.UpperMinimum -or $got.Distance -gt ($usable - $got.LowerMinimum)) {
+        Write-Error ($case.Name + ': splitter distance is outside valid bounds')
+        exit 1
+    }
+}
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell split-layout decision check failed: %v\n%s", err, output)
+	}
+}
+
 func TestWindowsUILiveStatusTimerUsesQuietDeduplicatedPolling(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {

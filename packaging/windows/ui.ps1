@@ -103,6 +103,42 @@ function Get-StatusLogDecision {
     return "None"
 }
 
+function Get-SplitLayoutDecision {
+    param(
+        [int]$AvailableHeight,
+        [int]$SplitterWidth,
+        [int]$CurrentDistance = -1
+    )
+    $height = [Math]::Max(0, $AvailableHeight)
+    $splitter = [Math]::Max(0, $SplitterWidth)
+    $usable = [Math]::Max(0, $height - $splitter)
+    if ($usable -eq 0) {
+        return [pscustomobject]@{ UpperMinimum = 0; LowerMinimum = 0; Distance = 0 }
+    }
+
+    if ($usable -ge 450) {
+        $upperMinimum = 250
+        $lowerMinimum = 200
+    } else {
+        $upperMinimum = [int][Math]::Floor($usable * 5.0 / 9.0)
+        $lowerMinimum = $usable - $upperMinimum
+    }
+
+    $lowerBound = $upperMinimum
+    $upperBound = $usable - $lowerMinimum
+    if ($CurrentDistance -lt 0) {
+        $distance = [int][Math]::Round($usable * 0.45, [System.MidpointRounding]::AwayFromZero)
+    } else {
+        $distance = $CurrentDistance
+    }
+    $distance = [Math]::Max($lowerBound, [Math]::Min($upperBound, $distance))
+    return [pscustomobject]@{
+        UpperMinimum = $upperMinimum
+        LowerMinimum = $lowerMinimum
+        Distance = $distance
+    }
+}
+
 function Set-UiStatus {
     param([Parameter(Mandatory = $true)][string]$Message, [System.Drawing.Color]$Color = [System.Drawing.Color]::MidnightBlue)
     if ($null -ne $script:statusLabel -and !$script:statusLabel.IsDisposed) {
