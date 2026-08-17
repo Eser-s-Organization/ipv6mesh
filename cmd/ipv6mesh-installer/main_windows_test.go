@@ -316,6 +316,39 @@ if ($result -ne $false) {
 	}
 }
 
+func TestWindowsUIKeepsDiagnosticsVisibleOnOperationPages(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	uiScript, err := os.ReadFile(uiPath)
+	if err != nil {
+		t.Fatalf("read UI script: %v", err)
+	}
+	contents := string(uiScript)
+
+	for _, forbidden := range []string{
+		`function Toggle-Diagnostics`,
+		`New-Button "显示诊断与日志"`,
+		`$script:diagnosticsPanel.Visible = !$script:diagnosticsPanel.Visible`,
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Fatalf("UI still contains collapsible diagnostics behavior %q", forbidden)
+		}
+	}
+
+	for _, required := range []string{
+		`$script:activePage = $Name`,
+		`$script:diagnosticsPanel.Visible = ($Name -ne "Welcome")`,
+		`$script:diagnosticsPanel.BringToFront()`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("UI missing persistent diagnostics behavior %q", required)
+		}
+	}
+}
+
 func TestInstallScriptStopsExistingServiceBeforeCopyingFiles(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {

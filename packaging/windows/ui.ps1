@@ -33,6 +33,7 @@ $script:welcomePanel = $null
 $script:hostPanel = $null
 $script:memberPanel = $null
 $script:diagnosticsPanel = $null
+$script:activePage = "Welcome"
 $script:hostStartButton = $null
 $script:memberJoinButton = $null
 $script:backButtons = @()
@@ -656,10 +657,14 @@ function Set-PrimaryBusy {
 
 function Show-Page {
     param([ValidateSet("Welcome", "Host", "Member")][string]$Name)
+    $script:activePage = $Name
     if ($null -ne $script:welcomePanel) { $script:welcomePanel.Visible = ($Name -eq "Welcome") }
     if ($null -ne $script:hostPanel) { $script:hostPanel.Visible = ($Name -eq "Host") }
     if ($null -ne $script:memberPanel) { $script:memberPanel.Visible = ($Name -eq "Member") }
-    if ($null -ne $script:diagnosticsPanel) { $script:diagnosticsPanel.Visible = $false }
+    if ($null -ne $script:diagnosticsPanel) {
+        $script:diagnosticsPanel.Visible = ($Name -ne "Welcome")
+        if ($Name -ne "Welcome") { $script:diagnosticsPanel.BringToFront() }
+    }
 }
 
 function Show-WelcomePage {
@@ -675,12 +680,6 @@ function Show-HostPage {
 function Show-MemberPage {
     Show-Page "Member"
     Set-UiStatus "请输入房主 IPv6" ([System.Drawing.Color]::MidnightBlue)
-}
-
-function Toggle-Diagnostics {
-    if ($null -ne $script:diagnosticsPanel) {
-        $script:diagnosticsPanel.Visible = !$script:diagnosticsPanel.Visible
-    }
 }
 
 function New-Label {
@@ -779,9 +778,6 @@ $script:hostPanel.Controls.Add($script:hostVirtualIPv4Label)
 $script:hostStartButton = New-Button "创建并连接" 40 275 190 44
 $script:hostStartButton.Add_Click({ Start-HostRoom })
 $script:hostPanel.Controls.Add($script:hostStartButton)
-$hostDiagnosticsButton = New-Button "显示诊断与日志" 250 275 170 44
-$hostDiagnosticsButton.Add_Click({ Toggle-Diagnostics })
-$script:hostPanel.Controls.Add($hostDiagnosticsButton)
 
 $script:memberPanel = New-Object System.Windows.Forms.Panel
 $script:memberPanel.Location = New-Object System.Drawing.Point(20, 70)
@@ -805,9 +801,6 @@ $script:memberPanel.Controls.Add($script:memberVirtualIPv4Label)
 $script:memberJoinButton = New-Button "加入并连接" 40 275 190 44
 $script:memberJoinButton.Add_Click({ Join-MemberRoom })
 $script:memberPanel.Controls.Add($script:memberJoinButton)
-$memberDiagnosticsButton = New-Button "显示诊断与日志" 250 275 170 44
-$memberDiagnosticsButton.Add_Click({ Toggle-Diagnostics })
-$script:memberPanel.Controls.Add($memberDiagnosticsButton)
 
 $script:diagnosticsPanel = New-Object System.Windows.Forms.GroupBox
 $script:diagnosticsPanel.Text = "诊断与日志"
