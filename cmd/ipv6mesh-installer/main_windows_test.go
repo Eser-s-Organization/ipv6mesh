@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -555,6 +556,53 @@ func TestWindowsUIResponsiveLayoutAudit(t *testing.T) {
 	}
 }
 
+func TestWindowsUIAsyncPollingMessagePumpAudit(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(
+		ctx,
+		"powershell.exe",
+		"-NoLogo",
+		"-NoProfile",
+		"-NonInteractive",
+		"-File", uiPath,
+		"-PackageDirectory", t.TempDir(),
+		"-AsyncPollingAudit",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("async WinForms polling audit failed: %v\n%s", err, output)
+	}
+	var audit struct {
+		Passed                bool `json:"Passed"`
+		MessagePumpTicks      int  `json:"MessagePumpTicks"`
+		WorkerStarts          int  `json:"WorkerStarts"`
+		MaxConcurrentWorkers  int  `json:"MaxConcurrentWorkers"`
+		LateResultWrites      int  `json:"LateResultWrites"`
+		UiThreadApplied       bool `json:"UiThreadApplied"`
+		SlowResultApplied     bool `json:"SlowResultApplied"`
+		MembersRetainedOnFail bool `json:"MembersRetainedOnFail"`
+	}
+	lines := strings.Split(strings.ReplaceAll(string(output), "\r", ""), "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		line := strings.TrimSpace(lines[index])
+		if strings.HasPrefix(line, "{") {
+			if err := json.Unmarshal([]byte(line), &audit); err != nil {
+				t.Fatalf("decode async polling audit JSON: %v\n%s", err, output)
+			}
+			break
+		}
+	}
+	if !audit.Passed || audit.MessagePumpTicks < 10 || audit.WorkerStarts != 1 || audit.MaxConcurrentWorkers > 1 || audit.LateResultWrites != 0 || !audit.UiThreadApplied || !audit.SlowResultApplied || !audit.MembersRetainedOnFail {
+		t.Fatalf("async polling audit did not prove non-blocking, serialized, safe updates: %#v\n%s", audit, output)
+	}
+}
+
 func TestWindowsUIResponsiveMemberLayoutUsesMeasuredClientSpace(t *testing.T) {
 	contents := readWindowsPackagingFile(t, "ui.ps1")
 	for _, required := range []string{
@@ -832,6 +880,9 @@ func TestWindowsUILiveStatusTimerUsesQuietDeduplicatedPolling(t *testing.T) {
 		t.Fatalf("read UI script: %v", err)
 	}
 	contents := string(uiScript)
+	if strings.Contains(contents, "Start-Job") || strings.Contains(contents, "Remove-Job") {
+		t.Fatal("automatic polling must not use Start-Job lifecycle")
+	}
 	for _, required := range []string{
 		`$script:statusRefreshTimer = New-Object System.Windows.Forms.Timer`,
 		`$script:statusRefreshTimer.Interval = 2000`,
@@ -841,14 +892,23 @@ func TestWindowsUILiveStatusTimerUsesQuietDeduplicatedPolling(t *testing.T) {
 		`function Dispose-StatusRefreshTimer`,
 		`function Invoke-AutomaticStatusRefresh`,
 		`$script:primaryBusy -or $script:cleanupStarted`,
-		`$script:activePage -eq "Welcome" -or $script:statusRefreshInProgress`,
-		`Get-NodeStatus -Automatic`,
+		`if ($script:activePage -eq "Welcome") { return }`,
+		`$script:statusRefreshInProgress -or $script:automaticPollingApplyPending`,
+		`function Start-AutomaticPollingCommand`,
+		`function Complete-AutomaticPollingCommand`,
+		`ReadToEndAsync()`,
+		`$process.EnableRaisingEvents = $true`,
+		`$process.HasExited`,
+		`$script:automaticPollingGeneration`,
+		`Invoke-UiBeginInvoke`,
+		`function Apply-NodeStatusResult`,
+		`function Apply-RoomMembersResult`,
 		`function Get-RoomMembers`,
 		`Invoke-VpnCtl -Arguments @("room", "members") -SuppressStandardOutput -Quiet:$Automatic`,
 		`$script:uiFlowState -in @("Hosting", "JoinedMember")`,
 		`Get-MemberLogDecision`,
 		`Invoke-VpnCtl -Arguments @("status") -SuppressStandardOutput -Quiet:$Automatic`,
-		`Convert-ResultToJson $result "读取节点状态" -Quiet:$Automatic`,
+		`Convert-ResultToJson $Result "读取节点状态" -Quiet:$Automatic`,
 		`Get-StatusLogDecision`,
 		`Dispose-StatusRefreshTimer`,
 	} {

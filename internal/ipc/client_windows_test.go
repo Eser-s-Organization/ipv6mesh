@@ -19,7 +19,9 @@ func TestClientCallDeadlineSelection(t *testing.T) {
 		want    time.Time
 	}{
 		{name: "local budget", command: CommandStatus, ctx: context.Background(), want: now.Add(5 * time.Second)},
+		{name: "connect uses network budget", command: CommandConnect, ctx: context.Background(), want: now.Add(45 * time.Second)},
 		{name: "network budget", command: CommandRoomMembers, ctx: context.Background(), want: now.Add(45 * time.Second)},
+		{name: "connect caller deadline wins", command: CommandConnect, ctx: deadlineContext(now.Add(2 * time.Second)), want: now.Add(2 * time.Second)},
 		{name: "caller deadline wins", command: CommandRoomMembers, ctx: deadlineContext(now.Add(2 * time.Second)), want: now.Add(2 * time.Second)},
 		{name: "budget wins over later caller", command: CommandStatus, ctx: deadlineContext(now.Add(30 * time.Second)), want: now.Add(5 * time.Second)},
 	}

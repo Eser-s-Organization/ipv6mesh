@@ -30,7 +30,7 @@ func (slowNetworkTestPipeHandler) HandleJSON(_ context.Context, data []byte) ([]
 	if err != nil {
 		return MarshalResponse(ErrorResponse(CodeInvalidRequest))
 	}
-	if request.Type == CommandRoomMembers {
+	if request.Type == CommandConnect || request.Type == CommandRoomMembers {
 		time.Sleep(5200 * time.Millisecond)
 	}
 	return MarshalResponse(SuccessResponse(Status{NetworkID: string(request.Type), PathState: PathStateDirect, ConfigGeneration: 1}))
@@ -89,6 +89,28 @@ func TestNamedPipeSlowNetworkCommandUsesExtendedDeadline(t *testing.T) {
 	}
 }
 
+func TestNamedPipeSlowConnectCommandUsesExtendedDeadline(t *testing.T) {
+	path := fmt.Sprintf(`\\.\pipe\ipv6mesh-slow-connect-%d`, time.Now().UnixNano())
+	server, err := newServerWithOptions(path, slowNetworkTestPipeHandler{}, testPipeAuthorizer{}, serverOptions{SecurityDescriptor: "D:P(A;;GA;;;WD)"})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer server.Close()
+	serverContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.Serve(serverContext) }()
+
+	callContext, callCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer callCancel()
+	response, err := NewClient(path).Call(callContext, Request{Type: CommandConnect, NetworkID: "network-a"})
+	if err != nil {
+		t.Fatalf("slow connect Call: %v", err)
+	}
+	if !response.OK || response.NetworkID != string(CommandConnect) {
+		t.Fatalf("slow connect response = %#v", response)
+	}
+}
+
 func TestNamedPipeCallHonorsEarlierCallerDeadlineAcrossRead(t *testing.T) {
 	path := fmt.Sprintf(`\\.\pipe\ipv6mesh-caller-deadline-%d`, time.Now().UnixNano())
 	server, err := newServerWithOptions(path, slowNetworkTestPipeHandler{}, testPipeAuthorizer{}, serverOptions{SecurityDescriptor: "D:P(A;;GA;;;WD)"})
@@ -109,6 +131,29 @@ func TestNamedPipeCallHonorsEarlierCallerDeadlineAcrossRead(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("caller deadline was not applied to the read phase: elapsed=%s err=%v", elapsed, err)
+	}
+}
+
+func TestNamedPipeConnectHonorsEarlierCallerDeadlineAcrossRead(t *testing.T) {
+	path := fmt.Sprintf(`\\.\pipe\ipv6mesh-connect-caller-deadline-%d`, time.Now().UnixNano())
+	server, err := newServerWithOptions(path, slowNetworkTestPipeHandler{}, testPipeAuthorizer{}, serverOptions{SecurityDescriptor: "D:P(A;;GA;;;WD)"})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer server.Close()
+	serverContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.Serve(serverContext) }()
+
+	callContext, callCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer callCancel()
+	started := time.Now()
+	_, err = NewClient(path).Call(callContext, Request{Type: CommandConnect, NetworkID: "network-a"})
+	if err == nil {
+		t.Fatal("slow connect Call unexpectedly succeeded after caller deadline")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("caller deadline was not applied to connect read phase: elapsed=%s err=%v", elapsed, err)
 	}
 }
 

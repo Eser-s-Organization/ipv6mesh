@@ -9,7 +9,8 @@ param(
     [string]$DataDirectory = (Join-Path $env:ProgramData "IPv6Mesh"),
     [string]$ServiceName = "IPv6Mesh",
     [string]$Version = "dev",
-    [switch]$LayoutAudit
+    [switch]$LayoutAudit,
+    [switch]$AsyncPollingAudit
 )
 
 $ErrorActionPreference = "Stop"
@@ -63,6 +64,30 @@ $script:primaryBusy = $false
 $script:updatingEndpoint = $false
 $script:statusRefreshTimer = $null
 $script:statusRefreshInProgress = $false
+$script:automaticPollingOperation = $null
+$script:automaticPollingGeneration = 0
+$script:automaticPollingApplyPending = $false
+$script:automaticPollingPendingResult = $null
+$script:automaticPollingPendingGeneration = 0
+$script:asyncPollingAudit = [bool]$AsyncPollingAudit
+$script:asyncPollingAuditCounters = @{
+    WorkerStarts = 0
+    ActiveWorkers = 0
+    MaxConcurrentWorkers = 0
+    MessagePumpTicks = 0
+    SlowResultApplied = $false
+    LateResultWrites = 0
+    UiThreadApplied = $false
+    MembersRetainedOnFail = $false
+    PollingTicks = 0
+    LastOperationState = ''
+}
+$script:asyncPollingAuditUiThreadId = 0
+$script:asyncPollingAuditOwnerThreadId = 0
+$script:asyncPollingAuditInitialMemberRows = 0
+$script:asyncPollingAuditStage = ''
+$script:asyncPollingAuditResponsiveTicks = 0
+$script:asyncPollingAuditLateQueued = $false
 $script:hasStatusRefreshResult = $false
 $script:lastStatusRefreshSucceeded = $false
 $script:lastStatusFingerprint = ""
@@ -97,19 +122,21 @@ function Add-UiLog {
     param([Parameter(Mandatory = $true)][string]$Message, [string]$Level = "信息")
     $safeMessage = Redact-Secret $Message
     $line = "[{0}] [{1}] {2}" -f (Get-Date).ToString("HH:mm:ss"), $Level, $safeMessage
-    [void]$script:logLines.Add($line)
-    if ($null -eq $script:logBox -or $script:logBox.IsDisposed) { return }
-    $update = [Action]{
-        if ($script:logBox.IsDisposed) { return }
+    $update = {
+        [void]$script:logLines.Add($line)
+        if ($null -eq $script:logBox -or $script:logBox.IsDisposed) { return }
         $script:logBox.AppendText($line + [Environment]::NewLine)
         $script:logBox.SelectionStart = $script:logBox.TextLength
         $script:logBox.ScrollToCaret()
+    }.GetNewClosure()
+    if ($null -ne $script:logBox -and !$script:logBox.IsDisposed -and $script:logBox.IsHandleCreated) {
+        try {
+            [void]$script:logBox.BeginInvoke([System.Windows.Forms.MethodInvoker]$update)
+            return
+        } catch {
+        }
     }
-    if ($script:logBox.InvokeRequired) {
-        [void]$script:logBox.BeginInvoke($update)
-    } else {
-        $update.Invoke()
-    }
+    $update.Invoke()
 }
 
 function Get-StatusLogDecision {
@@ -793,13 +820,13 @@ function Install-NodeService {
     }
 }
 
-function Get-NodeStatus {
-	param([switch]$Automatic)
-	if ($script:statusRefreshInProgress) { return $null }
-	$script:statusRefreshInProgress = $true
+function Apply-NodeStatusResult {
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        [switch]$Automatic
+    )
     try {
-        $result = Invoke-VpnCtl -Arguments @("status") -SuppressStandardOutput -Quiet:$Automatic
-        $status = Convert-ResultToJson $result "读取节点状态" -Quiet:$Automatic
+        $status = Convert-ResultToJson $Result "读取节点状态" -Quiet:$Automatic
         $script:activeNetworkId = [string]$status.network_id
         $virtualIPv4 = [string]$status.virtual_ipv4
         $path = [string]$status.path_state
@@ -830,6 +857,16 @@ function Get-NodeStatus {
         $script:lastStatusRefreshSucceeded = $false
         $script:lastStatusFingerprint = ""
         return $null
+    }
+}
+
+function Get-NodeStatus {
+	param([switch]$Automatic)
+	if ($script:statusRefreshInProgress) { return $null }
+	$script:statusRefreshInProgress = $true
+    try {
+        $result = Invoke-VpnCtl -Arguments @("status") -SuppressStandardOutput -Quiet:$Automatic
+        return Apply-NodeStatusResult $result -Automatic:$Automatic
     } finally {
         $script:statusRefreshInProgress = $false
     }
@@ -845,14 +882,13 @@ function Set-ActiveVirtualIPv4 {
     }
 }
 
-function Get-RoomMembers {
-    param([switch]$Automatic)
-    if ($script:memberRefreshInProgress -or [string]::IsNullOrWhiteSpace($script:activeNetworkId)) { return $null }
-    if ($script:uiFlowState -notin @("Hosting", "JoinedMember")) { return $null }
-    $script:memberRefreshInProgress = $true
+function Apply-RoomMembersResult {
+    param(
+        [Parameter(Mandatory = $true)]$Result,
+        [switch]$Automatic
+    )
     try {
-        $result = Invoke-VpnCtl -Arguments @("room", "members") -SuppressStandardOutput -Quiet:$Automatic
-        $response = Convert-ResultToJson $result "读取房间成员" -Quiet:$Automatic
+        $response = Convert-ResultToJson $Result "读取房间成员" -Quiet:$Automatic
         $members = @($response.members)
         $fingerprint = (($members | ForEach-Object { "{0}|{1}|{2}|{3}" -f $_.display_name, $_.virtual_ipv4, $_.is_local, $_.state }) -join ";")
         Set-RoomMemberRows $members
@@ -878,6 +914,17 @@ function Get-RoomMembers {
         $script:hasMemberRefreshResult = $true
         $script:lastMemberRefreshSucceeded = $false
         return $null
+    }
+}
+
+function Get-RoomMembers {
+    param([switch]$Automatic)
+    if ($script:memberRefreshInProgress -or [string]::IsNullOrWhiteSpace($script:activeNetworkId)) { return $null }
+    if ($script:uiFlowState -notin @("Hosting", "JoinedMember")) { return $null }
+    $script:memberRefreshInProgress = $true
+    try {
+        $result = Invoke-VpnCtl -Arguments @("room", "members") -SuppressStandardOutput -Quiet:$Automatic
+        return Apply-RoomMembersResult $result -Automatic:$Automatic
     } finally {
         $script:memberRefreshInProgress = $false
     }
@@ -1005,17 +1052,240 @@ function Set-PrimaryBusy {
     Update-UiFlowControls
 }
 
+function Invoke-UiBeginInvoke {
+    param([Parameter(Mandatory = $true)][scriptblock]$Callback)
+    $form = $script:form
+    if ($null -eq $form -or $form.IsDisposed -or $form.Disposing -or !$form.IsHandleCreated) { return $false }
+    try {
+        [void]$form.BeginInvoke([System.Windows.Forms.MethodInvoker]$Callback)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Start-AutomaticPollingCommand {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$State,
+        [Parameter(Mandatory = $true)][ValidateSet("Status", "Members")][string]$Phase
+    )
+    $fileName = Get-PayloadExecutable "vpnctl.exe"
+    $arguments = if ($Phase -eq "Status") { @("status") } else { @("room", "members") }
+    if ($script:asyncPollingAudit) {
+        $fileName = Get-PowerShellPath
+        if ($Phase -eq "Status") {
+            $auditStatus = '{"network_id":"audit-network","virtual_ipv4":"10.42.0.2","path_state":"direct","last_error":""}'
+            $auditCommand = "Start-Sleep -Milliseconds 5200; [Console]::Out.Write('$auditStatus')"
+            $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($auditCommand))
+            $arguments = @("-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", $encodedCommand)
+        } else {
+            $auditCommand = "[Console]::Error.Write('control_unreachable'); exit 1"
+            $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($auditCommand))
+            $arguments = @("-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", $encodedCommand)
+        }
+    }
+    $environment = Get-ClientEnvironment
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $fileName
+    $psi.Arguments = (($arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join " ")
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    foreach ($key in $environment.Keys) {
+        $psi.EnvironmentVariables[$key] = [string]$environment[$key]
+    }
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    $stdoutTask = $null
+    $stderrTask = $null
+    try {
+        [void]$process.Start()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $State["${Phase}StdoutTask"] = $stdoutTask
+        $State["${Phase}StderrTask"] = $stderrTask
+        $State["Process"] = $process
+        $process.EnableRaisingEvents = $true
+    } catch {
+        try {
+            if (!$process.HasExited) { $process.Kill() }
+        } catch {}
+        try { $process.Dispose() } catch {}
+        throw
+    }
+}
+
+function Complete-AutomaticPollingCommand {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$State,
+        [Parameter(Mandatory = $true)][ValidateSet("Status", "Members")][string]$Phase
+    )
+    if ([bool]$State["Cancelled"]) { return $false }
+    $process = $State["Process"]
+    if ($null -eq $process) { return $false }
+    try { $exited = $process.HasExited } catch { $exited = $true }
+    if (!$exited) { return $false }
+    $stdoutTask = $State["${Phase}StdoutTask"]
+    $stderrTask = $State["${Phase}StderrTask"]
+    if ($null -ne $stdoutTask -and !$stdoutTask.IsCompleted) { return $false }
+    if ($null -ne $stderrTask -and !$stderrTask.IsCompleted) { return $false }
+    try {
+        $stdout = if ($null -ne $stdoutTask) { [string]$stdoutTask.Result } else { "" }
+        $stderr = if ($null -ne $stderrTask) { [string]$stderrTask.Result } else { "" }
+        $State["${Phase}Result"] = [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout; Stderr = $stderr }
+    } catch {
+        $State["${Phase}Result"] = [pscustomobject]@{ ExitCode = 1; Stdout = ""; Stderr = "" }
+    } finally {
+        try { $process.Dispose() } catch {}
+        $State["Process"] = $null
+    }
+    $State["Phase"] = "${Phase}Done"
+    return $true
+}
+
+function Start-AutomaticPollingOperation {
+    param([Parameter(Mandatory = $true)][int]$Generation)
+    $state = [hashtable]::Synchronized(@{
+        Generation = $Generation
+        IncludeMembers = ($script:uiFlowState -in @("Hosting", "JoinedMember"))
+        Phase = "StatusRunning"
+        Cancelled = $false
+        Process = $null
+    })
+    $script:asyncPollingAuditCounters.WorkerStarts++
+    $script:asyncPollingAuditCounters.ActiveWorkers++
+    if ($script:asyncPollingAuditCounters.ActiveWorkers -gt $script:asyncPollingAuditCounters.MaxConcurrentWorkers) {
+        $script:asyncPollingAuditCounters.MaxConcurrentWorkers = $script:asyncPollingAuditCounters.ActiveWorkers
+    }
+    try {
+        Start-AutomaticPollingCommand -State $state -Phase "Status"
+        return $state
+    } catch {
+        $script:asyncPollingAuditCounters.ActiveWorkers--
+        throw
+    }
+}
+
+function Process-AutomaticPollingOperation {
+    $state = $script:automaticPollingOperation
+    if ($null -eq $state) { return }
+    if ($script:asyncPollingAudit) {
+        $script:asyncPollingAuditCounters.PollingTicks++
+        $script:asyncPollingAuditCounters.LastOperationState = [string]$state["Phase"]
+    }
+    if ([bool]$state["Cancelled"] -or [int]$state["Generation"] -ne $script:automaticPollingGeneration) {
+        Stop-StatusRefresh
+        return
+    }
+    $phase = [string]$state["Phase"]
+    if ($phase -eq "StatusRunning") {
+        if (!(Complete-AutomaticPollingCommand -State $state -Phase "Status")) { return }
+        $phase = "StatusDone"
+    } elseif ($phase -eq "MembersRunning") {
+        if (!(Complete-AutomaticPollingCommand -State $state -Phase "Members")) { return }
+        $phase = "MembersDone"
+    }
+    if ($phase -eq "StatusDone") {
+        if ([bool]$state["IncludeMembers"]) {
+            $state["Phase"] = "MembersRunning"
+            try { Start-AutomaticPollingCommand -State $state -Phase "Members" } catch { $state["Phase"] = "MembersDone"; $state["MembersResult"] = [pscustomobject]@{ ExitCode = 1; Stdout = ""; Stderr = "" } }
+            return
+        }
+        $state["Phase"] = "Ready"
+        $phase = "Ready"
+    }
+    if ($phase -eq "MembersDone") { $state["Phase"] = "Ready"; $phase = "Ready" }
+    if ($phase -ne "Ready") { return }
+    $result = [pscustomobject]@{
+        Status = $state["StatusResult"]
+        Members = if ([bool]$state["IncludeMembers"]) { $state["MembersResult"] } else { $null }
+    }
+    $generation = [int]$state["Generation"]
+    $script:automaticPollingOperation = $null
+    $script:asyncPollingAuditCounters.ActiveWorkers = [Math]::Max(0, $script:asyncPollingAuditCounters.ActiveWorkers - 1)
+    if ($script:cleanupStarted -or $generation -ne $script:automaticPollingGeneration) {
+        $script:statusRefreshInProgress = $false
+        $script:memberRefreshInProgress = $false
+        return
+    }
+    $script:automaticPollingPendingResult = $result
+    $script:automaticPollingPendingGeneration = $generation
+    $script:automaticPollingApplyPending = $true
+    $queued = Invoke-UiBeginInvoke {
+        if ($script:cleanupStarted -or $script:automaticPollingPendingGeneration -ne $script:automaticPollingGeneration) {
+            $script:automaticPollingApplyPending = $false
+            $script:automaticPollingPendingResult = $null
+            $script:statusRefreshInProgress = $false
+            $script:memberRefreshInProgress = $false
+            return
+        }
+        try {
+            $script:asyncPollingAuditUiThreadId = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+            $resultToApply = $script:automaticPollingPendingResult
+            $null = Apply-NodeStatusResult $resultToApply.Status -Automatic
+            if ($null -ne $resultToApply.Members) { $null = Apply-RoomMembersResult $resultToApply.Members -Automatic }
+            if ($script:asyncPollingAudit) {
+                $script:asyncPollingAuditCounters.SlowResultApplied = $true
+                $script:asyncPollingAuditCounters.UiThreadApplied = ($script:asyncPollingAuditUiThreadId -eq $script:asyncPollingAuditOwnerThreadId)
+                if ($null -ne $script:memberMemberGrid) { $script:asyncPollingAuditCounters.MembersRetainedOnFail = ($script:memberMemberGrid.Rows.Count -eq $script:asyncPollingAuditInitialMemberRows) }
+            }
+        } finally {
+            $script:automaticPollingPendingResult = $null
+            $script:automaticPollingApplyPending = $false
+            $script:statusRefreshInProgress = $false
+            $script:memberRefreshInProgress = $false
+        }
+    }
+    if (!$queued) {
+        $script:automaticPollingPendingResult = $null
+        $script:automaticPollingApplyPending = $false
+        $script:statusRefreshInProgress = $false
+        $script:memberRefreshInProgress = $false
+    }
+}
+
 function Invoke-AutomaticStatusRefresh {
     if ($script:primaryBusy -or $script:cleanupStarted) { return }
-    if ($script:activePage -eq "Welcome" -or $script:statusRefreshInProgress) { return }
-    $null = Get-NodeStatus -Automatic
-    if ($script:uiFlowState -in @("Hosting", "JoinedMember")) { $null = Get-RoomMembers -Automatic }
+    if ($script:activePage -eq "Welcome") { return }
+    if ($null -ne $script:automaticPollingOperation) {
+        Process-AutomaticPollingOperation
+        return
+    }
+    if ($script:statusRefreshInProgress -or $script:automaticPollingApplyPending) { return }
+    try {
+        $script:statusRefreshInProgress = $true
+        $script:memberRefreshInProgress = $script:uiFlowState -in @("Hosting", "JoinedMember")
+        $script:automaticPollingOperation = Start-AutomaticPollingOperation -Generation $script:automaticPollingGeneration
+    } catch {
+        $script:statusRefreshInProgress = $false
+        $script:memberRefreshInProgress = $false
+        Add-UiLog "自动读取节点状态失败。" "警告"
+    }
 }
 
 function Stop-StatusRefresh {
     if ($null -ne $script:statusRefreshTimer) {
         $script:statusRefreshTimer.Stop()
     }
+    $script:automaticPollingGeneration++
+    $script:automaticPollingApplyPending = $false
+    $script:automaticPollingPendingResult = $null
+    if ($null -ne $script:automaticPollingOperation) {
+        $state = $script:automaticPollingOperation
+        $state["Cancelled"] = $true
+        $process = $state["Process"]
+        if ($null -ne $process) {
+            try {
+                if (!$process.HasExited) { $process.Kill() }
+            } catch {}
+            try { $process.Dispose() } catch {}
+        }
+        $script:automaticPollingOperation = $null
+        $script:asyncPollingAuditCounters.ActiveWorkers = 0
+    }
+    $script:statusRefreshInProgress = $false
+    $script:memberRefreshInProgress = $false
 }
 
 function Start-StatusRefresh {
@@ -1703,6 +1973,89 @@ function Invoke-ResponsiveLayoutAudit {
     }
 }
 
+function Invoke-AsyncPollingAudit {
+    $script:asyncPollingAuditOwnerThreadId = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+    $script:form.ShowInTaskbar = $false
+    $script:form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $script:form.Location = New-Object System.Drawing.Point(-32000, -32000)
+    $script:form.Opacity = 0
+    $script:form.Show()
+    $script:uiFlowState = "Hosting"
+    $script:activeNetworkId = "audit-network"
+    Set-PageLayoutState "Host"
+    Set-ResponsiveSplitLayout
+    Set-ResponsiveMemberLayout
+    $initialMembers = @([pscustomobject]@{
+        display_name = "audit-host"
+        virtual_ipv4 = "10.42.0.1"
+        is_local = $true
+        state = "online"
+    })
+    Set-RoomMemberRows $initialMembers
+    $script:asyncPollingAuditInitialMemberRows = $script:memberMemberGrid.Rows.Count
+
+    $heartbeat = New-Object System.Windows.Forms.Timer
+    $heartbeat.Interval = 50
+    $script:asyncPollingAuditStage = "responsive"
+    $script:asyncPollingAuditResponsiveDeadline = (Get-Date).AddMilliseconds(1200)
+    $script:asyncPollingAuditCompletionDeadline = (Get-Date).AddSeconds(10)
+    $heartbeat.Add_Tick({
+        try {
+            $script:asyncPollingAuditCounters.MessagePumpTicks++
+            $now = Get-Date
+            if ($script:asyncPollingAuditStage -eq "responsive" -and $now -ge $script:asyncPollingAuditResponsiveDeadline) {
+                $script:asyncPollingAuditResponsiveTicks = $script:asyncPollingAuditCounters.MessagePumpTicks
+                $script:asyncPollingAuditStage = "waiting"
+            }
+            if ($script:asyncPollingAuditStage -eq "waiting" -and $script:asyncPollingAuditCounters.SlowResultApplied) {
+                Stop-StatusRefresh
+                $script:uiFlowState = "Idle"
+                $script:asyncPollingAuditLateQueued = Invoke-UiBeginInvoke {
+                    if ($null -ne $script:nodeStatusLabel -and !$script:nodeStatusLabel.IsDisposed) {
+                        $script:asyncPollingAuditCounters.LateResultWrites++
+                        $script:nodeStatusLabel.Text = "迟到结果不应写入"
+                    }
+                }
+                $script:asyncPollingAuditStage = "closing"
+                $script:form.Close()
+            } elseif ($script:asyncPollingAuditStage -eq "waiting" -and $now -ge $script:asyncPollingAuditCompletionDeadline) {
+                $script:asyncPollingAuditStage = "closing"
+                $script:form.Close()
+            }
+        } catch {
+            $script:asyncPollingAuditStage = "closing"
+            try { $script:form.Close() } catch {}
+        }
+    })
+    $heartbeat.Start()
+    $script:statusRefreshTimer.Interval = 50
+    Start-StatusRefresh
+    [void][System.Windows.Forms.Application]::Run($script:form)
+    $heartbeat.Stop()
+    $heartbeat.Dispose()
+
+    return [pscustomobject]@{
+        Passed = ($script:asyncPollingAuditResponsiveTicks -ge 10 -and
+            $script:asyncPollingAuditCounters.WorkerStarts -eq 1 -and
+            $script:asyncPollingAuditCounters.MaxConcurrentWorkers -le 1 -and
+            $script:asyncPollingAuditCounters.LateResultWrites -eq 0 -and
+            $script:asyncPollingAuditCounters.UiThreadApplied -and
+            $script:asyncPollingAuditCounters.SlowResultApplied -and
+            $script:asyncPollingAuditCounters.MembersRetainedOnFail -and
+            $script:asyncPollingAuditLateQueued)
+        MessagePumpTicks = $script:asyncPollingAuditResponsiveTicks
+        WorkerStarts = $script:asyncPollingAuditCounters.WorkerStarts
+        MaxConcurrentWorkers = $script:asyncPollingAuditCounters.MaxConcurrentWorkers
+        LateResultWrites = $script:asyncPollingAuditCounters.LateResultWrites
+        UiThreadApplied = $script:asyncPollingAuditCounters.UiThreadApplied
+        SlowResultApplied = $script:asyncPollingAuditCounters.SlowResultApplied
+        MembersRetainedOnFail = $script:asyncPollingAuditCounters.MembersRetainedOnFail
+        PollingTicks = $script:asyncPollingAuditCounters.PollingTicks
+        LastOperationState = $script:asyncPollingAuditCounters.LastOperationState
+        LateResultQueued = $script:asyncPollingAuditLateQueued
+    }
+}
+
 if (!$LayoutAudit) {
     if (!(Enter-UiInstance)) {
         [void][System.Windows.Forms.MessageBox]::Show("IPv6Mesh 已在运行。请使用现有窗口。", "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
@@ -2031,10 +2384,26 @@ $script:ipv6AddressBox.Add_TextChanged({
     try { Update-ControlEndpoint } catch { Update-UiFlowControls }
 })
 
-$script:form.Add_FormClosing({ Stop-AllResources })
+$script:form.Add_FormClosing({
+    Stop-AllResources
+})
 if ($LayoutAudit) {
     try {
         $audit = Invoke-ResponsiveLayoutAudit
+        $audit | ConvertTo-Json -Depth 6 -Compress
+        if (!$audit.Passed) { exit 1 }
+    } finally {
+        Stop-StatusRefresh
+        if ($null -ne $script:form -and !$script:form.IsDisposed) {
+            $script:form.Hide()
+            $script:form.Dispose()
+        }
+    }
+    return
+}
+if ($AsyncPollingAudit) {
+    try {
+        $audit = Invoke-AsyncPollingAudit
         $audit | ConvertTo-Json -Depth 6 -Compress
         if (!$audit.Passed) { exit 1 }
     } finally {

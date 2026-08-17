@@ -46,7 +46,7 @@ const (
 
 func commandTimeoutClass(command Command) timeoutClass {
 	switch command {
-	case CommandJoin, CommandJoinRoom, CommandLeave, CommandRoomMembers:
+	case CommandJoin, CommandJoinRoom, CommandLeave, CommandConnect, CommandRoomMembers:
 		return networkCommandTimeout
 	default:
 		return localCommandTimeout
