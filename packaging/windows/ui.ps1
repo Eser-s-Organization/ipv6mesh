@@ -10,7 +10,8 @@ param(
     [string]$ServiceName = "IPv6Mesh",
     [string]$Version = "dev",
     [switch]$LayoutAudit,
-    [switch]$AsyncPollingAudit
+    [switch]$AsyncPollingAudit,
+    [switch]$PreparationRaceAudit
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,7 +70,7 @@ $script:automaticPollingGeneration = 0
 $script:automaticPollingApplyPending = $false
 $script:automaticPollingPendingResult = $null
 $script:automaticPollingPendingGeneration = 0
-$script:asyncPollingAudit = [bool]$AsyncPollingAudit
+$script:asyncPollingAuditMode = [bool]($AsyncPollingAudit -or $PreparationRaceAudit)
 $script:asyncPollingAuditCounters = @{
     WorkerStarts = 0
     ActiveWorkers = 0
@@ -933,7 +934,7 @@ function Get-RoomMembers {
 function Start-HostRoom {
     if ($script:uiFlowState -ne "HostSetup") { Add-UiLog "创建房间操作已被忽略。" "警告"; return }
     if (!(Set-UiFlowState 'PreparingHost')) { return }
-    Set-PrimaryBusy $true "正在创建房间并连接本机……"
+    Begin-PrimaryOperation "正在创建房间并连接本机……"
     try {
         if (!(Refresh-LocalIPv6)) { throw "没有可用的房主全局 IPv6。" }
         $hostIPv6 = Get-BoxText $script:ipv6AddressBox
@@ -958,14 +959,14 @@ function Start-HostRoom {
         Stop-FailedPreparation "HostSetup"
         [void][System.Windows.Forms.MessageBox]::Show($script:form, "创建房间失败，请查看诊断日志。", "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     } finally {
-        Set-PrimaryBusy $false ""
+        End-PrimaryOperation
     }
 }
 
 function Join-MemberRoom {
     if ($script:uiFlowState -ne "MemberSetup") { Add-UiLog "加入房间操作已被忽略。" "警告"; return }
     if (!(Set-UiFlowState 'PreparingMember')) { return }
-    Set-PrimaryBusy $true "正在加入房间并连接本机……"
+    Begin-PrimaryOperation "正在加入房间并连接本机……"
     try {
         $hostIPv6 = Get-BoxText $script:memberHostIPv6Box
         if ($hostIPv6 -eq "") { throw "请输入房主 IPv6。" }
@@ -988,7 +989,7 @@ function Join-MemberRoom {
         Stop-FailedPreparation "MemberSetup"
         [void][System.Windows.Forms.MessageBox]::Show($script:form, "加入房间失败，请查看诊断日志。", "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     } finally {
-        Set-PrimaryBusy $false ""
+        End-PrimaryOperation
     }
 }
 
@@ -1052,6 +1053,24 @@ function Set-PrimaryBusy {
     Update-UiFlowControls
 }
 
+function Begin-PrimaryOperation {
+    param([string]$Status = "")
+    Stop-StatusRefresh
+    Set-PrimaryBusy $true $Status
+}
+
+function Restart-StatusRefreshIfActive {
+    if ($script:cleanupStarted -or $script:activePage -eq "Welcome") { return }
+    if ($script:uiFlowState -in @("HostSetup", "MemberSetup", "Hosting", "JoinedMember")) {
+        Start-StatusRefresh
+    }
+}
+
+function End-PrimaryOperation {
+    Set-PrimaryBusy $false ""
+    Restart-StatusRefreshIfActive
+}
+
 function Invoke-UiBeginInvoke {
     param([Parameter(Mandatory = $true)][scriptblock]$Callback)
     $form = $script:form
@@ -1071,7 +1090,7 @@ function Start-AutomaticPollingCommand {
     )
     $fileName = Get-PayloadExecutable "vpnctl.exe"
     $arguments = if ($Phase -eq "Status") { @("status") } else { @("room", "members") }
-    if ($script:asyncPollingAudit) {
+    if ($script:asyncPollingAuditMode) {
         $fileName = Get-PowerShellPath
         if ($Phase -eq "Status") {
             $auditStatus = '{"network_id":"audit-network","virtual_ipv4":"10.42.0.2","path_state":"direct","last_error":""}'
@@ -1170,7 +1189,7 @@ function Start-AutomaticPollingOperation {
 function Process-AutomaticPollingOperation {
     $state = $script:automaticPollingOperation
     if ($null -eq $state) { return }
-    if ($script:asyncPollingAudit) {
+    if ($script:asyncPollingAuditMode) {
         $script:asyncPollingAuditCounters.PollingTicks++
         $script:asyncPollingAuditCounters.LastOperationState = [string]$state["Phase"]
     }
@@ -1225,7 +1244,7 @@ function Process-AutomaticPollingOperation {
             $resultToApply = $script:automaticPollingPendingResult
             $null = Apply-NodeStatusResult $resultToApply.Status -Automatic
             if ($null -ne $resultToApply.Members) { $null = Apply-RoomMembersResult $resultToApply.Members -Automatic }
-            if ($script:asyncPollingAudit) {
+            if ($script:asyncPollingAuditMode) {
                 $script:asyncPollingAuditCounters.SlowResultApplied = $true
                 $script:asyncPollingAuditCounters.UiThreadApplied = ($script:asyncPollingAuditUiThreadId -eq $script:asyncPollingAuditOwnerThreadId)
                 if ($null -ne $script:memberMemberGrid) { $script:asyncPollingAuditCounters.MembersRetainedOnFail = ($script:memberMemberGrid.Rows.Count -eq $script:asyncPollingAuditInitialMemberRows) }
@@ -1973,6 +1992,109 @@ function Invoke-ResponsiveLayoutAudit {
     }
 }
 
+function Invoke-PreparationRaceAudit {
+    $script:preparationRaceAuditState = [hashtable]::Synchronized(@{
+        Stage = "starting"
+        OldGeneration = -1
+        CurrentGeneration = -1
+        PrimaryOperationCancelled = $false
+        StaleResultQueued = $false
+        StaleResultDropped = $false
+        OldGenerationApplied = $false
+        JoinedNetworkPreserved = $false
+        FailureReturnedToSetup = $false
+        RefreshRestarted = $false
+        Deadline = (Get-Date).AddSeconds(8)
+    })
+    $script:form.ShowInTaskbar = $false
+    $script:form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $script:form.Location = New-Object System.Drawing.Point(-32000, -32000)
+    $script:form.Opacity = 0
+    $script:form.Show()
+    $script:uiFlowState = "HostSetup"
+    $script:activeNetworkId = "old-network"
+    Set-PageLayoutState "Host"
+    Set-ResponsiveSplitLayout
+    Set-ResponsiveMemberLayout
+
+    $heartbeat = New-Object System.Windows.Forms.Timer
+    $heartbeat.Interval = 25
+    $heartbeat.Add_Tick({
+        try {
+            $state = $script:preparationRaceAuditState
+            if ($state["Stage"] -eq "starting" -and $null -ne $script:automaticPollingOperation) {
+                $state["OldGeneration"] = $script:automaticPollingGeneration
+                [void](Set-UiFlowState "PreparingHost")
+                Begin-PrimaryOperation "正在测试准备操作"
+                $state["PrimaryOperationCancelled"] = ($null -eq $script:automaticPollingOperation)
+                $state["CurrentGeneration"] = $script:automaticPollingGeneration
+                $script:activeNetworkId = "joined-network"
+                [void](Set-UiFlowState "Hosting")
+                $script:preparationRaceAuditStaleGeneration = [int]$state["OldGeneration"]
+                $state["StaleResultQueued"] = Invoke-UiBeginInvoke {
+                    $state = $script:preparationRaceAuditState
+                    if ($script:preparationRaceAuditStaleGeneration -eq $script:automaticPollingGeneration) {
+                        $state["OldGenerationApplied"] = $true
+                        $script:activeNetworkId = "old-network"
+                    } else {
+                        $state["StaleResultDropped"] = $true
+                    }
+                }
+                End-PrimaryOperation
+                $state["Stage"] = "waiting-stale"
+                return
+            }
+            if ($state["Stage"] -eq "waiting-stale" -and $state["StaleResultDropped"]) {
+                $state["JoinedNetworkPreserved"] = ($script:activeNetworkId -eq "joined-network")
+                Stop-StatusRefresh
+                [void](Set-UiFlowState "Cleaning")
+                [void](Set-UiFlowState "HostSetup")
+                $script:activeNetworkId = ""
+                [void](Set-UiFlowState "PreparingHost")
+                Begin-PrimaryOperation "正在测试失败恢复"
+                Stop-FailedPreparation "HostSetup"
+                End-PrimaryOperation
+                $state["FailureReturnedToSetup"] = ($script:uiFlowState -eq "HostSetup")
+                $state["RefreshRestarted"] = ($script:statusRefreshTimer.Enabled -and $null -ne $script:automaticPollingOperation)
+                $state["Stage"] = "closing"
+                $script:form.Close()
+                return
+            }
+            if ((Get-Date) -ge $state["Deadline"]) {
+                $state["Stage"] = "closing"
+                $script:form.Close()
+            }
+        } catch {
+            $state["Stage"] = "closing"
+            try { $script:form.Close() } catch {}
+        }
+    })
+    $heartbeat.Start()
+    $script:statusRefreshTimer.Interval = 50
+    Start-StatusRefresh
+    [void][System.Windows.Forms.Application]::Run($script:form)
+    $heartbeat.Stop()
+    $heartbeat.Dispose()
+
+    $state = $script:preparationRaceAuditState
+    return [pscustomobject]@{
+        Passed = ($state["PrimaryOperationCancelled"] -and
+            $state["CurrentGeneration"] -gt $state["OldGeneration"] -and
+            $state["StaleResultQueued"] -and
+            $state["StaleResultDropped"] -and
+            !$state["OldGenerationApplied"] -and
+            $state["JoinedNetworkPreserved"] -and
+            $state["FailureReturnedToSetup"] -and
+            $state["RefreshRestarted"])
+        PrimaryOperationCancelled = [bool]$state["PrimaryOperationCancelled"]
+        OldGenerationApplied = [bool]$state["OldGenerationApplied"]
+        StaleResultDropped = [bool]$state["StaleResultDropped"]
+        JoinedNetworkPreserved = [bool]$state["JoinedNetworkPreserved"]
+        FailureReturnedToSetup = [bool]$state["FailureReturnedToSetup"]
+        RefreshRestarted = [bool]$state["RefreshRestarted"]
+    }
+}
+
 function Invoke-AsyncPollingAudit {
     $script:asyncPollingAuditOwnerThreadId = [System.Threading.Thread]::CurrentThread.ManagedThreadId
     $script:form.ShowInTaskbar = $false
@@ -2056,7 +2178,7 @@ function Invoke-AsyncPollingAudit {
     }
 }
 
-if (!$LayoutAudit) {
+if (!$LayoutAudit -and !$AsyncPollingAudit -and !$PreparationRaceAudit) {
     if (!(Enter-UiInstance)) {
         [void][System.Windows.Forms.MessageBox]::Show("IPv6Mesh 已在运行。请使用现有窗口。", "IPv6Mesh", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
         return
@@ -2385,6 +2507,10 @@ $script:ipv6AddressBox.Add_TextChanged({
 })
 
 $script:form.Add_FormClosing({
+    if ($script:asyncPollingAuditMode) {
+        Dispose-StatusRefreshTimer
+        return
+    }
     Stop-AllResources
 })
 if ($LayoutAudit) {
@@ -2404,6 +2530,20 @@ if ($LayoutAudit) {
 if ($AsyncPollingAudit) {
     try {
         $audit = Invoke-AsyncPollingAudit
+        $audit | ConvertTo-Json -Depth 6 -Compress
+        if (!$audit.Passed) { exit 1 }
+    } finally {
+        Stop-StatusRefresh
+        if ($null -ne $script:form -and !$script:form.IsDisposed) {
+            $script:form.Hide()
+            $script:form.Dispose()
+        }
+    }
+    return
+}
+if ($PreparationRaceAudit) {
+    try {
+        $audit = Invoke-PreparationRaceAudit
         $audit | ConvertTo-Json -Depth 6 -Compress
         if (!$audit.Passed) { exit 1 }
     } finally {

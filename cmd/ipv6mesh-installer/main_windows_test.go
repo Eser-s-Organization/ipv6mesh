@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -600,6 +601,98 @@ func TestWindowsUIAsyncPollingMessagePumpAudit(t *testing.T) {
 	}
 	if !audit.Passed || audit.MessagePumpTicks < 10 || audit.WorkerStarts != 1 || audit.MaxConcurrentWorkers > 1 || audit.LateResultWrites != 0 || !audit.UiThreadApplied || !audit.SlowResultApplied || !audit.MembersRetainedOnFail {
 		t.Fatalf("async polling audit did not prove non-blocking, serialized, safe updates: %#v\n%s", audit, output)
+	}
+}
+
+func TestWindowsUIAsyncPollingAuditCanRunConcurrently(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	type result struct {
+		output []byte
+		err    error
+	}
+	results := make(chan result, 2)
+	var start sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		cmd := exec.CommandContext(
+			ctx,
+			"powershell.exe",
+			"-NoLogo",
+			"-NoProfile",
+			"-NonInteractive",
+			"-File", uiPath,
+			"-PackageDirectory", t.TempDir(),
+			"-AsyncPollingAudit",
+		)
+		start.Add(1)
+		go func() {
+			start.Done()
+			output, err := cmd.CombinedOutput()
+			results <- result{output: output, err: err}
+		}()
+	}
+	start.Wait()
+	for i := 0; i < 2; i++ {
+		got := <-results
+		if got.err != nil {
+			t.Fatalf("concurrent async polling audit %d failed: %v\n%s", i+1, got.err, got.output)
+		}
+		compact := strings.ReplaceAll(strings.ReplaceAll(string(got.output), "\r", ""), "\n", "")
+		if !strings.Contains(compact, `"Passed":true`) {
+			t.Fatalf("concurrent async polling audit %d did not complete successfully:\n%s", i+1, got.output)
+		}
+	}
+}
+
+func TestWindowsUIPreparationRaceAudit(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(
+		ctx,
+		"powershell.exe",
+		"-NoLogo",
+		"-NoProfile",
+		"-NonInteractive",
+		"-File", uiPath,
+		"-PackageDirectory", t.TempDir(),
+		"-PreparationRaceAudit",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("preparation race audit failed: %v\n%s", err, output)
+	}
+	var audit struct {
+		Passed                    bool `json:"Passed"`
+		PrimaryOperationCancelled bool `json:"PrimaryOperationCancelled"`
+		OldGenerationApplied      bool `json:"OldGenerationApplied"`
+		StaleResultDropped        bool `json:"StaleResultDropped"`
+		JoinedNetworkPreserved    bool `json:"JoinedNetworkPreserved"`
+		FailureReturnedToSetup    bool `json:"FailureReturnedToSetup"`
+		RefreshRestarted          bool `json:"RefreshRestarted"`
+	}
+	lines := strings.Split(strings.ReplaceAll(string(output), "\r", ""), "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		line := strings.TrimSpace(lines[index])
+		if strings.HasPrefix(line, "{") {
+			if err := json.Unmarshal([]byte(line), &audit); err != nil {
+				t.Fatalf("decode preparation race audit JSON: %v\n%s", err, output)
+			}
+			break
+		}
+	}
+	if !audit.Passed || !audit.PrimaryOperationCancelled || audit.OldGenerationApplied || !audit.StaleResultDropped || !audit.JoinedNetworkPreserved || !audit.FailureReturnedToSetup || !audit.RefreshRestarted {
+		t.Fatalf("preparation race audit did not prove cancellation, stale-result isolation, and refresh recovery: %#v\n%s", audit, output)
 	}
 }
 
