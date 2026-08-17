@@ -881,6 +881,72 @@ function New-Button {
     return $button
 }
 
+function New-LayoutLabel {
+    param([string]$Name, [string]$Text, [int]$FontSize = 9, [switch]$Bold)
+    $label = New-Object System.Windows.Forms.Label
+    $label.Name = $Name
+    $label.Text = $Text
+    $label.AutoSize = $true
+    $label.Anchor = [System.Windows.Forms.AnchorStyles]::Left
+    $label.Margin = New-Object System.Windows.Forms.Padding(6, 8, 6, 8)
+    $style = if ($Bold) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }
+    $label.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", $FontSize, $style)
+    return $label
+}
+
+function New-LayoutTextBox {
+    param([string]$Name, [switch]$Password, [switch]$ReadOnly)
+    $box = New-Object System.Windows.Forms.TextBox
+    $box.Name = $Name
+    $box.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $box.Margin = New-Object System.Windows.Forms.Padding(6)
+    $box.UseSystemPasswordChar = $Password
+    $box.ReadOnly = $ReadOnly
+    return $box
+}
+
+function New-LayoutButton {
+    param([string]$Name, [string]$Text, [int]$MinimumWidth = 100, [int]$MinimumHeight = 32)
+    $button = New-Object System.Windows.Forms.Button
+    $button.Name = $Name
+    $button.Text = $Text
+    $button.AutoSize = $true
+    $button.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $button.MinimumSize = New-Object System.Drawing.Size($MinimumWidth, $MinimumHeight)
+    $button.Padding = New-Object System.Windows.Forms.Padding(10, 2, 10, 2)
+    $button.Margin = New-Object System.Windows.Forms.Padding(6)
+    $button.Anchor = [System.Windows.Forms.AnchorStyles]::Left
+    return $button
+}
+
+function New-ResponsivePageGrid {
+    param([string]$Name)
+    $page = New-Object System.Windows.Forms.TableLayoutPanel
+    $page.Name = $Name
+    $page.Dock = [System.Windows.Forms.DockStyle]::Top
+    $page.AutoSize = $true
+    $page.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $page.MinimumSize = New-Object System.Drawing.Size(820, 0)
+    $page.Padding = New-Object System.Windows.Forms.Padding(20, 8, 20, 20)
+    $page.ColumnCount = 3
+    $page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 130)))
+    $page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    $page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 150)))
+    return $page
+}
+
+function Add-PageControl {
+    param(
+        [System.Windows.Forms.TableLayoutPanel]$Page,
+        [System.Windows.Forms.Control]$Control,
+        [int]$Column,
+        [int]$Row,
+        [int]$ColumnSpan = 1
+    )
+    $Page.Controls.Add($Control, $Column, $Row)
+    if ($ColumnSpan -gt 1) { $Page.SetColumnSpan($Control, $ColumnSpan) }
+}
+
 $initialIPv6 = Get-DetectedIPv6Address
 if ([string]::IsNullOrWhiteSpace($initialIPv6) -and ![string]::IsNullOrWhiteSpace($ControlUrl)) {
     try {
@@ -1012,58 +1078,81 @@ $script:operationSplit.Add_SplitterMoved({
 $script:operationSplit.Add_SizeChanged({ Set-ResponsiveSplitLayout })
 $script:form.Add_Shown({ Set-ResponsiveSplitLayout })
 
-$script:hostPanel = New-Object System.Windows.Forms.Panel
-$script:hostPanel.Location = New-Object System.Drawing.Point(0, 0)
-$script:hostPanel.Size = New-Object System.Drawing.Size(1080, 570)
-$script:hostPanel.Visible = $false
+$script:hostPanel = New-ResponsivePageGrid "HostPanel"
+$script:hostPanel.RowCount = 6
+for ($row = 0; $row -lt 6; $row++) {
+    $script:hostPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+}
 $script:operationSplit.Panel1.Controls.Add($script:hostPanel)
-$hostBackButton = New-Button "返回" 20 15 90
+
+$hostBackButton = New-LayoutButton "HostBack" "返回" 90
 $hostBackButton.Add_Click({ Show-WelcomePage })
 $script:backButtons += $hostBackButton
-$script:hostPanel.Controls.Add($hostBackButton)
-$script:hostPanel.Controls.Add((New-Label "创建网络" 135 15 300 32 18))
-$script:hostPanel.Controls.Add((New-Label "房主 IPv6：" 40 85 130 28))
-$script:ipv6AddressBox = New-TextBox 170 82 540
-$script:ipv6AddressBox.Text = $initialIPv6
-$script:hostPanel.Controls.Add($script:ipv6AddressBox)
-$detectButton = New-Button "重新检测" 730 80 120
-$detectButton.Add_Click({ $null = Refresh-LocalIPv6 })
-$script:hostPanel.Controls.Add($detectButton)
-$script:hostPanel.Controls.Add((New-Label "房主 IPv6 仅接受首选、非 SkipAsSource 的 2000::/3 全局地址。" 170 115 700 25))
-$script:hostPanel.Controls.Add((New-Label "控制面地址：" 40 160 130 28))
-$script:controlUrlBox = New-TextBox 170 157 540 -ReadOnly
-$script:hostPanel.Controls.Add($script:controlUrlBox)
-$copyHostIPv6Button = New-Button "复制房主 IPv6" 730 155 140
-$copyHostIPv6Button.Add_Click({ Copy-UiField $script:ipv6AddressBox "房主 IPv6" })
-$script:hostPanel.Controls.Add($copyHostIPv6Button)
-$script:hostVirtualIPv4Label = New-Label "房主虚拟 IPv4：未加入" 40 220 650 30 12
-$script:hostPanel.Controls.Add($script:hostVirtualIPv4Label)
-$script:hostStartButton = New-Button "创建并连接" 40 275 190 44
-$script:hostStartButton.Add_Click({ Start-HostRoom })
-$script:hostPanel.Controls.Add($script:hostStartButton)
+Add-PageControl $script:hostPanel $hostBackButton 0 0
 
-$script:memberPanel = New-Object System.Windows.Forms.Panel
-$script:memberPanel.Location = New-Object System.Drawing.Point(0, 0)
-$script:memberPanel.Size = New-Object System.Drawing.Size(1080, 570)
+$hostTitle = New-LayoutLabel "HostTitle" "创建网络" 18
+Add-PageControl $script:hostPanel $hostTitle 1 0 2
+
+Add-PageControl $script:hostPanel (New-LayoutLabel "HostIPv6Label" "房主 IPv6：") 0 1
+$script:ipv6AddressBox = New-LayoutTextBox "HostIPv6Input"
+$script:ipv6AddressBox.Text = $initialIPv6
+$script:ipv6AddressBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+Add-PageControl $script:hostPanel $script:ipv6AddressBox 1 1
+$detectButton = New-LayoutButton "HostDetect" "重新检测" 120
+$detectButton.Add_Click({ $null = Refresh-LocalIPv6 })
+Add-PageControl $script:hostPanel $detectButton 2 1
+
+$hostIPv6Help = New-LayoutLabel "HostIPv6Help" "房主 IPv6 仅接受首选、非 SkipAsSource 的 2000::/3 全局地址。"
+Add-PageControl $script:hostPanel $hostIPv6Help 1 2 2
+
+Add-PageControl $script:hostPanel (New-LayoutLabel "ControlURLLabel" "控制面地址：") 0 3
+$script:controlUrlBox = New-LayoutTextBox "ControlURL" -ReadOnly
+Add-PageControl $script:hostPanel $script:controlUrlBox 1 3
+$copyHostIPv6Button = New-LayoutButton "CopyHostIPv6" "复制房主 IPv6" 140
+$copyHostIPv6Button.Add_Click({ Copy-UiField $script:ipv6AddressBox "房主 IPv6" })
+Add-PageControl $script:hostPanel $copyHostIPv6Button 2 3
+
+$script:hostVirtualIPv4Label = New-LayoutLabel "HostVirtualIPv4" "房主虚拟 IPv4：未加入" 12 -Bold
+Add-PageControl $script:hostPanel $script:hostVirtualIPv4Label 0 4 3
+
+$script:hostStartButton = New-LayoutButton "HostStart" "创建并连接" 190 44
+$script:hostStartButton.Add_Click({ Start-HostRoom })
+Add-PageControl $script:hostPanel $script:hostStartButton 0 5 3
+
+$script:memberPanel = New-ResponsivePageGrid "MemberPanel"
+$script:memberPanel.RowCount = 6
+for ($row = 0; $row -lt 6; $row++) {
+    $script:memberPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+}
 $script:memberPanel.Visible = $false
 $script:operationSplit.Panel1.Controls.Add($script:memberPanel)
-$memberBackButton = New-Button "返回" 20 15 90
+
+$memberBackButton = New-LayoutButton "MemberBack" "返回" 90
 $memberBackButton.Add_Click({ Show-WelcomePage })
 $script:backButtons += $memberBackButton
-$script:memberPanel.Controls.Add($memberBackButton)
-$script:memberPanel.Controls.Add((New-Label "加入网络" 135 15 300 32 18))
-$script:memberPanel.Controls.Add((New-Label "房主 IPv6：" 40 85 130 28))
-$script:memberHostIPv6Box = New-TextBox 170 82 680
-$script:memberPanel.Controls.Add($script:memberHostIPv6Box)
-$script:memberPanel.Controls.Add((New-Label "成员只需输入房主 IPv6；地址必须是 2000::/3 全局 IPv6。" 170 115 700 25))
-$script:memberPanel.Controls.Add((New-Label "本机名称：" 40 160 130 28))
-$script:memberNameLabel = New-Label ([string]$env:COMPUTERNAME) 170 160 500 28
-$script:memberPanel.Controls.Add($script:memberNameLabel)
-$script:memberVirtualIPv4Label = New-Label "本机虚拟 IPv4：未加入" 40 220 650 30 12
-$script:memberPanel.Controls.Add($script:memberVirtualIPv4Label)
-$script:memberJoinButton = New-Button "加入并连接" 40 275 190 44
+Add-PageControl $script:memberPanel $memberBackButton 0 0
+
+$memberTitle = New-LayoutLabel "MemberTitle" "加入网络" 18
+Add-PageControl $script:memberPanel $memberTitle 1 0 2
+
+Add-PageControl $script:memberPanel (New-LayoutLabel "MemberHostIPv6Label" "房主 IPv6：") 0 1
+$script:memberHostIPv6Box = New-LayoutTextBox "MemberHostIPv6Input"
+$script:memberHostIPv6Box.Dock = [System.Windows.Forms.DockStyle]::Fill
+Add-PageControl $script:memberPanel $script:memberHostIPv6Box 1 1 2
+
+$memberIPv6Help = New-LayoutLabel "MemberIPv6Help" "成员只需输入房主 IPv6；地址必须是 2000::/3 全局 IPv6。"
+Add-PageControl $script:memberPanel $memberIPv6Help 1 2 2
+
+Add-PageControl $script:memberPanel (New-LayoutLabel "MemberNameCaption" "本机名称：") 0 3
+$script:memberNameLabel = New-LayoutLabel "MemberName" ([string]$env:COMPUTERNAME)
+Add-PageControl $script:memberPanel $script:memberNameLabel 1 3 2
+
+$script:memberVirtualIPv4Label = New-LayoutLabel "MemberVirtualIPv4" "本机虚拟 IPv4：未加入" 12 -Bold
+Add-PageControl $script:memberPanel $script:memberVirtualIPv4Label 0 4 3
+
+$script:memberJoinButton = New-LayoutButton "MemberJoin" "加入并连接" 190 44
 $script:memberJoinButton.Add_Click({ Join-MemberRoom })
-$script:memberPanel.Controls.Add($script:memberJoinButton)
+Add-PageControl $script:memberPanel $script:memberJoinButton 0 5 3
 
 $script:diagnosticsPanel = New-Object System.Windows.Forms.GroupBox
 $script:diagnosticsPanel.Text = "诊断与日志"

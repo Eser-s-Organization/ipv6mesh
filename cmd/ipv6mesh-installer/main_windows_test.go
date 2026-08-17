@@ -379,6 +379,44 @@ func TestWindowsUIUsesManagedOperationShell(t *testing.T) {
 	}
 }
 
+func TestWindowsUIOperationPagesUseResponsiveGrids(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	uiScript, err := os.ReadFile(uiPath)
+	if err != nil {
+		t.Fatalf("read UI script: %v", err)
+	}
+	contents := string(uiScript)
+	for _, required := range []string{
+		`function New-ResponsivePageGrid`,
+		`$script:hostPanel = New-ResponsivePageGrid "HostPanel"`,
+		`$script:memberPanel = New-ResponsivePageGrid "MemberPanel"`,
+		`$page.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))`,
+		`$page.MinimumSize = New-Object System.Drawing.Size(820, 0)`,
+		`$script:ipv6AddressBox.Dock = [System.Windows.Forms.DockStyle]::Fill`,
+		`$script:memberHostIPv6Box.Dock = [System.Windows.Forms.DockStyle]::Fill`,
+		`$script:operationSplit.Panel1.AutoScroll = $true`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Errorf("UI missing responsive operation-page behavior %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		`New-TextBox 170 82`,
+		`New-Button "创建并连接" 40 275`,
+		`New-Button "加入并连接" 40 275`,
+		`$script:hostPanel.Size = New-Object System.Drawing.Size(1080, 570)`,
+		`$script:memberPanel.Size = New-Object System.Drawing.Size(1080, 570)`,
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("UI retains fixed operation-page layout %q", forbidden)
+		}
+	}
+}
+
 func TestWindowsUIStatusLogDecision(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
