@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -27,13 +28,25 @@ var (
 type Command string
 
 const (
-	CommandStatus     Command = "status"
-	CommandJoin       Command = "join"
-	CommandJoinRoom   Command = "join_room"
-	CommandLeave      Command = "leave"
-	CommandConnect    Command = "connect"
-	CommandDisconnect Command = "disconnect"
+	CommandStatus      Command = "status"
+	CommandJoin        Command = "join"
+	CommandJoinRoom    Command = "join_room"
+	CommandLeave       Command = "leave"
+	CommandConnect     Command = "connect"
+	CommandDisconnect  Command = "disconnect"
+	CommandRoomMembers Command = "room_members"
 )
+
+type RoomMemberState string
+
+const RoomMemberOnline RoomMemberState = "online"
+
+type RoomMember struct {
+	DisplayName string          `json:"display_name"`
+	VirtualIPv4 string          `json:"virtual_ipv4"`
+	IsLocal     bool            `json:"is_local"`
+	State       RoomMemberState `json:"state"`
+}
 
 type PathState string
 
@@ -80,7 +93,8 @@ type Error struct {
 type Response struct {
 	OK bool `json:"ok"`
 	Status
-	Error *Error `json:"error,omitempty"`
+	Members []RoomMember `json:"members,omitempty"`
+	Error   *Error       `json:"error,omitempty"`
 }
 
 func SuccessResponse(status Status) Response {
@@ -95,6 +109,18 @@ func ErrorResponse(code string) Response {
 		code = CodeInternal
 	}
 	return Response{Error: &Error{Code: code}}
+}
+
+func SuccessMembersResponse(networkID string, members []RoomMember) Response {
+	copyMembers := append([]RoomMember(nil), members...)
+	return Response{
+		OK: true,
+		Status: Status{
+			NetworkID: networkID,
+			PathState: PathStateDisconnected,
+		},
+		Members: copyMembers,
+	}
 }
 
 func MarshalRequest(request Request) ([]byte, error) {
@@ -128,7 +154,7 @@ func DecodeRequest(data []byte) (Request, error) {
 	request.Type = Command(command)
 	allowed := map[string]bool{"type": true}
 	switch request.Type {
-	case CommandStatus:
+	case CommandStatus, CommandRoomMembers:
 	case CommandJoin:
 		allowed["invite"], allowed["display_name"] = true, true
 		if err := decodeStringField(fields, "invite", &request.Invite); err != nil {
@@ -171,6 +197,9 @@ func MarshalResponse(response Response) ([]byte, error) {
 	if !response.OK && response.Error == nil {
 		return nil, ErrInvalidResponse
 	}
+	if !response.OK && response.Members != nil {
+		return nil, ErrInvalidResponse
+	}
 	status := response.Status
 	if status.PathState == "" {
 		status.PathState = PathStateDisconnected
@@ -187,6 +216,17 @@ func MarshalResponse(response Response) ([]byte, error) {
 	}
 	if status.LastError != "" {
 		fields["last_error"] = status.LastError
+	}
+	if response.Members != nil {
+		if strings.TrimSpace(status.NetworkID) == "" {
+			return nil, ErrInvalidResponse
+		}
+		for _, member := range response.Members {
+			if err := validateRoomMember(member); err != nil {
+				return nil, errors.Join(ErrInvalidResponse, err)
+			}
+		}
+		fields["members"] = response.Members
 	}
 	if response.Error != nil {
 		fields["error"] = response.Error
@@ -210,7 +250,7 @@ func DecodeResponse(data []byte) (Response, error) {
 	if err := decodeBoolField(fields, "ok", &response.OK); err != nil {
 		return Response{}, errors.Join(ErrInvalidResponse, err)
 	}
-	allowed := map[string]bool{"ok": true, "network_id": true, "virtual_ipv4": true, "path_state": true, "last_handshake": true, "last_error": true, "config_generation": true, "error": true}
+	allowed := map[string]bool{"ok": true, "network_id": true, "virtual_ipv4": true, "path_state": true, "last_handshake": true, "last_error": true, "config_generation": true, "members": true, "error": true}
 	for name := range fields {
 		if !allowed[name] {
 			return Response{}, errors.Join(ErrInvalidResponse, fmt.Errorf("unknown field %q", name))
@@ -248,6 +288,16 @@ func DecodeResponse(data []byte) (Response, error) {
 			return Response{}, errors.Join(ErrInvalidResponse, err)
 		}
 	}
+	if raw, ok := fields["members"]; ok {
+		if !response.OK {
+			return Response{}, errors.Join(ErrInvalidResponse, errors.New("members are only valid on success responses"))
+		}
+		members, err := decodeRoomMembers(raw)
+		if err != nil {
+			return Response{}, errors.Join(ErrInvalidResponse, err)
+		}
+		response.Members = members
+	}
 	if raw, ok := fields["error"]; ok {
 		var value map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &value); err != nil || value == nil {
@@ -281,7 +331,7 @@ func DecodeResponse(data []byte) (Response, error) {
 
 func validateRequest(request Request) error {
 	switch request.Type {
-	case CommandStatus:
+	case CommandStatus, CommandRoomMembers:
 		if request.Invite != "" || request.DisplayName != "" || request.ControlURL != "" || request.NetworkID != "" {
 			return errors.New("status has no arguments")
 		}
@@ -304,6 +354,91 @@ func validateRequest(request Request) error {
 		return errors.New("unsupported command")
 	}
 	return nil
+}
+
+func validateRoomMember(member RoomMember) error {
+	if strings.TrimSpace(member.DisplayName) == "" {
+		return errors.New("room member display_name is required")
+	}
+	if net.ParseIP(member.VirtualIPv4).To4() == nil {
+		return errors.New("room member virtual_ipv4 must be IPv4")
+	}
+	if member.State != RoomMemberOnline {
+		return errors.New("room member state must be online")
+	}
+	return nil
+}
+
+func decodeRoomMember(raw json.RawMessage) (RoomMember, error) {
+	fields, err := decodeObject(raw, true)
+	if err != nil {
+		return RoomMember{}, err
+	}
+	allowed := map[string]bool{"display_name": true, "virtual_ipv4": true, "is_local": true, "state": true}
+	for name := range fields {
+		if !allowed[name] {
+			return RoomMember{}, fmt.Errorf("unknown room member field %q", name)
+		}
+	}
+	var member RoomMember
+	if err := decodeStringField(fields, "display_name", &member.DisplayName); err != nil {
+		return RoomMember{}, err
+	}
+	if err := decodeStringField(fields, "virtual_ipv4", &member.VirtualIPv4); err != nil {
+		return RoomMember{}, err
+	}
+	if raw, ok := fields["is_local"]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return RoomMember{}, errors.New("missing or null room member is_local")
+	} else if err := json.Unmarshal(raw, &member.IsLocal); err != nil {
+		return RoomMember{}, err
+	}
+	var state string
+	if err := decodeStringField(fields, "state", &state); err != nil {
+		return RoomMember{}, err
+	}
+	member.State = RoomMemberState(state)
+	if err := validateRoomMember(member); err != nil {
+		return RoomMember{}, err
+	}
+	return member, nil
+}
+
+func decodeRoomMembers(raw json.RawMessage) ([]RoomMember, error) {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, errors.New("members cannot be null")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	first, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	delim, ok := first.(json.Delim)
+	if !ok || delim != '[' {
+		return nil, errors.New("members array required")
+	}
+	members := make([]RoomMember, 0)
+	for decoder.More() {
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		member, err := decodeRoomMember(value)
+		if err != nil {
+			return nil, err
+		}
+		members = append(members, member)
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("trailing JSON value")
+		}
+		return nil, err
+	}
+	return members, nil
 }
 
 func decodeObject(data []byte, rejectTrailing bool) (map[string]json.RawMessage, error) {
