@@ -5,7 +5,9 @@ package service
 import (
 	"context"
 	"errors"
+	"net"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 
@@ -29,6 +31,7 @@ type JoinRequest struct {
 }
 
 type JoinResult struct {
+	DisplayName      string
 	NetworkID        string
 	VirtualIPv4      string
 	ConfigGeneration int64
@@ -200,6 +203,8 @@ func (service *Service) Handle(ctx context.Context, request ipc.Request) ipc.Res
 		return service.join(ctx, request)
 	case ipc.CommandJoinRoom:
 		return service.joinRoom(ctx, request)
+	case ipc.CommandRoomMembers:
+		return service.roomMembers(ctx)
 	case ipc.CommandLeave:
 		return service.leave(ctx, request.NetworkID)
 	case ipc.CommandConnect:
@@ -224,8 +229,9 @@ func (service *Service) join(ctx context.Context, request ipc.Request) ipc.Respo
 	}
 	result, err := controlClient.Join(ctx, JoinRequest{Invite: request.Invite, DisplayName: request.DisplayName, PublicKey: publicKey})
 	if err != nil {
-		return ipc.ErrorResponse(CodeControlFailed)
+		return ipc.ErrorResponse(safeControlErrorCode(err))
 	}
+	result.DisplayName = request.DisplayName
 	return service.finishJoin(ctx, result)
 }
 
@@ -253,20 +259,36 @@ func (service *Service) joinRoom(ctx context.Context, request ipc.Request) ipc.R
 	if err != nil {
 		return ipc.ErrorResponse(safeRoomControlErrorCode(err))
 	}
+	result.DisplayName = request.DisplayName
 	return service.finishJoin(ctx, result)
 }
 
 func safeRoomControlErrorCode(err error) string {
 	var httpErr *control.HTTPError
-	if !errors.As(err, &httpErr) {
-		return CodeControlFailed
+	if errors.As(err, &httpErr) {
+		switch httpErr.Code {
+		case "room_not_ready", "room_mode_disabled", "node_already_joined", "room_full", "join_rate_limited", "enrollment_recovery_pending":
+			return httpErr.Code
+		default:
+			return CodeControlFailed
+		}
 	}
-	switch httpErr.Code {
-	case "room_not_ready", "room_mode_disabled", "node_already_joined", "room_full", "join_rate_limited", "enrollment_recovery_pending":
-		return httpErr.Code
-	default:
-		return CodeControlFailed
+	return safeControlErrorCode(err)
+}
+
+func safeControlErrorCode(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ipc.CodeOperationTimeout
 	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return ipc.CodeOperationTimeout
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return ipc.CodeControlUnreachable
+	}
+	return CodeControlFailed
 }
 
 func (service *Service) finishJoin(ctx context.Context, result JoinResult) ipc.Response {
@@ -339,13 +361,80 @@ func (service *Service) leave(ctx context.Context, networkID string) ipc.Respons
 		return ipc.ErrorResponse(CodeControlFailed)
 	}
 	if err := controlClient.Leave(ctx, networkID); err != nil {
-		return ipc.ErrorResponse(CodeControlFailed)
+		return ipc.ErrorResponse(safeControlErrorCode(err))
 	}
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	service.joined = nil
 	service.status = ipc.Status{PathState: ipc.PathStateDisconnected}
 	return ipc.SuccessResponse(service.status)
+}
+
+func (service *Service) roomMembers(ctx context.Context) ipc.Response {
+	service.mu.RLock()
+	if service.joined == nil {
+		service.mu.RUnlock()
+		return ipc.ErrorResponse(CodeNotJoined)
+	}
+	joined := *service.joined
+	controlClient := service.options.Control
+	status := service.status
+	service.mu.RUnlock()
+
+	snapshotClient, ok := controlClient.(SnapshotClient)
+	if !ok {
+		return ipc.ErrorResponse(CodeControlFailed)
+	}
+	snapshot, err := snapshotClient.Snapshot(ctx, joined.NetworkID)
+	if err != nil {
+		return ipc.ErrorResponse(safeControlErrorCode(err))
+	}
+	members, err := projectRoomMembers(joined, snapshot)
+	if err != nil {
+		return ipc.ErrorResponse(CodeControlFailed)
+	}
+	response := ipc.SuccessMembersResponse(joined.NetworkID, members)
+	response.Status = status
+	return response
+}
+
+func projectRoomMembers(joined JoinResult, snapshot control.NetworkSnapshot) ([]ipc.RoomMember, error) {
+	joinedName := strings.TrimSpace(joined.DisplayName)
+	joinedIP := net.ParseIP(strings.TrimSpace(joined.VirtualIPv4)).To4()
+	if joinedName == "" || strings.TrimSpace(joined.NetworkID) == "" || joinedIP == nil {
+		return nil, errors.New("invalid joined membership")
+	}
+	if snapshot.NetworkID != joined.NetworkID {
+		return nil, errors.New("snapshot network mismatch")
+	}
+	localIP := snapshot.LocalVirtualIPv4.To4()
+	if localIP == nil || !localIP.Equal(joinedIP) {
+		return nil, errors.New("snapshot local address mismatch")
+	}
+	members := make([]ipc.RoomMember, 0, len(snapshot.Peers)+1)
+	members = append(members, ipc.RoomMember{DisplayName: joinedName, VirtualIPv4: joinedIP.String(), IsLocal: true, State: ipc.RoomMemberOnline})
+	for _, peer := range snapshot.Peers {
+		name := strings.TrimSpace(peer.DisplayName)
+		ip := peer.VirtualIPv4.To4()
+		if name == "" || ip == nil {
+			return nil, errors.New("invalid peer member")
+		}
+		members = append(members, ipc.RoomMember{DisplayName: name, VirtualIPv4: ip.String(), State: ipc.RoomMemberOnline})
+	}
+	sort.SliceStable(members, func(i, j int) bool {
+		if members[i].IsLocal != members[j].IsLocal {
+			return members[i].IsLocal
+		}
+		leftName, rightName := strings.ToLower(members[i].DisplayName), strings.ToLower(members[j].DisplayName)
+		if leftName != rightName {
+			return leftName < rightName
+		}
+		if members[i].VirtualIPv4 != members[j].VirtualIPv4 {
+			return members[i].VirtualIPv4 < members[j].VirtualIPv4
+		}
+		return members[i].DisplayName < members[j].DisplayName
+	})
+	return members, nil
 }
 
 func (service *Service) connect(ctx context.Context, networkID string) ipc.Response {

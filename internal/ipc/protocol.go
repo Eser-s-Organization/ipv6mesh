@@ -57,15 +57,17 @@ const (
 )
 
 const (
-	CodeInvalidRequest = "invalid_request"
-	CodeUnauthorized   = "unauthorized"
-	CodeAlreadyJoined  = "already_joined"
-	CodeNotJoined      = "not_joined"
-	CodeWrongNetwork   = "wrong_network"
-	CodeNotStarted     = "not_started"
-	CodeControlFailed  = "control_failed"
-	CodeAdapterFailed  = "adapter_failed"
-	CodeInternal       = "internal_error"
+	CodeInvalidRequest     = "invalid_request"
+	CodeUnauthorized       = "unauthorized"
+	CodeAlreadyJoined      = "already_joined"
+	CodeNotJoined          = "not_joined"
+	CodeWrongNetwork       = "wrong_network"
+	CodeNotStarted         = "not_started"
+	CodeControlFailed      = "control_failed"
+	CodeControlUnreachable = "control_unreachable"
+	CodeOperationTimeout   = "operation_timeout"
+	CodeAdapterFailed      = "adapter_failed"
+	CodeInternal           = "internal_error"
 )
 
 type Request struct {

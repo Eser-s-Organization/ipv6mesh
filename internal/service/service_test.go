@@ -1,10 +1,13 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
 	"net/http"
+	"net/url"
+	"reflect"
 	"testing"
 
 	"github.com/Eser-s-Organization/ipv6mesh/internal/control"
@@ -32,6 +35,7 @@ type fakeControlClient struct {
 	leaveErr       error
 	snapshot       control.NetworkSnapshot
 	snapshotErr    error
+	snapshotCalls  int
 }
 
 func (client *fakeControlClient) Join(context.Context, JoinRequest) (JoinResult, error) {
@@ -50,6 +54,7 @@ func (client *fakeControlClient) Leave(context.Context, string) error {
 }
 
 func (client *fakeControlClient) Snapshot(context.Context, string) (control.NetworkSnapshot, error) {
+	client.snapshotCalls++
 	return client.snapshot, client.snapshotErr
 }
 
@@ -146,6 +151,152 @@ func TestServiceJoinsRoomWithoutInvite(t *testing.T) {
 	})
 	if !response.OK || response.NetworkID != "room-1" || controlClient.roomJoinCalls != 1 {
 		t.Fatalf("room join response=%#v calls=%d", response, controlClient.roomJoinCalls)
+	}
+}
+
+func TestServiceRoomMembersProjectsLocalAndPeersWithoutSensitiveFields(t *testing.T) {
+	controlClient := &fakeControlClient{
+		roomJoinResult: JoinResult{DisplayName: "HOST-PC", NetworkID: "room-1", VirtualIPv4: "10.42.0.2", ConfigGeneration: 3},
+		snapshot: control.NetworkSnapshot{
+			NetworkID: "room-1", Generation: 3, LocalNodeID: "host-id", LocalVirtualIPv4: net.ParseIP("10.42.0.2"),
+			Peers: []control.Peer{
+				{NodeID: "peer-z", DisplayName: "alice", PublicKey: "must-not-leak", VirtualIPv4: net.ParseIP("10.42.0.4"), Endpoints: []control.EndpointCandidate{{Address: net.ParseIP("2001:db8::4"), Port: 51820}}},
+				{NodeID: "peer-a", DisplayName: "Alice", PublicKey: "must-not-leak", VirtualIPv4: net.ParseIP("10.42.0.3")},
+			},
+		},
+	}
+	service := New(Options{Identity: &fakeIdentityStore{identity: identity.Identity{PublicKey: "public-key"}}, Control: controlClient, ControlURL: "http://[2001:db8::1]:8080"})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	joined := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandJoinRoom, ControlURL: "http://[2001:db8::1]:8080", DisplayName: "HOST-PC"})
+	if !joined.OK {
+		t.Fatalf("join = %#v", joined)
+	}
+
+	response := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandRoomMembers})
+	if !response.OK || response.NetworkID != "room-1" || len(response.Members) != 3 {
+		t.Fatalf("members = %#v", response)
+	}
+	want := []ipc.RoomMember{
+		{DisplayName: "HOST-PC", VirtualIPv4: "10.42.0.2", IsLocal: true, State: ipc.RoomMemberOnline},
+		{DisplayName: "Alice", VirtualIPv4: "10.42.0.3", State: ipc.RoomMemberOnline},
+		{DisplayName: "alice", VirtualIPv4: "10.42.0.4", State: ipc.RoomMemberOnline},
+	}
+	if !reflect.DeepEqual(response.Members, want) {
+		t.Fatalf("members = %#v, want %#v", response.Members, want)
+	}
+	if controlClient.snapshotCalls != 1 {
+		t.Fatalf("snapshot calls = %d, want 1", controlClient.snapshotCalls)
+	}
+	encoded, err := ipc.MarshalResponse(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"peer-z", "must-not-leak", "2001:db8::4", "session"} {
+		if bytes.Contains(encoded, []byte(forbidden)) {
+			t.Fatalf("leaked %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+type timeoutNetError struct{}
+
+func (timeoutNetError) Error() string   { return "timeout" }
+func (timeoutNetError) Timeout() bool   { return true }
+func (timeoutNetError) Temporary() bool { return true }
+
+func joinedRoomServiceForMembers(t *testing.T, snapshotErr error) *Service {
+	t.Helper()
+	controlClient := &fakeControlClient{
+		roomJoinResult: JoinResult{DisplayName: "MEMBER-PC", NetworkID: "room-1", VirtualIPv4: "10.42.0.2", ConfigGeneration: 2},
+		snapshot: control.NetworkSnapshot{
+			NetworkID: "room-1", Generation: 2, LocalNodeID: "local", LocalVirtualIPv4: net.ParseIP("10.42.0.2"),
+		},
+		snapshotErr: snapshotErr,
+	}
+	service := New(Options{
+		Identity:   &fakeIdentityStore{identity: identity.Identity{PublicKey: "public-key"}},
+		Control:    controlClient,
+		ControlURL: "http://[2001:db8::1]:8080",
+	})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	response := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandJoinRoom, ControlURL: "http://[2001:db8::1]:8080", DisplayName: "MEMBER-PC"})
+	if !response.OK {
+		t.Fatalf("join = %#v", response)
+	}
+	return service
+}
+
+func TestServiceRoomMembersMapsSafeErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "deadline", err: context.DeadlineExceeded, want: ipc.CodeOperationTimeout},
+		{name: "url timeout", err: &url.Error{Op: "Get", URL: "http://[2001:db8::1]:8080", Err: timeoutNetError{}}, want: ipc.CodeOperationTimeout},
+		{name: "unreachable", err: &url.Error{Op: "Get", URL: "http://[2001:db8::1]:8080", Err: errors.New("no route")}, want: ipc.CodeControlUnreachable},
+		{name: "http", err: &control.HTTPError{StatusCode: http.StatusBadGateway}, want: CodeControlFailed},
+		{name: "unknown", err: errors.New("secret detail"), want: CodeControlFailed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := joinedRoomServiceForMembers(t, test.err)
+			response := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandRoomMembers})
+			if response.OK || response.Error == nil || response.Error.Code != test.want || response.Error.Message != "" {
+				t.Fatalf("response = %#v", response)
+			}
+		})
+	}
+}
+
+func TestServiceRoomMembersRejectsInvalidSnapshotAndClearsAfterLeave(t *testing.T) {
+	controlClient := &fakeControlClient{
+		roomJoinResult: JoinResult{DisplayName: "MEMBER-PC", NetworkID: "room-1", VirtualIPv4: "10.42.0.2", ConfigGeneration: 2},
+		snapshot:       control.NetworkSnapshot{NetworkID: "other-room", Generation: 2, LocalNodeID: "local", LocalVirtualIPv4: net.ParseIP("10.42.0.2")},
+	}
+	service := New(Options{Identity: &fakeIdentityStore{identity: identity.Identity{PublicKey: "public-key"}}, Control: controlClient, ControlURL: "http://[2001:db8::1]:8080"})
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	notJoined := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandRoomMembers})
+	if notJoined.OK || notJoined.Error == nil || notJoined.Error.Code != CodeNotJoined {
+		t.Fatalf("not joined response = %#v", notJoined)
+	}
+	joined := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandJoinRoom, ControlURL: "http://[2001:db8::1]:8080", DisplayName: "MEMBER-PC"})
+	if !joined.OK {
+		t.Fatalf("join = %#v", joined)
+	}
+	invalid := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandRoomMembers})
+	if invalid.OK || invalid.Error == nil || invalid.Error.Code != CodeControlFailed {
+		t.Fatalf("invalid snapshot response = %#v", invalid)
+	}
+	controlClient.snapshot = control.NetworkSnapshot{NetworkID: "room-1", Generation: 2, LocalNodeID: "local", LocalVirtualIPv4: net.ParseIP("10.42.0.2"), Peers: []control.Peer{{DisplayName: "", VirtualIPv4: net.ParseIP("10.42.0.3")}}}
+	emptyName := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandRoomMembers})
+	if emptyName.OK || emptyName.Error == nil || emptyName.Error.Code != CodeControlFailed {
+		t.Fatalf("empty peer response = %#v", emptyName)
+	}
+	controlClient.snapshot = control.NetworkSnapshot{NetworkID: "room-1", Generation: 2, LocalNodeID: "local", LocalVirtualIPv4: net.ParseIP("10.42.0.2"), Peers: []control.Peer{{DisplayName: "peer", VirtualIPv4: net.ParseIP("2001:db8::3")}}}
+	invalidIPv4 := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandRoomMembers})
+	if invalidIPv4.OK || invalidIPv4.Error == nil || invalidIPv4.Error.Code != CodeControlFailed {
+		t.Fatalf("invalid peer IPv4 response = %#v", invalidIPv4)
+	}
+	controlClient.snapshot = control.NetworkSnapshot{NetworkID: "room-1", Generation: 2, LocalNodeID: "local", LocalVirtualIPv4: net.ParseIP("10.42.0.2")}
+	before := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandStatus})
+	members := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandRoomMembers})
+	if !members.OK || before.NetworkID != members.NetworkID || before.VirtualIPv4 != members.VirtualIPv4 || before.PathState != members.PathState {
+		t.Fatalf("members changed status: before=%#v members=%#v", before, members)
+	}
+	left := service.Handle(context.Background(), ipc.Request{Type: ipc.CommandLeave, NetworkID: "room-1"})
+	if !left.OK {
+		t.Fatalf("leave = %#v", left)
+	}
+	notJoined = service.Handle(context.Background(), ipc.Request{Type: ipc.CommandRoomMembers})
+	if notJoined.OK || notJoined.Error == nil || notJoined.Error.Code != CodeNotJoined {
+		t.Fatalf("after leave response = %#v", notJoined)
 	}
 }
 
