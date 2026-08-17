@@ -213,6 +213,66 @@ func TestWindowsDocumentationDescribesPersistentLiveDiagnostics(t *testing.T) {
 	}
 }
 
+func TestWindowsDocumentationDescribesReliableRoomMembers(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	repositoryRoot := filepath.Join(filepath.Dir(sourceFile), "..", "..")
+	rootBytes, err := os.ReadFile(filepath.Join(repositoryRoot, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	windowsBytes, err := os.ReadFile(filepath.Join(repositoryRoot, "packaging", "windows", "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := strings.ToLower(strings.Join(strings.Fields(string(rootBytes)), " "))
+	windows := strings.Join(strings.Fields(string(windowsBytes)), " ")
+	rootRequired := []string{
+		"room members", "display name", "virtual ipv4", "online", "wide window", "right-hand member column", "narrow window", "stacked", "cannot be active at the same time", "end the room", "leave the room", "/healthz", "control_unreachable", "operation_timeout", "does not automatically retry", "does not show an offline transition", "does not restore",
+	}
+	for _, required := range rootRequired {
+		if !strings.Contains(root, required) {
+			t.Errorf("README.md missing room reliability statement %q", required)
+		}
+	}
+	windowsRequired := []string{
+		"房间成员", "名称", "虚拟 IPv4", "在线", "宽窗口", "右侧成员栏", "窄窗口", "成员列表下移", "不能同时", "处于活动状态", "结束房间", "离开房间", "/healthz", "control_unreachable", "operation_timeout", "不会自动重试", "不显示离线", "不会自动恢复",
+	}
+	for _, required := range windowsRequired {
+		if !strings.Contains(windows, required) {
+			t.Errorf("packaging/windows/README.md missing room reliability statement %q", required)
+		}
+	}
+	rootMembersStart := strings.Index(root, "live room member list")
+	windowsLower := strings.ToLower(windows)
+	windowsMembersStart := strings.Index(windows, "房间成员列表")
+	rootMembersEnd := -1
+	if rootMembersStart >= 0 {
+		rootMembersEnd = strings.Index(root[rootMembersStart:], "opening the ui")
+	}
+	windowsMembersEnd := -1
+	if windowsMembersStart >= 0 {
+		windowsMembersEnd = strings.Index(windowsLower[windowsMembersStart:], "the room endpoint")
+	}
+	if rootMembersStart < 0 || rootMembersEnd < 0 || windowsMembersStart < 0 || windowsMembersEnd < 0 {
+		t.Fatal("member-list documentation sections not found")
+	}
+	rootMembers := root[rootMembersStart : rootMembersStart+rootMembersEnd]
+	windowsMembers := windows[windowsMembersStart : windowsMembersStart+windowsMembersEnd]
+	for _, forbidden := range []string{"token", "invite", "public key", "endpoint", "administrator"} {
+		if strings.Contains(rootMembers, forbidden) {
+			t.Errorf("README.md member list exposes forbidden field %q", forbidden)
+		}
+	}
+	for _, forbidden := range []string{"令牌", "邀请", "公钥", "endpoint", "管理员"} {
+		if strings.Contains(windowsMembers, forbidden) {
+			t.Errorf("packaging/windows/README.md member list exposes forbidden field %q", forbidden)
+		}
+	}
+}
+
 func TestWindowsUIUsesRoomWorkflowAndActionableHealthCheck(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {

@@ -50,6 +50,8 @@ http://[<ipv6>]:8080。IPv4、ULA、link-local、loopback、multicast、未指�
 - 每个控制面进程最多维护一个活动房间；
 - 未创建房间或 room mode 未开启时，公开 join 返回稳定的 room_not_ready 或
   room_mode_disabled 错误；
+- 成员加入前 UI 会先检查房主 `/healthz`；`control_unreachable` 表示确认房主窗口
+  和 TCP 8080，`operation_timeout` 表示检查网络后再重试；不要复制原始错误正文；
 - 公开 join 按来源 IPv4 和全局窗口限流，并限制请求体大小；
 - 每次 join 内部创建短期 invitation，复用既有 enrollment 事务；invitation 不
   通过 room API 返回；

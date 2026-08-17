@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/Eser-s-Organization/ipv6mesh/internal/control"
@@ -55,6 +56,9 @@ func TestRoomLifecycleEnrollsHostAndMemberWithoutVisibleInvites(t *testing.T) {
 	if host.Membership.VirtualIPv4.Equal(member.Membership.VirtualIPv4) {
 		t.Fatalf("duplicate virtual IPv4: %s", host.Membership.VirtualIPv4)
 	}
+	if got, want := []string{host.Node.DisplayName, member.Node.DisplayName}, []string{"HOST", "MEMBER"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("names = %v, want %v", got, want)
+	}
 	if host.SessionToken == "" || member.SessionToken == "" {
 		t.Fatal("room enrollment did not return node sessions")
 	}
@@ -69,6 +73,19 @@ func TestRoomLifecycleEnrollsHostAndMemberWithoutVisibleInvites(t *testing.T) {
 	}
 	if len(hostSnapshot.Peers) != 1 || len(memberSnapshot.Peers) != 1 {
 		t.Fatalf("peer counts: host=%d member=%d", len(hostSnapshot.Peers), len(memberSnapshot.Peers))
+	}
+	if hostSnapshot.Peers[0].DisplayName != "MEMBER" || !hostSnapshot.Peers[0].VirtualIPv4.Equal(member.Membership.VirtualIPv4) {
+		t.Fatalf("host members = %#v", hostSnapshot.Peers)
+	}
+	if err := client.Leave(context.Background(), roomNetwork.ID, member.Node.ID, member.SessionToken); err != nil {
+		t.Fatal(err)
+	}
+	hostSnapshot, err = client.Snapshot(context.Background(), roomNetwork.ID, host.SessionToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hostSnapshot.Peers) != 0 {
+		t.Fatalf("member survived leave: %#v", hostSnapshot.Peers)
 	}
 }
 

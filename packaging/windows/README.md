@@ -42,6 +42,21 @@ case the host create action stays unavailable until a valid host address is foun
 but the member page remains usable for entering the host's IPv6. Closing the host
 ends the in-memory room; reopening creates a new room.
 
+### 房间成员列表
+
+加入成功后，创建页和加入页都会显示房间成员列表，列出每个成员的**名称**、
+**虚拟 IPv4**和固定状态**在线**。宽窗口使用设置区右侧的**右侧成员栏**；
+窄窗口把成员列表下移到设置区下方、诊断区上方。成员列表复用每两秒一次的
+状态刷新；临时读取失败时保留上一次成功的成员行。
+
+成员安装节点服务前，UI 会先请求房主 `/healthz`。创建模式和加入模式不能同时
+处于活动状态：房主必须先点击**结束房间**，成员必须先点击**离开房间**，然后
+才能选择另一种模式。第二个 UI 进程会被拒绝；关闭房主窗口仍会结束内存房间。
+
+房间流程不会自动重试、不显示离线状态，也不会自动恢复上一次房间。
+遇到 `control_unreachable` 时确认房主窗口和 TCP 8080；遇到
+`operation_timeout` 时检查网络后再重试。
+
 The room endpoint is derived as `http://[host-ipv6]:8080`. The host must allow TCP
 8080, both nodes must allow WireGuard UDP 51820, and the host's global IPv6 must be
 reachable from the member. The normal UI never displays internal bootstrap tokens,

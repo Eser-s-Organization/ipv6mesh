@@ -40,6 +40,26 @@ and does not require an administrator token, a Network ID, or an invitation toke
 7. The host must allow TCP 8080 to the control plane and both peers must allow
    WireGuard UDP 51820. The host and member must have reachable global IPv6.
 
+### Live room member list
+
+After a successful join, both operation pages show a live room members list with
+each display name, virtual IPv4, and the fixed state **online**. On a wide window
+the list is a right-hand member column beside the settings; on a narrow window it
+uses a stacked layout below the settings and above diagnostics. The list refreshes
+with the existing two-second status poll and keeps the last successful rows during
+a transient read failure.
+
+Before a member service installation, the UI checks the host `/healthz` path.
+The host and member modes cannot be active at the same time: the host must **end
+the room**, and the member must **leave the room**, before selecting the other
+mode. A second UI process is rejected, and closing the host still ends the
+in-memory room.
+
+The room flow does not automatically retry, does not show an offline transition,
+and does not restore a previous room. For a safe failure, use
+`control_unreachable` to confirm the host window and TCP 8080, or
+`operation_timeout` to check the network before trying again.
+
 Opening the UI does not require a global IPv6 on the current computer. Without one,
 the host create action remains unavailable until a valid host address is detected,
 while a member can still open **加入网络** and enter the host's IPv6 address.
