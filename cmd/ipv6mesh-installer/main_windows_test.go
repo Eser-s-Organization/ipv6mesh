@@ -155,6 +155,8 @@ func TestWindowsPackageIncludesChineseUI(t *testing.T) {
 		"复制房主 IPv6",
 		"房主虚拟 IPv4",
 		"本机虚拟 IPv4",
+		"诊断与日志",
+		"节点状态读取已恢复",
 		"Set-PrimaryBusy",
 		"Stop-AllResources",
 		"Get-NetIPAddress -AddressFamily IPv6",
@@ -178,6 +180,26 @@ func TestWindowsPackageIncludesChineseUI(t *testing.T) {
 	} {
 		if strings.Contains(contents, forbidden) {
 			t.Fatalf("normal room UI still exposes %q", forbidden)
+		}
+	}
+}
+
+func TestWindowsDocumentationDescribesPersistentLiveDiagnostics(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	repositoryRoot := filepath.Join(filepath.Dir(sourceFile), "..", "..")
+	for _, name := range []string{"README.md", filepath.Join("packaging", "windows", "README.md")} {
+		contents, err := os.ReadFile(filepath.Join(repositoryRoot, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		text := strings.Join(strings.Fields(string(contents)), " ")
+		for _, required := range []string{"always visible", "every two seconds", "does not repeat unchanged status"} {
+			if !strings.Contains(text, required) {
+				t.Errorf("%s missing diagnostics statement %q", name, required)
+			}
 		}
 	}
 }

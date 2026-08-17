@@ -26,8 +26,9 @@ and does not require an administrator token, a Network ID, or an invitation toke
    IPv6 address.
 3. The member selects **加入网络**, enters the host IPv6, and clicks join. The
    member page needs no room ID, invitation, or administrator credential.
-4. Both pages show the assigned virtual IPv4 and the current Direct/Relay path. Use
-   the diagnostics panel only when troubleshooting.
+4. The create and join pages keep diagnostics and logs always visible. Node status
+   refreshes every two seconds, while the log updates immediately and does not
+   repeat unchanged status.
 5. Closing the host ends the in-memory room. Reopening the installer creates a new
    room and a new set of assignments.
 6. Knowing the host IPv6 grants join access while the room is open. Treat the host

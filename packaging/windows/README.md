@@ -29,6 +29,10 @@ Both users open the same installer. The welcome page has two actions:
 2. **加入网络** asks only for the host's IPv6 address and a local device name. It
    does not ask for a Network ID, invitation, administrator token, or approval.
 
+The create and join pages keep diagnostics and logs always visible. Node status
+refreshes every two seconds, while the log updates immediately and does not repeat
+unchanged status. The welcome page hides diagnostics and pauses status refresh.
+
 The UI itself starts even when the current computer has no global IPv6. In that
 case the host create action stays unavailable until a valid host address is found,
 but the member page remains usable for entering the host's IPv6. Closing the host
