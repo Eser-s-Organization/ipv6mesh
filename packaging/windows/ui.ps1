@@ -97,7 +97,8 @@ function New-RandomToken {
 }
 
 function Test-GlobalIPv6 {
-    param([Parameter(Mandatory = $true)][string]$Value)
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
     try {
         $parsed = [System.Net.IPAddress]::Parse($Value.Trim('[', ']'))
         $bytes = $parsed.GetAddressBytes()
