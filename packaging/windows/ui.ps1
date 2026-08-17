@@ -790,6 +790,7 @@ function Set-PageLayoutState {
 
 function Set-ResponsiveSplitLayout {
     if ($script:updatingSplitLayout -or $null -eq $script:operationSplit -or $script:operationSplit.IsDisposed) { return }
+    if ($script:activePage -eq "Welcome") { return }
     if ($script:operationSplit.ClientSize.Height -le 0) { return }
     $script:updatingSplitLayout = $true
     try {

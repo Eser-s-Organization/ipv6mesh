@@ -603,6 +603,30 @@ foreach ($case in $cases) {
 	}
 }
 
+func TestWindowsUIWelcomeDoesNotMutateSplitterState(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	uiScript, err := os.ReadFile(uiPath)
+	if err != nil {
+		t.Fatalf("read UI script: %v", err)
+	}
+	contents := string(uiScript)
+	functionStart := strings.Index(contents, "function Set-ResponsiveSplitLayout")
+	if functionStart < 0 {
+		t.Fatal("Set-ResponsiveSplitLayout function not found")
+	}
+	functionBody := contents[functionStart:]
+	guard := `if ($script:activePage -eq "Welcome") { return }`
+	guardIndex := strings.Index(functionBody, guard)
+	clientSizeIndex := strings.Index(functionBody, "$script:operationSplit.ClientSize.Height")
+	if guardIndex < 0 || clientSizeIndex < 0 || guardIndex > clientSizeIndex {
+		t.Fatalf("welcome page must return before reading or saving splitter layout state")
+	}
+}
+
 func TestWindowsUILiveStatusTimerUsesQuietDeduplicatedPolling(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
