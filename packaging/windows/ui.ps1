@@ -1091,8 +1091,6 @@ function Start-AutomaticPollingCommand {
         [Parameter(Mandatory = $true)][hashtable]$State,
         [Parameter(Mandatory = $true)][ValidateSet("Status", "Members")][string]$Phase
     )
-    $fileName = Get-PayloadExecutable "vpnctl.exe"
-    $arguments = if ($Phase -eq "Status") { @("status") } else { @("room", "members") }
     if ($script:asyncPollingAuditMode) {
         $fileName = Get-PowerShellPath
         if ($Phase -eq "Status") {
@@ -1105,6 +1103,9 @@ function Start-AutomaticPollingCommand {
             $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($auditCommand))
             $arguments = @("-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", $encodedCommand)
         }
+    } else {
+        $fileName = Get-PayloadExecutable "vpnctl.exe"
+        $arguments = if ($Phase -eq "Status") { @("status") } else { @("room", "members") }
     }
     $environment = Get-ClientEnvironment
     $psi = New-Object System.Diagnostics.ProcessStartInfo

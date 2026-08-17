@@ -573,6 +573,7 @@ func TestWindowsUIAsyncPollingMessagePumpAudit(t *testing.T) {
 		"-NonInteractive",
 		"-File", uiPath,
 		"-PackageDirectory", t.TempDir(),
+		"-InstallDirectory", filepath.Join(t.TempDir(), "missing-install"),
 		"-AsyncPollingAudit",
 	)
 	output, err := cmd.CombinedOutput()
@@ -588,6 +589,7 @@ func TestWindowsUIAsyncPollingMessagePumpAudit(t *testing.T) {
 		UiThreadApplied       bool `json:"UiThreadApplied"`
 		SlowResultApplied     bool `json:"SlowResultApplied"`
 		MembersRetainedOnFail bool `json:"MembersRetainedOnFail"`
+		StartFailures         int  `json:"StartFailures"`
 	}
 	lines := strings.Split(strings.ReplaceAll(string(output), "\r", ""), "\n")
 	for index := len(lines) - 1; index >= 0; index-- {
@@ -599,7 +601,7 @@ func TestWindowsUIAsyncPollingMessagePumpAudit(t *testing.T) {
 			break
 		}
 	}
-	if !audit.Passed || audit.MessagePumpTicks < 10 || audit.WorkerStarts != 1 || audit.MaxConcurrentWorkers > 1 || audit.LateResultWrites != 0 || !audit.UiThreadApplied || !audit.SlowResultApplied || !audit.MembersRetainedOnFail {
+	if !audit.Passed || audit.MessagePumpTicks < 10 || audit.WorkerStarts != 1 || audit.MaxConcurrentWorkers > 1 || audit.LateResultWrites != 0 || !audit.UiThreadApplied || !audit.SlowResultApplied || !audit.MembersRetainedOnFail || audit.StartFailures != 0 {
 		t.Fatalf("async polling audit did not prove non-blocking, serialized, safe updates: %#v\n%s", audit, output)
 	}
 }
@@ -635,6 +637,7 @@ func TestWindowsUIAsyncPollingAuditCanRunConcurrently(t *testing.T) {
 	results := make(chan result, 2)
 	var start sync.WaitGroup
 	for i := 0; i < 2; i++ {
+		packageDirectory := t.TempDir()
 		cmd := exec.CommandContext(
 			ctx,
 			"powershell.exe",
@@ -642,7 +645,8 @@ func TestWindowsUIAsyncPollingAuditCanRunConcurrently(t *testing.T) {
 			"-NoProfile",
 			"-NonInteractive",
 			"-File", uiPath,
-			"-PackageDirectory", t.TempDir(),
+			"-PackageDirectory", packageDirectory,
+			"-InstallDirectory", filepath.Join(t.TempDir(), "missing-install"),
 			"-AsyncPollingAudit",
 		)
 		start.Add(1)
@@ -681,6 +685,7 @@ func TestWindowsUIPreparationRaceAudit(t *testing.T) {
 		"-NonInteractive",
 		"-File", uiPath,
 		"-PackageDirectory", t.TempDir(),
+		"-InstallDirectory", filepath.Join(t.TempDir(), "missing-install"),
 		"-PreparationRaceAudit",
 	)
 	output, err := cmd.CombinedOutput()
