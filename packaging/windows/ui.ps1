@@ -75,6 +75,29 @@ function Add-UiLog {
     }
 }
 
+function Get-StatusLogDecision {
+    param(
+        [bool]$Automatic,
+        [bool]$Succeeded,
+        [AllowEmptyString()][string]$Fingerprint,
+        [bool]$HasPrevious,
+        [bool]$PreviousSucceeded,
+        [AllowEmptyString()][string]$PreviousFingerprint
+    )
+    if (!$Automatic) { return "Manual" }
+    if (!$HasPrevious) {
+        if ($Succeeded) { return "Changed" }
+        return "Failed"
+    }
+    if (!$Succeeded) {
+        if ($PreviousSucceeded) { return "Failed" }
+        return "None"
+    }
+    if (!$PreviousSucceeded) { return "Recovered" }
+    if ($Fingerprint -ne $PreviousFingerprint) { return "Changed" }
+    return "None"
+}
+
 function Set-UiStatus {
     param([Parameter(Mandatory = $true)][string]$Message, [System.Drawing.Color]$Color = [System.Drawing.Color]::MidnightBlue)
     if ($null -ne $script:statusLabel -and !$script:statusLabel.IsDisposed) {

@@ -349,6 +349,57 @@ func TestWindowsUIKeepsDiagnosticsVisibleOnOperationPages(t *testing.T) {
 	}
 }
 
+func TestWindowsUIStatusLogDecision(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) {
+    $parseErrors | ForEach-Object { Write-Error $_.Message }
+    exit 1
+}
+$function = $ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-StatusLogDecision'
+}, $true) | Select-Object -First 1
+if ($null -eq $function) {
+    Write-Error 'Get-StatusLogDecision function not found'
+    exit 1
+}
+. ([scriptblock]::Create($function.Extent.Text))
+$cases = @(
+    @{ Name = 'first success'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = '10.42.0.1|Direct|'; HasPrevious = $false; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'Changed' },
+    @{ Name = 'unchanged success'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = '10.42.0.1|Direct|'; HasPrevious = $true; PreviousSucceeded = $true; PreviousFingerprint = '10.42.0.1|Direct|' }; Want = 'None' },
+    @{ Name = 'changed success'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = '10.42.0.1|Relay|'; HasPrevious = $true; PreviousSucceeded = $true; PreviousFingerprint = '10.42.0.1|Direct|' }; Want = 'Changed' },
+    @{ Name = 'first failure'; Parameters = @{ Automatic = $true; Succeeded = $false; Fingerprint = ''; HasPrevious = $false; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'Failed' },
+    @{ Name = 'failure after success'; Parameters = @{ Automatic = $true; Succeeded = $false; Fingerprint = ''; HasPrevious = $true; PreviousSucceeded = $true; PreviousFingerprint = '10.42.0.1|Direct|' }; Want = 'Failed' },
+    @{ Name = 'repeated failure'; Parameters = @{ Automatic = $true; Succeeded = $false; Fingerprint = ''; HasPrevious = $true; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'None' },
+    @{ Name = 'recovery'; Parameters = @{ Automatic = $true; Succeeded = $true; Fingerprint = '10.42.0.1|Direct|'; HasPrevious = $true; PreviousSucceeded = $false; PreviousFingerprint = '' }; Want = 'Recovered' },
+    @{ Name = 'manual unchanged'; Parameters = @{ Automatic = $false; Succeeded = $true; Fingerprint = '10.42.0.1|Direct|'; HasPrevious = $true; PreviousSucceeded = $true; PreviousFingerprint = '10.42.0.1|Direct|' }; Want = 'Manual' }
+)
+foreach ($case in $cases) {
+    $parameters = $case.Parameters
+    $got = Get-StatusLogDecision @parameters
+    if ($got -ne $case.Want) {
+        Write-Error ($case.Name + ': got ' + $got + ', want ' + $case.Want)
+        exit 1
+    }
+}
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell status-log decision check failed: %v\n%s", err, output)
+	}
+}
+
 func TestInstallScriptStopsExistingServiceBeforeCopyingFiles(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
