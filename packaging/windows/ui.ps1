@@ -45,6 +45,11 @@ $script:startedNodeService = $false
 $script:cleanupStarted = $false
 $script:primaryBusy = $false
 $script:updatingEndpoint = $false
+$script:statusRefreshTimer = $null
+$script:statusRefreshInProgress = $false
+$script:hasStatusRefreshResult = $false
+$script:lastStatusRefreshSucceeded = $false
+$script:lastStatusFingerprint = ""
 
 function Redact-Secret {
     param([AllowNull()][string]$Value)
@@ -240,7 +245,8 @@ function Invoke-External {
         [Parameter(Mandatory = $true)][string[]]$Arguments,
         [hashtable]$Environment = @{},
         [Parameter(Mandatory = $true)][string]$Source,
-        [switch]$SuppressStandardOutput
+        [switch]$SuppressStandardOutput,
+        [switch]$Quiet
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FileName
@@ -254,7 +260,7 @@ function Invoke-External {
     }
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $psi
-    Add-UiLog "开始执行 $Source" "调试"
+    if (!$Quiet) { Add-UiLog "开始执行 $Source" "调试" }
     try {
         [void]$process.Start()
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
@@ -264,33 +270,34 @@ function Invoke-External {
         $stderr = $stderrTask.Result
         $exitCode = $process.ExitCode
     } catch {
-        Add-UiLog "$Source 启动失败：$($_.Exception.Message)" "错误"
+        if (!$Quiet) { Add-UiLog "$Source 启动失败：$($_.Exception.Message)" "错误" }
         throw
     } finally {
         $process.Dispose()
     }
-    if (!$SuppressStandardOutput -and ![string]::IsNullOrWhiteSpace($stdout)) {
+    if (!$Quiet -and !$SuppressStandardOutput -and ![string]::IsNullOrWhiteSpace($stdout)) {
         foreach ($line in ($stdout -split [Environment]::NewLine)) {
             if (![string]::IsNullOrWhiteSpace($line)) { Add-UiLog "$Source：$line" }
         }
     }
-    if (![string]::IsNullOrWhiteSpace($stderr)) {
+    if (!$Quiet -and ![string]::IsNullOrWhiteSpace($stderr)) {
         foreach ($line in ($stderr -split [Environment]::NewLine)) {
             if (![string]::IsNullOrWhiteSpace($line)) { Add-UiLog "$Source：$line" "警告" }
         }
     }
-    if ($exitCode -ne 0) { Add-UiLog "$Source 退出码：$exitCode" "错误" }
+    if (!$Quiet -and $exitCode -ne 0) { Add-UiLog "$Source 退出码：$exitCode" "错误" }
     return [pscustomobject]@{ ExitCode = $exitCode; Stdout = $stdout; Stderr = $stderr }
 }
 
 function Invoke-VpnCtl {
-    param([Parameter(Mandatory = $true)][string[]]$Arguments, [switch]$SuppressStandardOutput)
+    param([Parameter(Mandatory = $true)][string[]]$Arguments, [switch]$SuppressStandardOutput, [switch]$Quiet)
     $spec = @{
         FileName = (Get-PayloadExecutable "vpnctl.exe")
         Arguments = $Arguments
         Environment = (Get-ClientEnvironment)
         Source = "vpnctl"
         SuppressStandardOutput = $SuppressStandardOutput
+        Quiet = $Quiet
     }
     return Invoke-External @spec
 }
@@ -305,7 +312,7 @@ function Assert-ControlUrl {
 }
 
 function Convert-ResultToJson {
-    param([Parameter(Mandatory = $true)]$Result, [Parameter(Mandatory = $true)][string]$Operation)
+    param([Parameter(Mandatory = $true)]$Result, [Parameter(Mandatory = $true)][string]$Operation, [switch]$Quiet)
     if ($Result.ExitCode -ne 0) {
         $stderr = [string]$Result.Stderr
         $code = ""
@@ -324,10 +331,10 @@ function Convert-ResultToJson {
             unauthorized = "控制面拒绝了当前操作。"
         }
         if ($code -ne "" -and $messages.ContainsKey($code)) {
-            Add-UiLog "$Operation 失败，错误码：$code" "警告"
+            if (!$Quiet) { Add-UiLog "$Operation 失败，错误码：$code" "警告" }
             throw "$Operation 失败：$($messages[$code])"
         }
-        Add-UiLog "$Operation 失败；原始错误已隐藏。" "错误"
+        if (!$Quiet) { Add-UiLog "$Operation 失败；原始错误已隐藏。" "错误" }
         throw "$Operation 失败，请查看诊断日志。"
     }
     if ([string]::IsNullOrWhiteSpace($Result.Stdout)) {
@@ -336,7 +343,7 @@ function Convert-ResultToJson {
     try {
         return ($Result.Stdout | ConvertFrom-Json -ErrorAction Stop)
     } catch {
-        Add-UiLog "$Operation 返回内容不是有效 JSON。" "错误"
+        if (!$Quiet) { Add-UiLog "$Operation 返回内容不是有效 JSON。" "错误" }
         throw "$Operation 返回内容无效。"
     }
 }
@@ -506,6 +513,7 @@ function Stop-AllResources {
     if ($script:cleanupStarted) { return }
     $script:cleanupStarted = $true
     Add-UiLog "正在执行退出清理。"
+    Dispose-StatusRefreshTimer
     Stop-StartedResources
     Add-UiLog "退出清理完成。"
 }
@@ -530,21 +538,44 @@ function Install-NodeService {
 }
 
 function Get-NodeStatus {
+	param([switch]$Automatic)
+	if ($script:statusRefreshInProgress) { return $null }
+	$script:statusRefreshInProgress = $true
     try {
-        $status = Convert-ResultToJson (Invoke-VpnCtl -Arguments @("status") -SuppressStandardOutput) "读取节点状态"
+        $result = Invoke-VpnCtl -Arguments @("status") -SuppressStandardOutput -Quiet:$Automatic
+        $status = Convert-ResultToJson $result "读取节点状态" -Quiet:$Automatic
         $script:activeNetworkId = [string]$status.network_id
         $virtualIPv4 = [string]$status.virtual_ipv4
         $path = [string]$status.path_state
         $errorCode = [string]$status.last_error
         $summary = "本机虚拟 IPv4：$virtualIPv4    路径：$path"
         if ($errorCode -ne "") { $summary += "    错误码：$errorCode" }
-        if ($null -ne $script:nodeStatusLabel) { $script:nodeStatusLabel.Text = $summary }
-        Add-UiLog "节点状态已刷新：VirtualIPv4=$virtualIPv4，Path=$path，ErrorCode=$errorCode"
+        if ($null -ne $script:nodeStatusLabel -and !$script:nodeStatusLabel.IsDisposed) {
+            $script:nodeStatusLabel.Text = $summary
+        }
+        $fingerprint = "$virtualIPv4|$path|$errorCode"
+        $decision = Get-StatusLogDecision -Automatic ([bool]$Automatic) -Succeeded $true -Fingerprint $fingerprint -HasPrevious $script:hasStatusRefreshResult -PreviousSucceeded $script:lastStatusRefreshSucceeded -PreviousFingerprint $script:lastStatusFingerprint
+        if ($decision -eq "Recovered") {
+            Add-UiLog "节点状态读取已恢复：VirtualIPv4=$virtualIPv4，Path=$path，ErrorCode=$errorCode"
+        } elseif ($decision -in @("Changed", "Manual")) {
+            Add-UiLog "节点状态已刷新：VirtualIPv4=$virtualIPv4，Path=$path，ErrorCode=$errorCode"
+        }
+        $script:hasStatusRefreshResult = $true
+        $script:lastStatusRefreshSucceeded = $true
+        $script:lastStatusFingerprint = $fingerprint
         return $status
     } catch {
-        Add-UiLog "读取节点状态失败。" "错误"
-        if ($null -ne $script:nodeStatusLabel) { $script:nodeStatusLabel.Text = "节点服务未连接或尚未加入房间" }
+        $decision = Get-StatusLogDecision -Automatic ([bool]$Automatic) -Succeeded $false -Fingerprint "" -HasPrevious $script:hasStatusRefreshResult -PreviousSucceeded $script:lastStatusRefreshSucceeded -PreviousFingerprint $script:lastStatusFingerprint
+        if ($decision -in @("Failed", "Manual")) { Add-UiLog "读取节点状态失败。" "错误" }
+        if ($null -ne $script:nodeStatusLabel -and !$script:nodeStatusLabel.IsDisposed) {
+            $script:nodeStatusLabel.Text = "节点服务未连接或尚未加入房间"
+        }
+        $script:hasStatusRefreshResult = $true
+        $script:lastStatusRefreshSucceeded = $false
+        $script:lastStatusFingerprint = ""
         return $null
+    } finally {
+        $script:statusRefreshInProgress = $false
     }
 }
 
@@ -678,6 +709,34 @@ function Set-PrimaryBusy {
     }
 }
 
+function Invoke-AutomaticStatusRefresh {
+    if ($script:primaryBusy -or $script:cleanupStarted) { return }
+    if ($script:activePage -eq "Welcome" -or $script:statusRefreshInProgress) { return }
+    $null = Get-NodeStatus -Automatic
+}
+
+function Stop-StatusRefresh {
+    if ($null -ne $script:statusRefreshTimer) {
+        $script:statusRefreshTimer.Stop()
+    }
+}
+
+function Start-StatusRefresh {
+    if ($null -eq $script:statusRefreshTimer) { return }
+    Invoke-AutomaticStatusRefresh
+    if ($script:activePage -ne "Welcome" -and !$script:cleanupStarted) {
+        $script:statusRefreshTimer.Start()
+    }
+}
+
+function Dispose-StatusRefreshTimer {
+    Stop-StatusRefresh
+    if ($null -ne $script:statusRefreshTimer) {
+        $script:statusRefreshTimer.Dispose()
+        $script:statusRefreshTimer = $null
+    }
+}
+
 function Show-Page {
     param([ValidateSet("Welcome", "Host", "Member")][string]$Name)
     $script:activePage = $Name
@@ -687,6 +746,11 @@ function Show-Page {
     if ($null -ne $script:diagnosticsPanel) {
         $script:diagnosticsPanel.Visible = ($Name -ne "Welcome")
         if ($Name -ne "Welcome") { $script:diagnosticsPanel.BringToFront() }
+    }
+    if ($Name -eq "Welcome") {
+        Stop-StatusRefresh
+    } else {
+        Start-StatusRefresh
     }
 }
 
@@ -863,6 +927,10 @@ $script:diagnosticsPanel.Controls.Add($copyLogButton)
 $exportLogButton = New-Button "导出日志" 240 250 100
 $exportLogButton.Add_Click({ Export-UiLog })
 $script:diagnosticsPanel.Controls.Add($exportLogButton)
+
+$script:statusRefreshTimer = New-Object System.Windows.Forms.Timer
+$script:statusRefreshTimer.Interval = 2000
+$script:statusRefreshTimer.Add_Tick({ Invoke-AutomaticStatusRefresh })
 
 $script:ipv6AddressBox.Add_TextChanged({
     if ($script:updatingEndpoint) { return }

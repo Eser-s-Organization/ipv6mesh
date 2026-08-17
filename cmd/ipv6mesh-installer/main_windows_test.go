@@ -400,6 +400,49 @@ foreach ($case in $cases) {
 	}
 }
 
+func TestWindowsUILiveStatusTimerUsesQuietDeduplicatedPolling(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	uiScript, err := os.ReadFile(uiPath)
+	if err != nil {
+		t.Fatalf("read UI script: %v", err)
+	}
+	contents := string(uiScript)
+	for _, required := range []string{
+		`$script:statusRefreshTimer = New-Object System.Windows.Forms.Timer`,
+		`$script:statusRefreshTimer.Interval = 2000`,
+		`$script:statusRefreshTimer.Add_Tick({ Invoke-AutomaticStatusRefresh })`,
+		`function Start-StatusRefresh`,
+		`function Stop-StatusRefresh`,
+		`function Dispose-StatusRefreshTimer`,
+		`function Invoke-AutomaticStatusRefresh`,
+		`$script:primaryBusy -or $script:cleanupStarted`,
+		`$script:activePage -eq "Welcome" -or $script:statusRefreshInProgress`,
+		`Get-NodeStatus -Automatic`,
+		`Invoke-VpnCtl -Arguments @("status") -SuppressStandardOutput -Quiet:$Automatic`,
+		`Convert-ResultToJson $result "读取节点状态" -Quiet:$Automatic`,
+		`Get-StatusLogDecision`,
+		`Dispose-StatusRefreshTimer`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("UI missing live status behavior %q", required)
+		}
+	}
+
+	cleanupIndex := strings.Index(contents, "function Stop-AllResources")
+	if cleanupIndex < 0 {
+		t.Fatal("Stop-AllResources function not found")
+	}
+	disposeIndex := strings.Index(contents[cleanupIndex:], "Dispose-StatusRefreshTimer")
+	resourceIndex := strings.Index(contents[cleanupIndex:], "Stop-StartedResources")
+	if disposeIndex < 0 || resourceIndex < 0 || disposeIndex > resourceIndex {
+		t.Fatalf("status timer must be disposed before resources stop (cleanup=%d dispose=%d resources=%d)", cleanupIndex, disposeIndex, resourceIndex)
+	}
+}
+
 func TestInstallScriptStopsExistingServiceBeforeCopyingFiles(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
