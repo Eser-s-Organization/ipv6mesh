@@ -33,6 +33,11 @@ $script:welcomePanel = $null
 $script:hostPanel = $null
 $script:memberPanel = $null
 $script:diagnosticsPanel = $null
+$script:contentPanel = $null
+$script:operationShell = $null
+$script:operationSplit = $null
+$script:updatingSplitLayout = $false
+$script:userSplitterDistance = -1
 $script:activePage = "Welcome"
 $script:hostStartButton = $null
 $script:memberJoinButton = $null
@@ -773,19 +778,60 @@ function Dispose-StatusRefreshTimer {
     }
 }
 
-function Show-Page {
+function Set-PageLayoutState {
     param([ValidateSet("Welcome", "Host", "Member")][string]$Name)
     $script:activePage = $Name
     if ($null -ne $script:welcomePanel) { $script:welcomePanel.Visible = ($Name -eq "Welcome") }
+    if ($null -ne $script:operationShell) { $script:operationShell.Visible = ($Name -ne "Welcome") }
     if ($null -ne $script:hostPanel) { $script:hostPanel.Visible = ($Name -eq "Host") }
     if ($null -ne $script:memberPanel) { $script:memberPanel.Visible = ($Name -eq "Member") }
-    if ($null -ne $script:diagnosticsPanel) {
-        $script:diagnosticsPanel.Visible = ($Name -ne "Welcome")
-        if ($Name -ne "Welcome") { $script:diagnosticsPanel.BringToFront() }
+}
+
+function Set-ResponsiveSplitLayout {
+    if ($script:updatingSplitLayout -or $null -eq $script:operationSplit -or $script:operationSplit.IsDisposed) { return }
+    if ($script:operationSplit.ClientSize.Height -le 0) { return }
+    $script:updatingSplitLayout = $true
+    try {
+        $decision = Get-SplitLayoutDecision -AvailableHeight $script:operationSplit.ClientSize.Height -SplitterWidth $script:operationSplit.SplitterWidth -CurrentDistance $script:userSplitterDistance
+        $script:operationSplit.SuspendLayout()
+        try {
+            $script:operationSplit.Panel1MinSize = 0
+            $script:operationSplit.Panel2MinSize = 0
+            $script:operationSplit.SplitterDistance = $decision.Distance
+            $script:operationSplit.Panel1MinSize = $decision.UpperMinimum
+            $script:operationSplit.Panel2MinSize = $decision.LowerMinimum
+            $script:userSplitterDistance = $decision.Distance
+        } finally {
+            $script:operationSplit.ResumeLayout($true)
+        }
+    } catch {
+        if ($LayoutAudit) { throw }
+        return
+    } finally {
+        $script:updatingSplitLayout = $false
     }
+}
+
+function Set-ResponsiveWindowBounds {
+    param([Parameter(Mandatory = $true)][System.Windows.Forms.Form]$Form)
+    $workingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $preferredOuter = $Form.SizeFromClientSize((New-Object System.Drawing.Size(1120, 720)))
+    $minimumWidth = [Math]::Min(900, $workingArea.Width)
+    $minimumHeight = [Math]::Min(640, $workingArea.Height)
+    $Form.MinimumSize = New-Object System.Drawing.Size($minimumWidth, $minimumHeight)
+    $Form.Size = New-Object System.Drawing.Size(
+        ([Math]::Min($preferredOuter.Width, $workingArea.Width)),
+        ([Math]::Min($preferredOuter.Height, $workingArea.Height))
+    )
+}
+
+function Show-Page {
+    param([ValidateSet("Welcome", "Host", "Member")][string]$Name)
+    Set-PageLayoutState $Name
     if ($Name -eq "Welcome") {
         Stop-StatusRefresh
     } else {
+        Set-ResponsiveSplitLayout
         Start-StatusRefresh
     }
 }
@@ -846,37 +892,131 @@ if ([string]::IsNullOrWhiteSpace($initialIPv6) -and ![string]::IsNullOrWhiteSpac
 $script:form = New-Object System.Windows.Forms.Form
 $script:form.Text = "IPv6Mesh 远程组网"
 $script:form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-$script:form.ClientSize = New-Object System.Drawing.Size(1120, 720)
-$script:form.MinimumSize = New-Object System.Drawing.Size(1120, 720)
+$script:form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+$script:form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
 $script:form.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
+Set-ResponsiveWindowBounds $script:form
 
-$title = New-Label "IPv6Mesh 远程组网" 20 15 500 32
+$rootLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$rootLayout.Name = "RootLayout"
+$rootLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
+$rootLayout.ColumnCount = 1
+$rootLayout.RowCount = 2
+$rootLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+$rootLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+$script:form.Controls.Add($rootLayout)
+
+$headerLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$headerLayout.Name = "HeaderLayout"
+$headerLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
+$headerLayout.AutoSize = $true
+$headerLayout.Padding = New-Object System.Windows.Forms.Padding(20, 12, 20, 10)
+$headerLayout.ColumnCount = 2
+$headerLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+$headerLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+$rootLayout.Controls.Add($headerLayout, 0, 0)
+
+$title = New-Object System.Windows.Forms.Label
+$title.Name = "ProductTitle"
+$title.Text = "IPv6Mesh 远程组网"
+$title.AutoSize = $true
+$title.Anchor = [System.Windows.Forms.AnchorStyles]::Left
 $title.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 15, [System.Drawing.FontStyle]::Bold)
-$script:form.Controls.Add($title)
-$script:statusLabel = New-Label "等待选择" 620 18 470 28
-$script:statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-$script:form.Controls.Add($script:statusLabel)
+$headerLayout.Controls.Add($title, 0, 0)
 
-$script:welcomePanel = New-Object System.Windows.Forms.Panel
-$script:welcomePanel.Location = New-Object System.Drawing.Point(20, 70)
-$script:welcomePanel.Size = New-Object System.Drawing.Size(1080, 570)
-$script:form.Controls.Add($script:welcomePanel)
-$script:welcomePanel.Controls.Add((New-Label "你想做什么？" 20 20 500 40 22))
-$script:welcomePanel.Controls.Add((New-Label "选择一种方式开始 IPv6Mesh 房间流程。" 22 70 600 28))
-$createButton = New-Button "创建网络" 180 150 260 70
+$script:statusLabel = New-Object System.Windows.Forms.Label
+$script:statusLabel.Name = "HeaderStatus"
+$script:statusLabel.Text = "等待选择"
+$script:statusLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:statusLabel.AutoEllipsis = $true
+$script:statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+$headerLayout.Controls.Add($script:statusLabel, 1, 0)
+
+$script:contentPanel = New-Object System.Windows.Forms.Panel
+$script:contentPanel.Name = "ContentPanel"
+$script:contentPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:contentPanel.Padding = New-Object System.Windows.Forms.Padding(20, 8, 20, 20)
+$rootLayout.Controls.Add($script:contentPanel, 0, 1)
+
+$script:welcomePanel = New-Object System.Windows.Forms.TableLayoutPanel
+$script:welcomePanel.Name = "WelcomePanel"
+$script:welcomePanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:welcomePanel.ColumnCount = 4
+$script:welcomePanel.RowCount = 5
+$script:welcomePanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 25)))
+$script:welcomePanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 25)))
+$script:welcomePanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 25)))
+$script:welcomePanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 25)))
+$script:welcomePanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 35)))
+$script:welcomePanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+$script:welcomePanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+$script:welcomePanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 100)))
+$script:welcomePanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 65)))
+$script:contentPanel.Controls.Add($script:welcomePanel)
+
+$welcomeTitle = New-Object System.Windows.Forms.Label
+$welcomeTitle.Name = "WelcomeTitle"
+$welcomeTitle.Text = "你想做什么？"
+$welcomeTitle.AutoSize = $true
+$welcomeTitle.Anchor = [System.Windows.Forms.AnchorStyles]::None
+$welcomeTitle.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 22)
+$script:welcomePanel.Controls.Add($welcomeTitle, 1, 1)
+$script:welcomePanel.SetColumnSpan($welcomeTitle, 2)
+
+$welcomeHelp = New-Object System.Windows.Forms.Label
+$welcomeHelp.Name = "WelcomeHelp"
+$welcomeHelp.Text = "选择一种方式开始 IPv6Mesh 房间流程。"
+$welcomeHelp.AutoSize = $true
+$welcomeHelp.Anchor = [System.Windows.Forms.AnchorStyles]::None
+$script:welcomePanel.Controls.Add($welcomeHelp, 1, 2)
+$script:welcomePanel.SetColumnSpan($welcomeHelp, 2)
+
+$createButton = New-Object System.Windows.Forms.Button
+$createButton.Name = "WelcomeCreate"
+$createButton.Text = "创建网络"
+$createButton.Dock = [System.Windows.Forms.DockStyle]::Fill
+$createButton.Margin = New-Object System.Windows.Forms.Padding(10, 15, 10, 15)
 $createButton.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 12)
 $createButton.Add_Click({ Show-HostPage })
-$script:welcomePanel.Controls.Add($createButton)
-$joinButton = New-Button "加入网络" 540 150 260 70
+$script:welcomePanel.Controls.Add($createButton, 1, 3)
+
+$joinButton = New-Object System.Windows.Forms.Button
+$joinButton.Name = "WelcomeJoin"
+$joinButton.Text = "加入网络"
+$joinButton.Dock = [System.Windows.Forms.DockStyle]::Fill
+$joinButton.Margin = New-Object System.Windows.Forms.Padding(10, 15, 10, 15)
 $joinButton.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 12)
 $joinButton.Add_Click({ Show-MemberPage })
-$script:welcomePanel.Controls.Add($joinButton)
+$script:welcomePanel.Controls.Add($joinButton, 2, 3)
+
+$script:operationShell = New-Object System.Windows.Forms.Panel
+$script:operationShell.Name = "OperationShell"
+$script:operationShell.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:operationShell.Visible = $false
+$script:contentPanel.Controls.Add($script:operationShell)
+
+$script:operationSplit = New-Object System.Windows.Forms.SplitContainer
+$script:operationSplit.Name = "OperationSplit"
+$script:operationSplit.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:operationSplit.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+$script:operationSplit.FixedPanel = [System.Windows.Forms.FixedPanel]::Panel1
+$script:operationSplit.SplitterWidth = 6
+$script:operationSplit.Panel1.AutoScroll = $true
+$script:operationShell.Controls.Add($script:operationSplit)
+$script:operationSplit.Add_SplitterMoved({
+    if (!$script:updatingSplitLayout) {
+        $script:userSplitterDistance = $script:operationSplit.SplitterDistance
+        Set-ResponsiveSplitLayout
+    }
+})
+$script:operationSplit.Add_SizeChanged({ Set-ResponsiveSplitLayout })
+$script:form.Add_Shown({ Set-ResponsiveSplitLayout })
 
 $script:hostPanel = New-Object System.Windows.Forms.Panel
-$script:hostPanel.Location = New-Object System.Drawing.Point(20, 70)
+$script:hostPanel.Location = New-Object System.Drawing.Point(0, 0)
 $script:hostPanel.Size = New-Object System.Drawing.Size(1080, 570)
 $script:hostPanel.Visible = $false
-$script:form.Controls.Add($script:hostPanel)
+$script:operationSplit.Panel1.Controls.Add($script:hostPanel)
 $hostBackButton = New-Button "返回" 20 15 90
 $hostBackButton.Add_Click({ Show-WelcomePage })
 $script:backButtons += $hostBackButton
@@ -903,10 +1043,10 @@ $script:hostStartButton.Add_Click({ Start-HostRoom })
 $script:hostPanel.Controls.Add($script:hostStartButton)
 
 $script:memberPanel = New-Object System.Windows.Forms.Panel
-$script:memberPanel.Location = New-Object System.Drawing.Point(20, 70)
+$script:memberPanel.Location = New-Object System.Drawing.Point(0, 0)
 $script:memberPanel.Size = New-Object System.Drawing.Size(1080, 570)
 $script:memberPanel.Visible = $false
-$script:form.Controls.Add($script:memberPanel)
+$script:operationSplit.Panel1.Controls.Add($script:memberPanel)
 $memberBackButton = New-Button "返回" 20 15 90
 $memberBackButton.Add_Click({ Show-WelcomePage })
 $script:backButtons += $memberBackButton
@@ -927,10 +1067,10 @@ $script:memberPanel.Controls.Add($script:memberJoinButton)
 
 $script:diagnosticsPanel = New-Object System.Windows.Forms.GroupBox
 $script:diagnosticsPanel.Text = "诊断与日志"
-$script:diagnosticsPanel.Location = New-Object System.Drawing.Point(40, 350)
-$script:diagnosticsPanel.Size = New-Object System.Drawing.Size(1040, 290)
-$script:diagnosticsPanel.Visible = $false
-$script:form.Controls.Add($script:diagnosticsPanel)
+$script:diagnosticsPanel.Location = New-Object System.Drawing.Point(0, 0)
+$script:diagnosticsPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:diagnosticsPanel.Visible = $true
+$script:operationSplit.Panel2.Controls.Add($script:diagnosticsPanel)
 $script:nodeStatusLabel = New-Label "节点服务未检查状态" 20 25 980 28
 $script:diagnosticsPanel.Controls.Add($script:nodeStatusLabel)
 $refreshStatusButton = New-Button "刷新状态" 20 60 100

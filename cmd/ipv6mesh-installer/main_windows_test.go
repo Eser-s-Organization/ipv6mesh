@@ -338,7 +338,7 @@ if ($result -ne $false) {
 	}
 }
 
-func TestWindowsUIKeepsDiagnosticsVisibleOnOperationPages(t *testing.T) {
+func TestWindowsUIUsesManagedOperationShell(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed")
@@ -349,24 +349,32 @@ func TestWindowsUIKeepsDiagnosticsVisibleOnOperationPages(t *testing.T) {
 		t.Fatalf("read UI script: %v", err)
 	}
 	contents := string(uiScript)
-
-	for _, forbidden := range []string{
-		`function Toggle-Diagnostics`,
-		`New-Button "显示诊断与日志"`,
-		`$script:diagnosticsPanel.Visible = !$script:diagnosticsPanel.Visible`,
-	} {
-		if strings.Contains(contents, forbidden) {
-			t.Fatalf("UI still contains collapsible diagnostics behavior %q", forbidden)
-		}
-	}
-
 	for _, required := range []string{
-		`$script:activePage = $Name`,
-		`$script:diagnosticsPanel.Visible = ($Name -ne "Welcome")`,
-		`$script:diagnosticsPanel.BringToFront()`,
+		`$rootLayout = New-Object System.Windows.Forms.TableLayoutPanel`,
+		`$rootLayout.Dock = [System.Windows.Forms.DockStyle]::Fill`,
+		`$script:contentPanel = New-Object System.Windows.Forms.Panel`,
+		`$script:operationShell = New-Object System.Windows.Forms.Panel`,
+		`$script:operationSplit = New-Object System.Windows.Forms.SplitContainer`,
+		`$script:operationSplit.Orientation = [System.Windows.Forms.Orientation]::Horizontal`,
+		`$script:operationSplit.Panel1.AutoScroll = $true`,
+		`$script:operationSplit.Panel2.Controls.Add($script:diagnosticsPanel)`,
+		`$script:diagnosticsPanel.Visible = $true`,
+		`$script:operationShell.Visible = ($Name -ne "Welcome")`,
+		`$script:form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi`,
+		`Set-ResponsiveWindowBounds $script:form`,
+		`$script:statusRefreshTimer.Interval = 2000`,
 	} {
 		if !strings.Contains(contents, required) {
-			t.Fatalf("UI missing persistent diagnostics behavior %q", required)
+			t.Errorf("UI missing managed operation-shell behavior %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		`$script:diagnosticsPanel.BringToFront()`,
+		`$script:diagnosticsPanel.Visible = ($Name -ne "Welcome")`,
+		`$script:form.Controls.Add($script:diagnosticsPanel)`,
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("UI retains form-level diagnostics workaround %q", forbidden)
 		}
 	}
 }
