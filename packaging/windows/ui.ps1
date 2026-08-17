@@ -851,36 +851,6 @@ function Show-MemberPage {
     Set-UiStatus "请输入房主 IPv6" ([System.Drawing.Color]::MidnightBlue)
 }
 
-function New-Label {
-    param([string]$Text, [int]$X, [int]$Y, [int]$Width = 100, [int]$Height = 24, [int]$FontSize = 9)
-    $label = New-Object System.Windows.Forms.Label
-    $label.Text = $Text
-    $label.Location = New-Object System.Drawing.Point($X, $Y)
-    $label.Size = New-Object System.Drawing.Size($Width, $Height)
-    $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-    $label.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", $FontSize)
-    return $label
-}
-
-function New-TextBox {
-    param([int]$X, [int]$Y, [int]$Width = 200, [int]$Height = 24, [switch]$Password, [switch]$ReadOnly)
-    $box = New-Object System.Windows.Forms.TextBox
-    $box.Location = New-Object System.Drawing.Point($X, $Y)
-    $box.Size = New-Object System.Drawing.Size($Width, $Height)
-    $box.UseSystemPasswordChar = $Password
-    $box.ReadOnly = $ReadOnly
-    return $box
-}
-
-function New-Button {
-    param([string]$Text, [int]$X, [int]$Y, [int]$Width = 120, [int]$Height = 30)
-    $button = New-Object System.Windows.Forms.Button
-    $button.Text = $Text
-    $button.Location = New-Object System.Drawing.Point($X, $Y)
-    $button.Size = New-Object System.Drawing.Size($Width, $Height)
-    return $button
-}
-
 function New-LayoutLabel {
     param([string]$Name, [string]$Text, [int]$FontSize = 9, [switch]$Bold)
     $label = New-Object System.Windows.Forms.Label
@@ -1155,43 +1125,81 @@ $script:memberJoinButton.Add_Click({ Join-MemberRoom })
 Add-PageControl $script:memberPanel $script:memberJoinButton 0 5 3
 
 $script:diagnosticsPanel = New-Object System.Windows.Forms.GroupBox
+$script:diagnosticsPanel.Name = "DiagnosticsPanel"
 $script:diagnosticsPanel.Text = "诊断与日志"
-$script:diagnosticsPanel.Location = New-Object System.Drawing.Point(0, 0)
 $script:diagnosticsPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
 $script:diagnosticsPanel.Visible = $true
+$script:diagnosticsPanel.Padding = New-Object System.Windows.Forms.Padding(12, 8, 12, 12)
 $script:operationSplit.Panel2.Controls.Add($script:diagnosticsPanel)
-$script:nodeStatusLabel = New-Label "节点服务未检查状态" 20 25 980 28
-$script:diagnosticsPanel.Controls.Add($script:nodeStatusLabel)
-$refreshStatusButton = New-Button "刷新状态" 20 60 100
+
+$diagnosticsLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$diagnosticsLayout.Name = "DiagnosticsLayout"
+$diagnosticsLayout.Dock = [System.Windows.Forms.DockStyle]::Fill
+$diagnosticsLayout.ColumnCount = 1
+$diagnosticsLayout.RowCount = 4
+$diagnosticsLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+$diagnosticsLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+$diagnosticsLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+$diagnosticsLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+$script:diagnosticsPanel.Controls.Add($diagnosticsLayout)
+
+$script:nodeStatusLabel = New-LayoutLabel "NodeStatus" "节点服务未检查状态"
+$script:nodeStatusLabel.AutoSize = $false
+$script:nodeStatusLabel.MinimumSize = New-Object System.Drawing.Size(0, 28)
+$script:nodeStatusLabel.AutoEllipsis = $true
+$script:nodeStatusLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$diagnosticsLayout.Controls.Add($script:nodeStatusLabel, 0, 0)
+
+$statusActions = New-Object System.Windows.Forms.FlowLayoutPanel
+$statusActions.Name = "StatusActions"
+$statusActions.Dock = [System.Windows.Forms.DockStyle]::Fill
+$statusActions.AutoSize = $true
+$statusActions.WrapContents = $true
+$statusActions.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+$diagnosticsLayout.Controls.Add($statusActions, 0, 1)
+
+$refreshStatusButton = New-LayoutButton "RefreshStatus" "刷新状态" 100
 $refreshStatusButton.Add_Click({ $null = Get-NodeStatus })
-$script:diagnosticsPanel.Controls.Add($refreshStatusButton)
-$connectButton = New-Button "连接" 130 60 90
+$statusActions.Controls.Add($refreshStatusButton)
+$connectButton = New-LayoutButton "ConnectNode" "连接" 90
 $connectButton.Add_Click({ Connect-Node })
-$script:diagnosticsPanel.Controls.Add($connectButton)
-$disconnectButton = New-Button "断开" 230 60 90
+$statusActions.Controls.Add($connectButton)
+$disconnectButton = New-LayoutButton "DisconnectNode" "断开" 90
 $disconnectButton.Add_Click({ Disconnect-Node })
-$script:diagnosticsPanel.Controls.Add($disconnectButton)
-$leaveButton = New-Button "离开房间" 330 60 110
+$statusActions.Controls.Add($disconnectButton)
+$leaveButton = New-LayoutButton "LeaveRoom" "离开房间" 110
 $leaveButton.Add_Click({ Leave-Node })
-$script:diagnosticsPanel.Controls.Add($leaveButton)
+$statusActions.Controls.Add($leaveButton)
+
 $script:logBox = New-Object System.Windows.Forms.TextBox
+$script:logBox.Name = "LogBox"
 $script:logBox.Multiline = $true
 $script:logBox.ReadOnly = $true
 $script:logBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
 $script:logBox.WordWrap = $false
-$script:logBox.Location = New-Object System.Drawing.Point(20, 100)
-$script:logBox.Size = New-Object System.Drawing.Size(1000, 145)
+$script:logBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+$script:logBox.MinimumSize = New-Object System.Drawing.Size(200, 80)
+$script:logBox.Margin = New-Object System.Windows.Forms.Padding(6)
 $script:logBox.Font = New-Object System.Drawing.Font("Consolas", 9)
-$script:diagnosticsPanel.Controls.Add($script:logBox)
-$clearLogButton = New-Button "清空日志" 20 250 100
+$diagnosticsLayout.Controls.Add($script:logBox, 0, 2)
+
+$logActions = New-Object System.Windows.Forms.FlowLayoutPanel
+$logActions.Name = "LogActions"
+$logActions.Dock = [System.Windows.Forms.DockStyle]::Fill
+$logActions.AutoSize = $true
+$logActions.WrapContents = $true
+$logActions.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+$diagnosticsLayout.Controls.Add($logActions, 0, 3)
+
+$clearLogButton = New-LayoutButton "ClearLog" "清空日志" 100
 $clearLogButton.Add_Click({ $script:logLines.Clear(); $script:logBox.Clear() })
-$script:diagnosticsPanel.Controls.Add($clearLogButton)
-$copyLogButton = New-Button "复制日志" 130 250 100
+$logActions.Controls.Add($clearLogButton)
+$copyLogButton = New-LayoutButton "CopyLog" "复制日志" 100
 $copyLogButton.Add_Click({ [System.Windows.Forms.Clipboard]::SetText(($script:logLines -join [Environment]::NewLine)) })
-$script:diagnosticsPanel.Controls.Add($copyLogButton)
-$exportLogButton = New-Button "导出日志" 240 250 100
+$logActions.Controls.Add($copyLogButton)
+$exportLogButton = New-LayoutButton "ExportLog" "导出日志" 100
 $exportLogButton.Add_Click({ Export-UiLog })
-$script:diagnosticsPanel.Controls.Add($exportLogButton)
+$logActions.Controls.Add($exportLogButton)
 
 $script:statusRefreshTimer = New-Object System.Windows.Forms.Timer
 $script:statusRefreshTimer.Interval = 2000

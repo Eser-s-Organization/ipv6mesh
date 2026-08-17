@@ -417,6 +417,45 @@ func TestWindowsUIOperationPagesUseResponsiveGrids(t *testing.T) {
 	}
 }
 
+func TestWindowsUIDiagnosticsUsesFillAndWrappingLayout(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	uiScript, err := os.ReadFile(uiPath)
+	if err != nil {
+		t.Fatalf("read UI script: %v", err)
+	}
+	contents := string(uiScript)
+	for _, required := range []string{
+		`$diagnosticsLayout = New-Object System.Windows.Forms.TableLayoutPanel`,
+		`$diagnosticsLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))`,
+		`$statusActions.WrapContents = $true`,
+		`$logActions.WrapContents = $true`,
+		`$script:logBox.Dock = [System.Windows.Forms.DockStyle]::Fill`,
+		`$script:logBox.MinimumSize = New-Object System.Drawing.Size(200, 80)`,
+		`$script:operationSplit.Panel2.Controls.Add($script:diagnosticsPanel)`,
+	} {
+		if !strings.Contains(contents, required) {
+			t.Errorf("UI missing responsive diagnostics behavior %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		`$script:diagnosticsPanel.Location = New-Object System.Drawing.Point(40, 350)`,
+		`$script:diagnosticsPanel.Size = New-Object System.Drawing.Size(1040, 290)`,
+		`$script:logBox.Location = New-Object System.Drawing.Point(20, 100)`,
+		`$script:logBox.Size = New-Object System.Drawing.Size(1000, 145)`,
+		`function New-Label`,
+		`function New-TextBox`,
+		`function New-Button`,
+	} {
+		if strings.Contains(contents, forbidden) {
+			t.Errorf("UI retains fixed diagnostics layout %q", forbidden)
+		}
+	}
+}
+
 func TestWindowsUIStatusLogDecision(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
