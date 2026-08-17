@@ -456,6 +456,36 @@ func TestWindowsUIDiagnosticsUsesFillAndWrappingLayout(t *testing.T) {
 	}
 }
 
+func TestWindowsUIResponsiveLayoutAudit(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	cmd := exec.Command(
+		"powershell.exe",
+		"-NoLogo",
+		"-NoProfile",
+		"-NonInteractive",
+		"-File", uiPath,
+		"-PackageDirectory", t.TempDir(),
+		"-LayoutAudit",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("responsive WinForms layout audit failed: %v\n%s", err, output)
+	}
+	compact := strings.ReplaceAll(strings.ReplaceAll(string(output), "\r", ""), "\n", "")
+	if !strings.Contains(compact, `"Passed":true`) {
+		t.Fatalf("responsive WinForms layout audit did not report success:\n%s", output)
+	}
+	for _, required := range []string{`"Case":"preferred"`, `"Case":"minimum"`, `"Case":"large"`, `"Case":"constrained"`, `"Case":"large-font"`, `"Case":"upper-limit"`, `"Case":"lower-limit"`} {
+		if !strings.Contains(compact, required) {
+			t.Errorf("responsive WinForms layout audit missing sample %s", required)
+		}
+	}
+}
+
 func TestWindowsUIStatusLogDecision(t *testing.T) {
 	_, sourceFile, _, ok := runtime.Caller(0)
 	if !ok {
