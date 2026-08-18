@@ -126,12 +126,14 @@ function Add-UiLog {
     param([Parameter(Mandatory = $true)][string]$Message, [string]$Level = "信息")
     $safeMessage = Redact-Secret $Message
     $line = "[{0}] [{1}] {2}" -f (Get-Date).ToString("HH:mm:ss"), $Level, $safeMessage
+    $logLines = $script:logLines
+    $logBox = $script:logBox
     $update = {
-        [void]$script:logLines.Add($line)
-        if ($null -eq $script:logBox -or $script:logBox.IsDisposed) { return }
-        $script:logBox.AppendText($line + [Environment]::NewLine)
-        $script:logBox.SelectionStart = $script:logBox.TextLength
-        $script:logBox.ScrollToCaret()
+        [void]$logLines.Add($line)
+        if ($null -eq $logBox -or $logBox.IsDisposed) { return }
+        $logBox.AppendText($line + [Environment]::NewLine)
+        $logBox.SelectionStart = $logBox.TextLength
+        $logBox.ScrollToCaret()
     }.GetNewClosure()
     if ($null -ne $script:logBox -and !$script:logBox.IsDisposed -and $script:logBox.IsHandleCreated) {
         try {
