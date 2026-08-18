@@ -1197,6 +1197,49 @@ if (Enter-UiInstance) { throw 'second instance acquired held mutex' }
 	}
 }
 
+func TestWindowsUILogFallbackWorksBeforeHandle(t *testing.T) {
+	contents := readWindowsPackagingFile(t, "ui.ps1")
+	for _, required := range []string{
+		"function Add-UiLog",
+		"function Redact-Secret",
+		"$script:logLines",
+	} {
+		if !strings.Contains(contents, required) {
+			t.Fatalf("UI missing startup log fallback requirement %q", required)
+		}
+	}
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	uiPath := filepath.Join(filepath.Dir(sourceFile), "..", "..", "packaging", "windows", "ui.ps1")
+	quotedPath := strings.ReplaceAll(uiPath, "'", "''")
+	command := `
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { exit 1 }
+$getFunctionText = {
+    param($name)
+    $node = $ast.FindAll({ param($candidate) $candidate -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq $name }, $true) | Select-Object -First 1
+    if ($null -eq $node) { throw ($name + ' function not found') }
+    return $node.Extent.Text
+}
+. ([scriptblock]::Create((& $getFunctionText 'Redact-Secret')))
+. ([scriptblock]::Create((& $getFunctionText 'Add-UiLog')))
+$script:logLines = New-Object 'System.Collections.Generic.List[string]'
+$script:logBox = $null
+$script:adminToken = ''
+Add-UiLog 'startup log before form handle'
+if ($script:logLines.Count -ne 1) { throw ('expected one startup log line, got ' + $script:logLines.Count) }
+`
+	cmd := exec.Command("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$scriptPath = '"+quotedPath+"';"+command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell startup log fallback check failed: %v\n%s", err, output)
+	}
+}
+
 func TestWindowsUIMemberPreflight(t *testing.T) {
 	contents := readWindowsPackagingFile(t, "ui.ps1")
 	if !strings.Contains(contents, "function Assert-MemberControlReady") {
